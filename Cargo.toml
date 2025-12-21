@@ -1,0 +1,51 @@
+[package]
+name = "combined_app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+deno_core = "=0.363.0"
+deno_error = "0.7"
+deno_runtime = { version = "0.229.0", features = ["transpile"] }
+
+deno_fs = "0.131.0"
+deno_resolver = "0.52.0"
+sys_traits = "0.1.17"
+
+anyhow = "1"
+tokio = { version = "1.40", features = ["full"] }
+
+winit = "0.30"
+env_logger = "0.11"
+log = "0.4"
+pollster = "0.4"
+bytemuck = { version = "1.16", features = ["derive"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "webp"] }
+regex = "1"
+import_map = "0.21"
+futures = "0.3"
+
+rusqlite = "0.34"
+
+rustls = { version = "0.23", features = ["ring"] }
+
+temporal_rs = "0.0.11"
+timezone_provider = "=0.0.11"
+
+pathdiff = "0.2"
+
+# Graphics
+wgpu = { version = "27.0", features = ["vulkan"] }
+wgpu-hal = { version = "27.0", features = ["vulkan"] }
+
+# XR dependencies (always included)
+openxr = { version = "0.19", features = ["static", "loaded"] }
+ash = "0.38"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = ["Win32_System_SystemInformation"]

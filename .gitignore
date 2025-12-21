@@ -1,0 +1,5 @@
+/target
+indexeddb/
+data/
+vendor/
+Cargo.lock

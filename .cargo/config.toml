@@ -1,0 +1,4 @@
+# Windows 11
+# [env]
+# AWS_LC_SYS_PREBUILT_NASM = "1"
+# CFLAGS = "/std:c11"

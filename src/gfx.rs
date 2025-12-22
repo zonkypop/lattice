@@ -621,6 +621,7 @@ pub struct PipelineCreate {
     pub depth_compare: Option<String>,
     pub color_format: Option<String>,
     pub sample_count: Option<u32>,
+    pub alpha_to_coverage_enabled: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1610,7 +1611,7 @@ pub fn op_gfx_device_create_pipeline(
     let multisample = wgpu::MultisampleState {
         count: desc.sample_count.unwrap_or(1),
         mask: !0,
-        alpha_to_coverage_enabled: false,
+        alpha_to_coverage_enabled: desc.alpha_to_coverage_enabled.unwrap_or(false),
     };
 
     let pipeline = if let Some(layout_rid) = desc.pipeline_layout_rid {

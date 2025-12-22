@@ -565,6 +565,8 @@ if (!gfx) {
                 depth_compare: depth?.depthCompare ?? null,
                 color_format: desc.fragment?.targets?.[0]?.format ?? null,
                 sample_count: desc.multisample?.count ?? 1,
+                alpha_to_coverage_enabled:
+                  desc.multisample?.alphaToCoverageEnabled ?? false,
               }).rid;
 
               return {

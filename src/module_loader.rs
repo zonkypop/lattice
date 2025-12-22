@@ -14,28 +14,26 @@ use deno_fs::RealFs;
 use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use deno_runtime::BootstrapOptions;
 use deno_runtime::web_worker::{WebWorker, WebWorkerOptions, WebWorkerServiceOptions, WorkerThreadType};
-use deno_runtime::ops::worker_host::{CreateWebWorkerCb, CreateWebWorkerArgs};
+use deno_runtime::ops::worker_host::CreateWebWorkerCb;
 use import_map::ImportMap;
 
-use crate::{snapshot_options_ext, gfx_host};
 use deno_core::SharedArrayBufferStore;
 
 use tokio::runtime::Handle;
 use deno_runtime::deno_permissions::PermissionsContainer;
 use deno_runtime::permissions::RuntimePermissionDescriptorParser;
+
 // ======================= Import Map Module Loader =======================
 
 #[derive(Clone)]
 pub struct ImportMapModuleLoader {
     import_map: Option<Arc<ImportMap>>,
     script_dir: PathBuf,
-    /// Path to the setup/shim file that should be auto-imported
     setup_module_path: Option<PathBuf>,
 }
 
 #[cfg(target_os = "windows")]
 fn normalize_file_path(path: &str) -> String {
-    // Remove leading slash before drive letter: /C:/... -> C:/...
     if path.len() > 2 && path.starts_with('/') && path.chars().nth(2) == Some(':') {
         path[1..].to_string()
     } else {
@@ -66,17 +64,10 @@ impl ImportMapModuleLoader {
             None
         };
 
-        // Look for setup.js in the script directory
         let setup_path = std::env::current_dir()
             .map(|d| d.join("src/shims/setup.js"))
             .unwrap_or_else(|_| PathBuf::from("src/shims/setup.js"));
-        let setup_module_path = if setup_path.exists() {
-            log::info!("Found setup.js at {:?}, will auto-inject", setup_path);
-            Some(setup_path)
-        } else {
-            log::info!("No setup.js found at {:?}", setup_path);
-            None
-        };
+        let setup_module_path = setup_path.exists().then_some(setup_path);
 
         Ok(Self {
             import_map,
@@ -85,7 +76,6 @@ impl ImportMapModuleLoader {
         })
     }
 
-    /// Create a loader with a custom setup file path
     pub fn with_setup_file(mut self, setup_path: PathBuf) -> Self {
         if setup_path.exists() {
             self.setup_module_path = Some(setup_path);
@@ -93,95 +83,54 @@ impl ImportMapModuleLoader {
         self
     }
 
-    /// Check if this module is the setup module itself (to avoid circular injection)
     fn is_setup_module(&self, specifier: &ModuleSpecifier) -> bool {
-        if let Some(ref setup_path) = self.setup_module_path {
-            if let Ok(spec_path) = specifier.to_file_path() {
-                // Canonicalize both paths for comparison
-                let setup_canonical = setup_path.canonicalize().ok();
-                let spec_canonical = spec_path.canonicalize().ok();
-                
-                if let (Some(s1), Some(s2)) = (setup_canonical, spec_canonical) {
-                    return s1 == s2;
-                }
-                
-                // Fallback to simple comparison
-                return spec_path == *setup_path;
-            }
+        let Some(ref setup_path) = self.setup_module_path else { return false };
+        let Ok(spec_path) = specifier.to_file_path() else { return false };
+        
+        if let (Some(s1), Some(s2)) = (setup_path.canonicalize().ok(), spec_path.canonicalize().ok()) {
+            return s1 == s2;
         }
-        false
+        spec_path == *setup_path
     }
 
-    /// Check if this is a module that should have setup.js injected
     fn should_inject_setup(&self, specifier: &ModuleSpecifier, code: &str) -> bool {
-        // Don't inject if there's no setup module configured
-        if self.setup_module_path.is_none() {
-            log::info!("should_inject_setup: no setup module configured");
+        if self.setup_module_path.is_none() || self.is_setup_module(specifier) {
             return false;
         }
 
-        // Don't inject into the setup module itself
-        if self.is_setup_module(specifier) {
-            log::info!("should_inject_setup: skipping setup module itself");
-            return false;
-        }
-
-        // Don't inject into indexDBShim.js (the shim file that setup.js imports)
         let path = specifier.path();
+        
         if path.contains("indexDBShim") || path.contains("indexedDBShim") {
-            log::info!("should_inject_setup: skipping indexDB shim file");
             return false;
         }
 
-        // Don't inject if the file already imports setup.js
-        if code.contains("import \"./setup.js\"") 
-            || code.contains("import './setup.js'")
-            || code.contains("from \"./setup.js\"")
-            || code.contains("from './setup.js'")
-            || code.contains("import \"setup\"")
-            || code.contains("import 'setup'")
-            || code.contains("import \"../setup.js\"")
-            || code.contains("import '../setup.js'")
-            || code.contains("import \"../../setup.js\"")
-            || code.contains("import '../../setup.js'")
-            || code.contains("import \"../../../setup.js\"")
-            || code.contains("import '../../../setup.js'")
-            || code.contains("import \"../../../../setup.js\"")
-            || code.contains("import '../../../../setup.js'")
-        {
-            log::info!("should_inject_setup: file already imports setup.js");
+        let setup_imports = [
+            "import \"./setup.js\"", "import './setup.js'",
+            "from \"./setup.js\"", "from './setup.js'",
+            "import \"setup\"", "import 'setup'",
+            "import \"../setup.js\"", "import '../setup.js'",
+            "import \"../../setup.js\"", "import '../../setup.js'",
+            "import \"../../../setup.js\"", "import '../../../setup.js'",
+            "import \"../../../../setup.js\"", "import '../../../../setup.js'",
+        ];
+        if setup_imports.iter().any(|s| code.contains(s)) {
             return false;
         }
 
-        // Skip node_modules - these are external libraries
-        if path.contains("node_modules") {
-            log::info!("should_inject_setup: skipping node_modules");
+        if path.contains("node_modules") || path.contains("/three/build/") || path.contains("/three/src/") {
             return false;
         }
 
-        // Skip three.js library files (they don't need browser shims typically)
-        // But be careful - some three.js addons might need them
-        if path.contains("/three/build/") || path.contains("/three/src/") {
-            log::info!("should_inject_setup: skipping three.js core library file");
-            return false;
-        }
-
-        // INJECT INTO ALL OTHER LOCAL JS FILES
-        // This ensures any file using browser APIs gets the shims
-        log::info!("should_inject_setup: WILL INJECT into {}", specifier);
         true
     }
 
-    /// Get the import statement to prepend
     fn get_setup_import(&self, specifier: &ModuleSpecifier) -> Option<String> {
         let setup_path = self.setup_module_path.as_ref()?;
         
         if let Ok(module_path) = specifier.to_file_path() {
             if let Some(module_dir) = module_path.parent() {
                 if let Some(rel_path) = pathdiff::diff_paths(setup_path, module_dir) {
-                    // Convert Windows backslashes to forward slashes for JS imports
                     let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-                    
                     let import_path = if rel_str.starts_with('.') {
                         rel_str
                     } else {
@@ -192,15 +141,11 @@ impl ImportMapModuleLoader {
             }
         }
 
-        if let Ok(setup_url) = ModuleSpecifier::from_file_path(setup_path) {
-            return Some(format!("import \"{}\";\n", setup_url));
-        }
-
-        None
+        ModuleSpecifier::from_file_path(setup_path)
+            .ok()
+            .map(|url| format!("import \"{}\";\n", url))
     }
 }
-
-
 
 impl ModuleLoader for ImportMapModuleLoader {
     fn resolve(
@@ -221,28 +166,23 @@ impl ModuleLoader for ImportMapModuleLoader {
                 .map_err(|e| JsErrorBox::generic(e.to_string()))?
         };
 
-        // Try import map resolution first
         if let Some(ref import_map) = self.import_map {
             match import_map.resolve(specifier, &referrer_url) {
                 Ok(resolved) => return Ok(resolved),
                 Err(e) => {
                     let err_str = e.to_string();
-                    if !err_str.contains("Relative import path") && 
-                       !specifier.starts_with("./") && 
-                       !specifier.starts_with("../") &&
-                       !specifier.starts_with("/") {
-                        // Unmapped bare specifier, fall through
-                    } else {
+                    if err_str.contains("Relative import path") || 
+                       specifier.starts_with("./") || 
+                       specifier.starts_with("../") ||
+                       specifier.starts_with("/") {
                         return Err(JsErrorBox::generic(e.to_string()));
                     }
                 }
             }
         }
 
-        // Default resolution for relative/absolute paths
-        let resolved = referrer_url.join(specifier)
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-        Ok(resolved)
+        referrer_url.join(specifier)
+            .map_err(|e| JsErrorBox::generic(e.to_string()))
     }
 
     fn load(
@@ -254,13 +194,10 @@ impl ModuleLoader for ImportMapModuleLoader {
     ) -> ModuleLoadResponse {
         let specifier = module_specifier.clone();
         
-        log::info!("ModuleLoader: loading {}", specifier);
-        
         let file_path = match specifier.to_file_path() {
             Ok(mut p) => {
                 #[cfg(target_os = "windows")]
                 {
-                    // Fix path if it has leading slash before drive letter
                     let path_str = p.to_string_lossy().to_string();
                     if path_str.starts_with("\\\\?\\") {
                         p = PathBuf::from(path_str.trim_start_matches("\\\\?\\"));
@@ -269,44 +206,26 @@ impl ModuleLoader for ImportMapModuleLoader {
                 p
             }
             Err(_) => {
-                log::error!("ModuleLoader: cannot convert to file path: {}", specifier);
                 return ModuleLoadResponse::Sync(Err(
-                    JsErrorBox::generic(format!(
-                        "Cannot load non-file URL: {}", specifier
-                    ))
+                    JsErrorBox::generic(format!("Cannot load non-file URL: {}", specifier))
                 ));
             }
         };
     
-        log::info!("ModuleLoader: reading file {}", file_path.display());
-        
         let code = match std::fs::read_to_string(&file_path) {
-            Ok(c) => {
-                log::info!("ModuleLoader: successfully read {} bytes from {}", c.len(), file_path.display());
-                c
-            }
+            Ok(c) => c,
             Err(e) => {
-                log::error!("ModuleLoader: failed to read: {}", e);
                 return ModuleLoadResponse::Sync(Err(
-                    JsErrorBox::generic(format!(
-                        "Failed to read {}: {}", file_path.display(), e
-                    ))
+                    JsErrorBox::generic(format!("Failed to read {}: {}", file_path.display(), e))
                 ));
             }
         };
 
-
-        // Inject setup.js import if needed
         let final_code = if self.should_inject_setup(&specifier, &code) {
-            if let Some(import_stmt) = self.get_setup_import(&specifier) {
-                log::info!("ModuleLoader: INJECTING '{}' into {}", import_stmt.trim(), specifier);
-                format!("{}{}", import_stmt, code)
-            } else {
-                log::warn!("ModuleLoader: should inject but get_setup_import returned None for {}", specifier);
-                code
-            }
+            self.get_setup_import(&specifier)
+                .map(|import| format!("{}{}", import, code))
+                .unwrap_or(code)
         } else {
-            log::info!("ModuleLoader: NOT injecting setup into {}", specifier);
             code
         };
     
@@ -321,21 +240,18 @@ impl ModuleLoader for ImportMapModuleLoader {
 
 // ======================= Web Worker Creation =======================
 
-
-
 pub fn create_web_worker_callback(
     module_loader: ImportMapModuleLoader,
     fs: Arc<RealFs>,
     shared_array_buffer_store: SharedArrayBufferStore,
     runtime_handle: Handle,
 ) -> Arc<CreateWebWorkerCb> {
-    Arc::new(move |args: deno_runtime::ops::worker_host::CreateWebWorkerArgs| {
+    Arc::new(move |args| {
         let module_loader = module_loader.clone();
         let fs = fs.clone();
         let shared_array_buffer_store = shared_array_buffer_store.clone();
         let handle = runtime_handle.clone();
 
-        // Enter the runtime context
         let _guard = handle.enter();
 
         let permission_desc_parser = Arc::new(
@@ -362,12 +278,10 @@ pub fn create_web_worker_callback(
             maybe_inspector_server: None,
         };
 
-        // For nested workers
         let nested_worker_cb: Arc<CreateWebWorkerCb> = Arc::new(|_| {
             panic!("Nested web workers are not supported")
         });
 
-     
         let options = WebWorkerOptions {
             name: args.name.clone(),
             main_module: args.main_module.clone(),
@@ -379,10 +293,8 @@ pub fn create_web_worker_callback(
             },
             extensions: vec![
                 crate::snapshot_options_ext::init(),
-                // Uncomment if workers need GPU access:
                 crate::gfx_host::init(),
             ],
-            // ================================
             startup_snapshot: None,
             unsafely_ignore_certificate_errors: None,
             seed: None,

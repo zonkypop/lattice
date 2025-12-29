@@ -240,6 +240,56 @@ if (!gfx) {
           : null;
     }
 
+    multiDrawIndexedIndirect(indirectBuffer, indirectOffset, drawCount) {
+      if (this._pipelineRid == null) return;
+      if (!indirectBuffer?.__rid)
+        throw new Error("multiDrawIndexedIndirect: no indirect buffer");
+      if (!this._indexBuffer?.__rid)
+        throw new Error("multiDrawIndexedIndirect: no index buffer set");
+
+      const vRids = [];
+      for (const [slot, rid] of this._vertexBuffers) vRids[slot] = rid;
+
+      const bgRids = [];
+      for (const [idx, rid] of this._bindGroups) bgRids[idx] = rid;
+
+      const isFirst = this._drawCalls.length === 0;
+
+      this._drawCalls.push({
+        pipeline_rid: this._pipelineRid,
+        vertex_buffer_rids: vRids,
+        bind_group_rids: bgRids,
+        clear_color: isFirst ? this._clearColor : null,
+        vertex_count: 0,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+        index_buffer_rid: this._indexBuffer.__rid,
+        index_format: this._indexFormat || "uint32",
+        index_count: 0,
+        first_index: 0,
+        base_vertex: 0,
+        depth_view_rid: isFirst ? this._depthAttachment?.viewRid ?? null : null,
+        depth_clear_value: isFirst
+          ? this._depthAttachment?.depthClearValue ?? null
+          : null,
+        depth_load_op: isFirst
+          ? this._depthAttachment?.depthLoadOp ?? null
+          : null,
+        depth_store_op: isFirst
+          ? this._depthAttachment?.depthStoreOp ?? null
+          : null,
+        depth_read_only: isFirst
+          ? this._depthAttachment?.depthReadOnly ?? null
+          : null,
+        // Multi-draw specific
+        is_multi_draw: true,
+        indirect_buffer_rid: indirectBuffer.__rid,
+        indirect_offset: indirectOffset >>> 0,
+        draw_count: drawCount >>> 0,
+      });
+    }
+
     setPipeline(p) {
       this._pipelineRid = p.__rid;
     }
@@ -799,20 +849,29 @@ if (!gfx) {
               writeBuffer(buffer, dstOffset, data, dataOffset = 0, size) {
                 if (buffer.__rid == null)
                   throw new Error("writeBuffer: no __rid");
-                let srcView =
-                  data instanceof Uint8Array
-                    ? data
-                    : ArrayBuffer.isView(data)
-                    ? new Uint8Array(
-                        data.buffer,
-                        data.byteOffset,
-                        data.byteLength
-                      )
-                    : data instanceof ArrayBuffer
-                    ? new Uint8Array(data)
-                    : (() => {
-                        throw new Error("writeBuffer: unsupported data type");
-                      })();
+
+                let srcView;
+                if (data instanceof Uint8Array) {
+                  srcView = data;
+                } else if (
+                  data instanceof ArrayBuffer ||
+                  data instanceof SharedArrayBuffer
+                ) {
+                  srcView = new Uint8Array(data);
+                } else if (ArrayBuffer.isView(data)) {
+                  srcView = new Uint8Array(
+                    data.buffer,
+                    data.byteOffset,
+                    data.byteLength
+                  );
+                } else {
+                  throw new Error(
+                    `writeBuffer: unsupported data type: ${Object.prototype.toString.call(
+                      data
+                    )}`
+                  );
+                }
+
                 const byteOffset = dataOffset >>> 0;
                 const byteLength =
                   size != null

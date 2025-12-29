@@ -29,6 +29,7 @@ import {
   op_gfx_render_depth_only,
   op_gfx_resource_drop,
   op_gfx_render_xr_frame,
+  op_gfx_multi_draw_indexed_indirect,
 
   // Input ops
   op_input_poll_events,
@@ -112,6 +113,7 @@ globalThis.__gfx = {
   op_gfx_render_depth_only,
   op_gfx_resource_drop,
   op_gfx_render_xr_frame,
+  op_gfx_multi_draw_indexed_indirect,
 };
 
 // Expose input ops to globalThis

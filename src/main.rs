@@ -99,6 +99,7 @@ extension!(
         gfx::op_gfx_decode_image_store,
         gfx::op_gfx_upload_decoded_image_to_texture,
         gfx::op_gfx_decoded_image_drop,
+        gfx::op_gfx_multi_draw_indexed_indirect,
 
         op_input_poll_events,
         op_input_get_window_size,

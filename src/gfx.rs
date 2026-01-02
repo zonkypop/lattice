@@ -13,6 +13,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use std::sync::RwLock;
+
+use wgpu::BufferAsyncError;
+
 // ======================= Graphics Context =======================
 
 struct MsaaState {
@@ -219,6 +222,7 @@ pub fn map_texture_format(fmt: &str) -> wgpu::TextureFormat {
         "rgba32float" => wgpu::TextureFormat::Rgba32Float,
         "r16float" => wgpu::TextureFormat::R16Float,
         "r32float" => wgpu::TextureFormat::R32Float,
+        "depth16unorm" => wgpu::TextureFormat::Depth16Unorm,
         "depth24plus" => wgpu::TextureFormat::Depth24Plus,
         "depth24plus-stencil8" => wgpu::TextureFormat::Depth24PlusStencil8,
         "depth32float" => wgpu::TextureFormat::Depth32Float,
@@ -678,6 +682,8 @@ pub struct DrawCall {
     pub indirect_buffer_rid: Option<u32>,
     pub indirect_offset: Option<u64>,
     pub draw_count: Option<u32>,
+    // Indirect indexed
+    pub is_indirect: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -888,6 +894,7 @@ pub fn op_gfx_multi_draw_indexed_indirect(
             depth_stencil_attachment: depth_attachment,
             occlusion_query_set: None,
             timestamp_writes: None,
+            multiview_mask: None, 
         });
 
         pass.set_pipeline(&pipeline.pipeline);
@@ -907,6 +914,13 @@ pub fn op_gfx_multi_draw_indexed_indirect(
     }
 
     ctx.queue.submit(std::iter::once(encoder.finish()));
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_queue_submit_empty() -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+    ctx.queue.submit(std::iter::empty());
     Ok(())
 }
 
@@ -1068,7 +1082,7 @@ pub fn generate_mipmaps(
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None, 
         });
 
@@ -1404,6 +1418,13 @@ pub fn op_gfx_texture_create_view(
     Ok(JsGfxTextureView { rid })
 }
 
+fn map_mipmap_filter_mode(s: Option<&str>) -> wgpu::MipmapFilterMode {
+    match s {
+        Some("nearest") => wgpu::MipmapFilterMode::Nearest,
+        _ => wgpu::MipmapFilterMode::Linear,
+    }
+}
+
 #[op2]
 #[serde]
 pub fn op_gfx_device_create_sampler(
@@ -1423,7 +1444,7 @@ pub fn op_gfx_device_create_sampler(
         label: desc.label.as_deref(),
         mag_filter: map_filter_mode(desc.mag_filter.as_deref()),
         min_filter: map_filter_mode(desc.min_filter.as_deref()),
-        mipmap_filter: map_filter_mode(desc.mipmap_filter.as_deref()),
+        mipmap_filter: map_mipmap_filter_mode(desc.mipmap_filter.as_deref()),
         address_mode_u: map_address_mode(desc.address_mode_u.as_deref()),
         address_mode_v: map_address_mode(desc.address_mode_v.as_deref()),
         address_mode_w: map_address_mode(desc.address_mode_w.as_deref()),
@@ -1528,7 +1549,7 @@ pub fn op_gfx_device_create_pipeline_layout(
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: desc.label.as_deref(),
                 bind_group_layouts: &layout_refs,
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
     let rid = state
@@ -1788,7 +1809,7 @@ pub fn op_gfx_device_create_pipeline(
                 primitive,
                 depth_stencil,
                 multisample,
-                multiview: None,
+                multiview_mask: None,
                 cache: None, 
             })
     } else {
@@ -1806,7 +1827,7 @@ pub fn op_gfx_device_create_pipeline(
                 primitive,
                 depth_stencil,
                 multisample,
-                multiview: None,
+                multiview_mask: None,
                 cache: None, 
             })
     };
@@ -1905,7 +1926,7 @@ pub fn op_gfx_surface_draw(
         }
 
         // Validate indirect buffer if multi-draw
-        if dc.is_multi_draw.unwrap_or(false) {
+        if dc.is_multi_draw.unwrap_or(false) || dc.is_indirect.unwrap_or(false) {
             if let Some(indirect_rid) = dc.indirect_buffer_rid {
                 if state
                     .resource_table
@@ -1923,7 +1944,6 @@ pub fn op_gfx_surface_draw(
         }
     }
 
-    // NOW acquire surface - ONLY ONCE
     let surface = ctx.surface.as_ref()
         .ok_or_else(|| JsErrorBox::generic("No surface in XR mode"))?;
     let output = match surface.get_current_texture() {
@@ -2026,6 +2046,7 @@ pub fn op_gfx_surface_draw(
     }
 
     for (call_idx, dc) in args.draw_calls.iter().enumerate() {
+
         // Validate pipeline exists
         let pipeline_res = state
             .resource_table
@@ -2091,7 +2112,7 @@ pub fn op_gfx_surface_draw(
         };
 
         // Get indirect buffer if multi-draw
-        let indirect_buf: Option<Arc<wgpu::Buffer>> = if dc.is_multi_draw.unwrap_or(false) {
+        let indirect_buf: Option<Arc<wgpu::Buffer>> = if dc.is_multi_draw.unwrap_or(false) || dc.is_indirect.unwrap_or(false) {
             if let Some(rid) = dc.indirect_buffer_rid {
                 let buf_res = state
                     .resource_table
@@ -2164,6 +2185,7 @@ pub fn op_gfx_surface_draw(
                 depth_stencil_attachment: depth_attachment,
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,  
             });
 
             pass.set_pipeline(&pipeline_res.pipeline);
@@ -2180,6 +2202,8 @@ pub fn op_gfx_surface_draw(
 
             // Handle multi-draw vs regular draw
             if dc.is_multi_draw.unwrap_or(false) {
+                
+
                 if let (Some(idx_buf), Some(indirect_buf)) = (index_buf.as_ref(), indirect_buf.as_ref()) {
                     let fmt = match dc.index_format.as_deref() {
                         Some("uint16") => wgpu::IndexFormat::Uint16,
@@ -2192,7 +2216,19 @@ pub fn op_gfx_surface_draw(
                         dc.draw_count.unwrap_or(0),
                     );
                 }
-            } else if let Some(idx_buf) = index_buf.as_ref() {
+            }
+            else if dc.is_indirect.unwrap_or(false) {
+                eprintln!("Using indirect");
+                if let (Some(idx_buf), Some(indirect_buf)) = (index_buf.as_ref(), indirect_buf.as_ref()) {
+                    let fmt = match dc.index_format.as_deref() {
+                        Some("uint16") => wgpu::IndexFormat::Uint16,
+                        _ => wgpu::IndexFormat::Uint32,
+                    };
+                    pass.set_index_buffer(idx_buf.slice(..), fmt);
+                    pass.draw_indexed_indirect(&indirect_buf, dc.indirect_offset.unwrap_or(0));
+                }
+            }
+            else if let Some(idx_buf) = index_buf.as_ref() {
                 if dc.index_count > 0 {
                     let fmt = match dc.index_format.as_deref() {
                         Some("uint16") => wgpu::IndexFormat::Uint16,
@@ -2320,7 +2356,7 @@ pub fn op_gfx_write_texture_image(
             origin: wgpu::Origin3d {
                 x: origin_x,
                 y: origin_y,
-                z: origin_z,  // USE IT HERE
+                z: origin_z,  
             },
             aspect: wgpu::TextureAspect::All,
         },
@@ -2369,6 +2405,7 @@ pub struct RenderXrFrameArgs {
     pub depth_clear_value: Option<f32>,
     pub clear_color: Option<ClearColor>,
 }
+
 
 #[op2]
 pub fn op_gfx_render_xr_frame(
@@ -2453,6 +2490,21 @@ pub fn op_gfx_render_xr_frame(
             None
         };
 
+        // Get indirect buffer if multi-draw
+        let indirect_buf: Option<Arc<wgpu::Buffer>> = if dc.is_multi_draw.unwrap_or(false) || dc.is_indirect.unwrap_or(false) {
+            if let Some(rid) = dc.indirect_buffer_rid {
+                let buf_res = state
+                    .resource_table
+                    .get::<GfxBuffer>(ResourceId::from(rid))
+                    .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+                Some(buf_res.buffer.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let color_load_op = if first_pass {
             match clear_color {
                 Some(c) => wgpu::LoadOp::Clear(c),
@@ -2491,11 +2543,12 @@ pub fn op_gfx_render_xr_frame(
                         load: color_load_op,
                         store: wgpu::StoreOp::Store,
                     },
-                    depth_slice: None,  
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: depth_attachment,
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,  
             });
 
             pass.set_pipeline(&pipeline_res.pipeline);
@@ -2510,7 +2563,48 @@ pub fn op_gfx_render_xr_frame(
                 }
             }
 
-            if let Some(idx_buf) = index_buf.as_ref() {
+            // These are not currently working on Quest 3
+            if dc.is_multi_draw.unwrap_or(false) {
+                if let Some(ref idx_buf) = index_buf {
+                    let fmt = match dc.index_format.as_deref() {
+                        Some("uint16") => wgpu::IndexFormat::Uint16,
+                        _ => wgpu::IndexFormat::Uint32,
+                    };
+                    pass.set_index_buffer(idx_buf.slice(..), fmt);
+                    
+                    if let Some(ref indirect) = indirect_buf {
+                        pass.multi_draw_indexed_indirect(
+                            indirect,
+                            dc.indirect_offset.unwrap_or(0),
+                            dc.draw_count.unwrap_or(0),
+                        );
+                    }
+                }
+            }
+            else if dc.is_indirect.unwrap_or(false) {
+                if let (Some(ref idx_buf), Some(ref indirect)) = (&index_buf, &indirect_buf) {
+                    let fmt = match dc.index_format.as_deref() {
+                        Some("uint16") => wgpu::IndexFormat::Uint16,
+                        _ => wgpu::IndexFormat::Uint32,
+                    };
+                    pass.set_index_buffer(idx_buf.slice(..), fmt);
+                    pass.draw_indexed_indirect(indirect, dc.indirect_offset.unwrap_or(0));
+                } else {
+                    eprintln!("XR: Missing buffers - index_buf={}, indirect_buf={}", index_buf.is_some(), indirect_buf.is_some());
+                }
+            }
+            // debug fallback, this works: Direct draw_indexed 
+            // if dc.is_multi_draw.unwrap_or(false) {
+            //     if let Some(ref idx_buf) = index_buf {
+            //         let fmt = match dc.index_format.as_deref() {
+            //             Some("uint16") => wgpu::IndexFormat::Uint16,
+            //             _ => wgpu::IndexFormat::Uint32,
+            //         };
+            //         pass.set_index_buffer(idx_buf.slice(..), fmt);
+            //         pass.draw_indexed(0..50000, 0, 0..1);
+            //     }
+            // }
+            else if let Some(idx_buf) = index_buf.as_ref() {
                 if dc.index_count > 0 {
                     let fmt = match dc.index_format.as_deref() {
                         Some("uint16") => wgpu::IndexFormat::Uint16,
@@ -2681,6 +2775,7 @@ pub fn op_gfx_render_to_texture(
                 depth_stencil_attachment: depth_attachment,
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None, 
             });
 
             pass.set_pipeline(&pipeline_res.pipeline);
@@ -2879,6 +2974,7 @@ pub fn op_gfx_render_depth_only(
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None, 
             });
 
             pass.set_pipeline(&pipeline_res.pipeline);
@@ -2924,7 +3020,6 @@ pub fn op_gfx_resource_drop(
     state: &mut OpState,
     rid: u32,
 ) -> Result<(), JsErrorBox> {
-    // Try to remove the resource - it will be dropped automatically
     let _ = state.resource_table.take::<GfxTextureView>(ResourceId::from(rid));
     Ok(())
 }

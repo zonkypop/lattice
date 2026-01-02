@@ -15,10 +15,19 @@ fn get_dbs() -> &'static Mutex<HashMap<String, Arc<Mutex<Connection>>>> {
 }
 
 fn get_db_path(db_name: &str) -> PathBuf {
+    #[cfg(target_os = "android")]
+    let data_dir = {
+        // Use /data/data/package_name which the app can write to
+        let pkg_dir = std::path::PathBuf::from("/data/data/com.yourcompany.combinedapp/files/indexeddb");
+        std::fs::create_dir_all(&pkg_dir).ok();
+        pkg_dir
+    };
+    #[cfg(not(target_os = "android"))]
     let data_dir = std::env::current_dir()
         .unwrap_or_default()
         .join("data")
         .join("indexeddb");
+    
     std::fs::create_dir_all(&data_dir).ok();
     data_dir.join(format!("{}.sqlite", db_name))
 }

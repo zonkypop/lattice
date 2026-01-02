@@ -9,8 +9,53 @@ use openxr as xr;
 use ash::vk::{self, Handle};
 use std::ffi::CString;
 use crate::gfx::{GfxContext, set_gfx_context};
+use wgpu_hal::vulkan::TextureMemory;
+
+
+use openxr::sys;
+
+
+
+#[cfg(target_os = "android")]
+fn init_android_loader(entry: &xr::Entry) -> Result<(), JsErrorBox> {
+    let native_activity = ndk_glue::native_activity();
+    let vm = native_activity.vm() as *mut std::ffi::c_void;
+    let activity = native_activity.activity() as *mut std::ffi::c_void;
+    
+    let mut init_fn: Option<xr::sys::pfn::VoidFunction> = None;
+    unsafe {
+        (entry.fp().get_instance_proc_addr)(
+            xr::sys::Instance::NULL,
+            b"xrInitializeLoaderKHR\0".as_ptr(),
+            &mut init_fn,
+        )
+    };
+    
+    if let Some(func) = init_fn {
+        type InitLoaderFn = unsafe extern "system" fn(*const xr::sys::LoaderInitInfoBaseHeaderKHR) -> xr::sys::Result;
+        let init_loader: InitLoaderFn = unsafe { std::mem::transmute(func) };
+        
+        let loader_init = xr::sys::LoaderInitInfoAndroidKHR {
+            ty: xr::sys::LoaderInitInfoAndroidKHR::TYPE,
+            next: std::ptr::null(),
+            application_vm: vm,
+            application_context: activity,
+        };
+        
+        unsafe {
+            init_loader(&loader_init as *const _ as *const xr::sys::LoaderInitInfoBaseHeaderKHR)
+        };
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+fn init_android_loader(_entry: &xr::Entry) -> Result<(), JsErrorBox> {
+    Ok(())
+}
 
 // ======================= Serde Types =======================
+
 
 #[derive(Serialize)]
 pub struct XrSessionInfo {
@@ -148,6 +193,7 @@ pub struct XrState {
     pub right_b_button_action: xr::Action<bool>,
     pub left_hand_path: xr::Path,
     pub right_hand_path: xr::Path,
+    
 }
 
 unsafe impl Send for XrState {}
@@ -155,11 +201,11 @@ unsafe impl Sync for XrState {}
 
 static XR_STATE: OnceLock<Mutex<Option<XrState>>> = OnceLock::new();
 
-fn get_xr_state() -> &'static Mutex<Option<XrState>> {
+pub fn get_xr_state() -> &'static Mutex<Option<XrState>> {
     XR_STATE.get_or_init(|| Mutex::new(None))
 }
 
-static XR_SWAPCHAIN_TEXTURES: OnceLock<Vec<wgpu::Texture>> = OnceLock::new();
+pub static XR_SWAPCHAIN_TEXTURES: OnceLock<Vec<wgpu::Texture>> = OnceLock::new();
 
 // ======================= Helper Functions =======================
 
@@ -228,21 +274,120 @@ pub fn get_xr_swapchain_texture(index: u32) -> Option<&'static wgpu::Texture> {
 
 #[op2(async)]
 pub async fn op_xr_is_supported() -> Result<bool, JsErrorBox> {
-    match xr::Entry::linked().enumerate_extensions() {
-        Ok(exts) => Ok(exts.khr_vulkan_enable2),
-        Err(_) => Ok(false),
+    match unsafe { xr::Entry::load() }.ok().and_then(|e| e.enumerate_extensions().ok()) {
+        Some(exts) => Ok(exts.khr_vulkan_enable2),
+        None => Ok(false),
     }
 }
 
-#[op2(async)]
-#[serde]
-pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
+unsafe fn enable_foveation(
+    instance: &xr::Instance,
+    session: &xr::Session<xr::Vulkan>,
+    swapchain: &xr::Swapchain<xr::Vulkan>,
+) -> Result<(), JsErrorBox> {
+    eprintln!("Attempting to enable foveation...");
+    
+    // Get function pointers
+    let mut create_foveation_profile: Option<sys::pfn::CreateFoveationProfileFB> = None;
+    let mut update_swapchain: Option<sys::pfn::UpdateSwapchainFB> = None;
+
+    let _ = (instance.fp().get_instance_proc_addr)(
+        instance.as_raw(),
+        c"xrCreateFoveationProfileFB".as_ptr(),
+        &mut create_foveation_profile as *mut _ as *mut _,
+    );
+    
+    let _ = (instance.fp().get_instance_proc_addr)(
+        instance.as_raw(),
+        c"xrUpdateSwapchainFB".as_ptr(),
+        &mut update_swapchain as *mut _ as *mut _,
+    );
+
+    eprintln!("create_foveation_profile fn: {}", create_foveation_profile.is_some());
+    eprintln!("update_swapchain fn: {}", update_swapchain.is_some());
+
+    let create_fn = create_foveation_profile
+        .ok_or_else(|| JsErrorBox::generic("xrCreateFoveationProfileFB not found"))?;
+    let update_fn = update_swapchain
+        .ok_or_else(|| JsErrorBox::generic("xrUpdateSwapchainFB not found"))?;
+
+    // Create fixed foveation profile (high quality setting)
+    let level_profile = sys::FoveationLevelProfileCreateInfoFB {
+        ty: sys::FoveationLevelProfileCreateInfoFB::TYPE,
+        next: std::ptr::null_mut(),
+        level: sys::FoveationLevelFB::HIGH,
+        vertical_offset: 0.0,
+        dynamic: sys::FoveationDynamicFB::LEVEL_ENABLED,
+    };
+
+    let profile_create_info = sys::FoveationProfileCreateInfoFB {
+        ty: sys::FoveationProfileCreateInfoFB::TYPE,
+        next: &level_profile as *const _ as *mut _,
+    };
+
+    let mut foveation_profile = sys::FoveationProfileFB::NULL;
+    let result = (create_fn)(
+        session.as_raw(),
+        &profile_create_info,
+        &mut foveation_profile,
+    );
+    
+    if result != sys::Result::SUCCESS {
+        return Err(JsErrorBox::generic(format!("Failed to create foveation profile: {:?}", result)));
+    }
+
+    // Apply foveation to swapchain
+    let swapchain_state = sys::SwapchainStateFoveationFB {
+        ty: sys::SwapchainStateFoveationFB::TYPE,
+        next: std::ptr::null_mut(),
+        flags: sys::SwapchainStateFoveationFlagsFB::EMPTY,
+        profile: foveation_profile,
+    };
+
+    let result = (update_fn)(
+        swapchain.as_raw(),
+        &swapchain_state as *const _ as *const sys::SwapchainStateBaseHeaderFB,
+    );
+
+    if result != sys::Result::SUCCESS {
+        return Err(JsErrorBox::generic(format!("Failed to update swapchain foveation: {:?}", result)));
+    }
+
+    log::info!("Foveation enabled (HIGH level, dynamic)");
+    Ok(())
+}
+
+pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
     log::info!("Requesting XR session...");
     
-    let xr_entry = xr::Entry::linked();
+    #[cfg(target_os = "android")]
+    let xr_entry = {
+        let entry = unsafe { xr::Entry::load() }
+            .map_err(|e| JsErrorBox::generic(format!("Failed to load OpenXR: {}", e)))?;
+        init_android_loader(&entry)?;
+        entry
+    };
+
+    #[cfg(not(target_os = "android"))]
+    let xr_entry = unsafe { xr::Entry::load() }
+        .map_err(|e| JsErrorBox::generic(format!("Failed to load OpenXR: {}", e)))?;
+
+    // Also replace ash::Entry::load with:
+    #[cfg(target_os = "android")]
+    let vk_entry = unsafe { ash::Entry::load() }.expect("Failed to load Vulkan");
+
+    #[cfg(not(target_os = "android"))]
+    let vk_entry = unsafe { ash::Entry::load() }
+        .map_err(|e| JsErrorBox::generic(format!("Failed to load Vulkan: {}", e)))?;
     
     let mut enabled_extensions = xr::ExtensionSet::default();
     enabled_extensions.khr_vulkan_enable2 = true;
+
+    // enabled_extensions.fb_foveation = true;
+    // enabled_extensions.fb_foveation_configuration = true;
+    // enabled_extensions.fb_swapchain_update_state = true;
+
+
     
     let instance = xr_entry.create_instance(
         &xr::ApplicationInfo {
@@ -263,10 +408,11 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
     let views = instance.enumerate_view_configuration_views(system, view_config_type)
         .map_err(|e| JsErrorBox::generic(format!("Failed to get view config: {}", e)))?;
     
+    // 1680x1760 on Quest 3
     let width = views[0].recommended_image_rect_width;
     let height = views[0].recommended_image_rect_height;
+
     
-    log::info!("XR view config: {}x{} per eye", width, height);
     
     let _reqs = instance.graphics_requirements::<xr::Vulkan>(system)
         .map_err(|e| JsErrorBox::generic(format!("Graphics requirements error: {}", e)))?;
@@ -275,11 +421,15 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
         .map_err(|e| JsErrorBox::generic(format!("Failed to load Vulkan: {}", e)))?;
     
     let flags = wgpu::InstanceFlags::default();
+    
+
     let instance_exts = <wgpu_hal::vulkan::Api as wgpu_hal::Api>::Instance::desired_extensions(
         &vk_entry,
         VK_TARGET_VERSION,
         flags,
     ).map_err(|e| JsErrorBox::generic(format!("Failed to get instance extensions: {}", e)))?;
+
+    
     
     let extensions_cchar: Vec<_> = instance_exts.iter().map(|s| s.as_ptr()).collect();
     
@@ -344,9 +494,14 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
         .ok_or_else(|| JsErrorBox::generic("Failed to expose adapter"))?;
     
     let wgpu_features = wgpu_exposed_adapter.features;
-    let enabled_device_extensions = wgpu_exposed_adapter
+    let hal_adapter_features = wgpu_exposed_adapter.features;  // Save before move
+
+
+
+    let mut enabled_device_extensions = wgpu_exposed_adapter
         .adapter
         .required_device_extensions(wgpu_features);
+
     
     let queue_families = unsafe { 
         vk_instance.get_physical_device_queue_family_properties(vk_physical_device) 
@@ -373,6 +528,8 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
         multiview: vk::TRUE,
         ..Default::default()
     };
+
+
     
     let device_extensions: Vec<_> = enabled_device_extensions.iter().map(|s| s.as_ptr()).collect();
     
@@ -417,7 +574,8 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
     let wgpu_adapter = unsafe { 
         wgpu_instance.create_adapter_from_hal(wgpu_exposed_adapter) 
     };
-    
+
+
     let limits = wgpu_adapter.limits();
     let (wgpu_device, wgpu_queue) = unsafe {
         wgpu_adapter.create_device_from_hal(
@@ -432,6 +590,8 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
             },
         )
     }.map_err(|e| JsErrorBox::generic(format!("Failed to finalize wgpu device: {}", e)))?;
+
+    
     
     let (session, frame_waiter, frame_stream) = unsafe {
         instance.create_session::<xr::Vulkan>(
@@ -571,12 +731,12 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
     session.attach_action_sets(&[&action_set])
         .map_err(|e| JsErrorBox::generic(format!("Failed to attach action sets: {}", e)))?;
     
-    log::info!("XR controller actions initialized");
     
     // ======================= Swapchain =======================
     let swapchain = session.create_swapchain(&xr::SwapchainCreateInfo {
         create_flags: xr::SwapchainCreateFlags::EMPTY,
-        usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT | xr::SwapchainUsageFlags::SAMPLED,
+        usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT 
+            | xr::SwapchainUsageFlags::SAMPLED,
         format: vk::Format::R8G8B8A8_SRGB.as_raw() as _,
         sample_count: 1,
         width,
@@ -585,6 +745,45 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
         array_size: 2,
         mip_count: 1,
     }).map_err(|e| JsErrorBox::generic(format!("Failed to create swapchain: {}", e)))?;
+
+
+    // Not working  / part of the WebGPU spec yet :/
+    // unsafe {
+    //     match enable_foveation(&instance, &session, &swapchain) {
+    //         Ok(()) => eprintln!("Foveation setup succeeded"),
+    //         Err(e) => eprintln!("Failed to enable foveation: {}", e),
+    //     }
+    // }
+
+    let mut get_foveation: Option<sys::pfn::GetSwapchainStateFB> = None;
+    let _ = unsafe {
+        (instance.fp().get_instance_proc_addr)(
+            instance.as_raw(),
+            c"xrGetSwapchainStateFB".as_ptr(),
+            &mut get_foveation as *mut _ as *mut _,
+        )
+    };
+
+    if let Some(get_fn) = get_foveation {
+        let mut foveation_state = sys::SwapchainStateFoveationFB {
+            ty: sys::SwapchainStateFoveationFB::TYPE,
+            next: std::ptr::null_mut(),
+            flags: sys::SwapchainStateFoveationFlagsFB::EMPTY,
+            profile: sys::FoveationProfileFB::NULL,
+        };
+        
+        let result = unsafe {
+            (get_fn)(
+                swapchain.as_raw(),
+                &mut foveation_state as *mut _ as *mut sys::SwapchainStateBaseHeaderFB,
+            )
+        };
+        
+        eprintln!("Get foveation state result: {:?}", result);
+        eprintln!("Foveation profile is null: {}", foveation_state.profile == sys::FoveationProfileFB::NULL);
+    } else {
+        eprintln!("xrGetSwapchainStateFB not found");
+    }
     
     let swapchain_images = swapchain.enumerate_images()
         .map_err(|e| JsErrorBox::generic(format!("Failed to enumerate swapchain images: {}", e)))?;
@@ -614,6 +813,7 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
                             view_formats: vec![],
                         },
                         None,
+                        TextureMemory::External,
                     )
             };
             
@@ -709,6 +909,13 @@ pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
     })
 }
 
+
+#[op2(async)]
+#[serde]
+pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
+    init_xr_session_internal().await
+}
+
 #[op2(fast)]
 pub fn op_xr_poll_events() -> Result<bool, JsErrorBox> {
     let mut guard = get_xr_state().lock().unwrap();
@@ -746,44 +953,31 @@ pub fn op_xr_poll_events() -> Result<bool, JsErrorBox> {
     Ok(!matches!(state.session_state, xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING))
 }
 
-#[op2(async)]
+
+#[op2]
 #[serde]
-pub async fn op_xr_wait_frame() -> Result<XrFrameState, JsErrorBox> {
-    let result = {
-        let session_running = {
-            let guard = get_xr_state().lock().unwrap();
-            let state = guard.as_ref().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
-            state.session_running
-        };
-        
-        if !session_running {
-            return Ok(XrFrameState { predicted_display_time: 0, should_render: false });
-        }
-        
-        let frame_state = {
-            let mut guard = get_xr_state().lock().unwrap();
-            let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
-            state.frame_waiter.wait()
-                .map_err(|e| JsErrorBox::generic(format!("Wait failed: {}", e)))?
-        };
-        
-        {
-            let mut guard = get_xr_state().lock().unwrap();
-            let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
-            state.frame_stream.begin()
-                .map_err(|e| JsErrorBox::generic(format!("Begin failed: {}", e)))?;
-            state.frame_state = Some(frame_state);
-        }
-        
-        XrFrameState {
-            predicted_display_time: frame_state.predicted_display_time.as_nanos(),
-            should_render: frame_state.should_render,
-        }
-    };
+pub fn op_xr_wait_frame() -> Result<XrFrameState, JsErrorBox> {
+    let mut guard = get_xr_state().lock().unwrap();
+    let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
     
-    tokio::task::yield_now().await;
-    Ok(result)
+    if !state.session_running {
+        return Ok(XrFrameState { predicted_display_time: 0, should_render: false });
+    }
+    
+    let frame_state = state.frame_waiter.wait()
+        .map_err(|e| JsErrorBox::generic(format!("Wait failed: {}", e)))?;
+    
+    state.frame_stream.begin()
+        .map_err(|e| JsErrorBox::generic(format!("Begin failed: {}", e)))?;
+    
+    state.frame_state = Some(frame_state);
+    
+    Ok(XrFrameState {
+        predicted_display_time: frame_state.predicted_display_time.as_nanos(),
+        should_render: frame_state.should_render,
+    })
 }
+
 
 #[op2]
 #[serde]
@@ -970,9 +1164,11 @@ pub fn op_xr_release_swapchain_image() -> Result<(), JsErrorBox> {
     state.current_swapchain_index = None;
     Ok(())
 }
-
 #[op2(fast)]
 pub fn op_xr_end_frame() -> Result<(), JsErrorBox> {
+
+  
+
     let mut guard = get_xr_state().lock().unwrap();
     let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
     
@@ -986,8 +1182,28 @@ pub fn op_xr_end_frame() -> Result<(), JsErrorBox> {
         return Ok(());
     }
     
-    let views = state.cached_views.take()
-        .ok_or_else(|| JsErrorBox::generic("No cached views"))?;
+    let views = match state.cached_views.take() {
+        Some(v) => v,
+        None => {
+            // No views cached, submit empty frame
+            state.frame_stream.end(frame_state.predicted_display_time, xr::EnvironmentBlendMode::OPAQUE, &[])
+                .map_err(|e| JsErrorBox::generic(format!("End frame failed: {}", e)))?;
+            return Ok(());
+        }
+    };
+    
+    // Validate poses - check quaternion is normalized
+    for view in &views {
+        let q = &view.pose.orientation;
+        let len_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+        if len_sq < 0.9 || len_sq > 1.1 {
+            // Invalid pose, submit empty frame
+            log::warn!("Invalid pose orientation, submitting empty frame");
+            state.frame_stream.end(frame_state.predicted_display_time, xr::EnvironmentBlendMode::OPAQUE, &[])
+                .map_err(|e| JsErrorBox::generic(format!("End frame failed: {}", e)))?;
+            return Ok(());
+        }
+    }
     
     let w = state.render_width as i32;
     let h = state.render_height as i32;

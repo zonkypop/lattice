@@ -3,19 +3,34 @@ name = "combined_app"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+# android
+# crate-type = ["rlib", "cdylib"]
+# desktop
+crate-type = ["rlib"]
+
+[[bin]]
+name = "combined_app"
+path = "src/main.rs"
+
+[features]
+default = ["desktop"]
+desktop = []
+
 [dependencies]
-deno_core = "=0.363.0"
+deno_core = { version = "=0.363.0", default-features = false, features = ["include_icu_data"] }
 deno_error = "0.7"
 deno_runtime = { version = "0.229.0", features = ["transpile"] }
 
 deno_fs = "0.131.0"
 deno_resolver = "0.52.0"
 sys_traits = "0.1.17"
+v8 = { version = "140.2.0", default-features = false }
 
 anyhow = "1"
 tokio = { version = "1.40", features = ["full"] }
 
-winit = "0.30"
 env_logger = "0.11"
 log = "0.4"
 pollster = "0.4"
@@ -39,13 +54,79 @@ timezone_provider = "=0.0.11"
 pathdiff = "0.2"
 
 # Graphics
-wgpu = { version = "27.0", features = ["vulkan"] }
-wgpu-hal = { version = "27.0", features = ["vulkan"] }
+wgpu = { version = "28.0", features = ["vulkan"] }
+wgpu-hal = { version = "28.0", features = ["vulkan"] }
 
-# XR dependencies (always included)
-openxr = { version = "0.19", features = ["static", "loaded"] }
+# XR - use "linked" which works on both desktop and Android
+openxr = { version = "0.19", features = ["loaded"] }
 ash = "0.38"
 
 [dependencies.windows-sys]
 version = "0.59"
 features = ["Win32_System_SystemInformation"]
+
+# Desktop only
+[target.'cfg(not(target_os = "android"))'.dependencies]
+winit = "0.30"
+
+# Android only
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-glue = "0.7"
+android_logger = "0.14"
+
+# Android manifest
+[package.metadata.android]
+package = "com.yourcompany.combinedapp"
+build_targets = ["aarch64-linux-android"]
+min_sdk_version = 32
+target_sdk_version = 32
+
+[package.metadata.android.application]
+label = "Combined App"
+has_code = false
+debuggable = true
+
+[package.metadata.android.application.activity]
+config_changes = "screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode|density"
+launch_mode = "singleTask"
+orientation = "landscape"
+theme = "@android:style/Theme.Black.NoTitleBar.Fullscreen"
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["com.oculus.intent.category.VR", "android.intent.category.LAUNCHER"]
+
+
+[[package.metadata.android.application.meta_data]]
+name = "com.oculus.vr.focusaware"
+value = "true"
+
+[[package.metadata.android.application.meta_data]]
+name = "com.oculus.supportedDevices"
+value = "quest3|questpro"
+
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.vr.headtracking"
+required = true
+
+[package.metadata.android.signing.release]
+path = "/home/compy3/android/debug.keystore"
+keystore_password = "android"
+key_alias = "debug"
+key_password = "android"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.vr.high_performance"
+required = true

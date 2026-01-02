@@ -857,7 +857,9 @@ if (!isNativeXR) {
             this.end();
             return;
           }
+
           const frameState = await globalThis.__xr.op_xr_wait_frame();
+
           if (frameState.should_render) {
             const poseData = globalThis.__xr.op_xr_get_viewer_pose();
             const swapchainInfo =
@@ -950,8 +952,6 @@ if (!isNativeXR) {
               this._inputSources._updateFromNative(defaultSources);
             }
 
-            // Note: Connected events are fired by XR.js updateXRInputSources, not here
-
             const xrFrame = new XRFrame(this, frameState);
             xrFrame._cachedPose = poseData;
             globalThis.__currentXRFrame = xrFrame;
@@ -972,6 +972,7 @@ if (!isNativeXR) {
             globalThis.__xr.op_xr_release_swapchain_image();
             globalThis.__xr.op_xr_end_frame();
           }
+          await globalThis.__yieldToRuntime();
         } catch (e) {
           console.error("XR loop error:", e);
           this.end();

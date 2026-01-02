@@ -398,7 +398,54 @@ if (!gfx) {
     }
 
     drawIndirect() {}
-    drawIndexedIndirect() {}
+
+    drawIndexedIndirect(indirectBuffer, indirectOffset) {
+      if (this._pipelineRid == null) return;
+      if (!indirectBuffer?.__rid)
+        throw new Error("drawIndexedIndirect: no indirect buffer");
+      if (!this._indexBuffer?.__rid)
+        throw new Error("drawIndexedIndirect: no index buffer set");
+
+      const vRids = [];
+      for (const [slot, rid] of this._vertexBuffers) vRids[slot] = rid;
+
+      const bgRids = [];
+      for (const [idx, rid] of this._bindGroups) bgRids[idx] = rid;
+
+      const isFirst = this._drawCalls.length === 0;
+
+      this._drawCalls.push({
+        pipeline_rid: this._pipelineRid,
+        vertex_buffer_rids: vRids,
+        bind_group_rids: bgRids,
+        clear_color: isFirst ? this._clearColor : null,
+        vertex_count: 0,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+        index_buffer_rid: this._indexBuffer.__rid,
+        index_format: this._indexFormat || "uint32",
+        index_count: 0,
+        first_index: 0,
+        base_vertex: 0,
+        depth_view_rid: isFirst ? this._depthAttachment?.viewRid ?? null : null,
+        depth_clear_value: isFirst
+          ? this._depthAttachment?.depthClearValue ?? null
+          : null,
+        depth_load_op: isFirst
+          ? this._depthAttachment?.depthLoadOp ?? null
+          : null,
+        depth_store_op: isFirst
+          ? this._depthAttachment?.depthStoreOp ?? null
+          : null,
+        depth_read_only: isFirst
+          ? this._depthAttachment?.depthReadOnly ?? null
+          : null,
+        is_indirect: true,
+        indirect_buffer_rid: indirectBuffer.__rid,
+        indirect_offset: indirectOffset >>> 0,
+      });
+    }
 
     executeBundles(bundles) {
       for (const bundle of bundles) {
@@ -844,7 +891,9 @@ if (!gfx) {
             },
 
             queue: {
-              submit() {},
+              submit() {
+                gfx.op_gfx_queue_submit_empty();
+              },
 
               writeBuffer(buffer, dstOffset, data, dataOffset = 0, size) {
                 if (buffer.__rid == null)
@@ -865,11 +914,7 @@ if (!gfx) {
                     data.byteLength
                   );
                 } else {
-                  throw new Error(
-                    `writeBuffer: unsupported data type: ${Object.prototype.toString.call(
-                      data
-                    )}`
-                  );
+                  throw new Error(`writeBuffer: unsupported data type`);
                 }
 
                 const byteOffset = dataOffset >>> 0;
@@ -877,6 +922,7 @@ if (!gfx) {
                   size != null
                     ? size >>> 0
                     : (srcView.byteLength - byteOffset) >>> 0;
+
                 gfx.op_gfx_queue_write_buffer(
                   buffer.__rid >>> 0,
                   dstOffset >>> 0,

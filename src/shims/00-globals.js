@@ -97,5 +97,3 @@ globalThis.__runAnimationFrames = () => {
   }
   globalThis.__dispatchInputEvents?.();
 };
-
-console.log("[shims] nativeXR:", globalThis.__nativeXR);

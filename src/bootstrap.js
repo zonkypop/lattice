@@ -30,6 +30,7 @@ import {
   op_gfx_resource_drop,
   op_gfx_render_xr_frame,
   op_gfx_multi_draw_indexed_indirect,
+  op_gfx_queue_submit_empty,
 
   // Input ops
   op_input_poll_events,
@@ -60,7 +61,12 @@ import {
   op_xr_poll_events,
   op_xr_get_swapchain_texture_view,
   op_xr_get_input_sources,
+
+  // event loop
+  op_yield_to_runtime,
 } from "ext:core/ops";
+
+globalThis.__yieldToRuntime = op_yield_to_runtime;
 
 globalThis.__xr = {
   op_xr_is_supported,
@@ -114,6 +120,7 @@ globalThis.__gfx = {
   op_gfx_resource_drop,
   op_gfx_render_xr_frame,
   op_gfx_multi_draw_indexed_indirect,
+  op_gfx_queue_submit_empty,
 };
 
 // Expose input ops to globalThis

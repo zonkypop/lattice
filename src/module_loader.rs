@@ -64,9 +64,15 @@ impl ImportMapModuleLoader {
             None
         };
 
+   
+
+        #[cfg(target_os = "android")]
+        let setup_path = std::path::PathBuf::from("/data/local/tmp/combined_app/src/shims/setup.js");
+        #[cfg(not(target_os = "android"))]
         let setup_path = std::env::current_dir()
             .map(|d| d.join("src/shims/setup.js"))
             .unwrap_or_else(|_| PathBuf::from("src/shims/setup.js"));
+
         let setup_module_path = setup_path.exists().then_some(setup_path);
 
         Ok(Self {

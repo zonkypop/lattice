@@ -7,7 +7,10 @@ use deno_core::op2;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
+
+#[cfg(not(target_os = "android"))]
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase};
+#[cfg(not(target_os = "android"))]
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
 // ======================= Global Event Queue =======================
@@ -107,6 +110,7 @@ impl InputEventQueue {
         self.events.drain(..).collect()
     }
 
+    #[cfg(not(target_os = "android"))]
     pub fn set_modifiers(&mut self, state: ModifiersState) {
         self.modifiers.ctrl = state.control_key();
         self.modifiers.shift = state.shift_key();
@@ -301,6 +305,7 @@ impl InputEventQueue {
     }
 
     /// Handle a winit MouseInput event
+    #[cfg(not(target_os = "android"))]
     pub fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
         let pointer_id = 0;
 
@@ -401,6 +406,7 @@ impl InputEventQueue {
     }
 
     /// Handle a winit MouseWheel event
+    #[cfg(not(target_os = "android"))]
     pub fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta, _phase: TouchPhase) {
         let pointer_id = 0;
         let (x, y) = self
@@ -435,6 +441,7 @@ impl InputEventQueue {
     }
 
     /// Handle a winit KeyboardInput event
+    #[cfg(not(target_os = "android"))]
     pub fn handle_keyboard_input(
         &mut self,
         state: ElementState,
@@ -469,6 +476,7 @@ impl InputEventQueue {
     }
 
     /// Handle a winit Touch event
+    #[cfg(not(target_os = "android"))]
     pub fn handle_touch(&mut self, touch: winit::event::Touch) {
         let pointer_id = touch.id as i32;
         let x = touch.location.x;
@@ -562,6 +570,7 @@ impl InputEventQueue {
 
 // ======================= Keycode Mapping =======================
 
+#[cfg(not(target_os = "android"))]
 fn keycode_to_js(keycode: KeyCode) -> (String, String, u32, u32) {
     // Returns (key, code, keyCode, location)
     // location: 0=standard, 1=left, 2=right, 3=numpad

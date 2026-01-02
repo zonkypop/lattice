@@ -16,4 +16,7 @@ Lattice is a WIP, to do :
 - Audio
 - WebRTC
 - Ergonomics etc
-- Android (XR) builds
+- Steam Frame Builds
+
+ - Android (XR) builds
+    *working apart from multi draw indirect - and no foveation (waiting for spec)

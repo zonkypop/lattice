@@ -28,6 +28,7 @@ import {
   op_gfx_decoded_image_drop,
   op_gfx_render_depth_only,
   op_gfx_resource_drop,
+  op_gfx_flush_commands,
   op_gfx_render_xr_frame,
   op_gfx_multi_draw_indexed_indirect,
   op_gfx_queue_submit_empty,
@@ -61,6 +62,7 @@ import {
   op_xr_poll_events,
   op_xr_get_swapchain_texture_view,
   op_xr_get_input_sources,
+  op_xr_frame_begin,
 
   // event loop
   op_yield_to_runtime,
@@ -80,6 +82,7 @@ globalThis.__xr = {
   op_xr_poll_events,
   op_xr_get_swapchain_texture_view,
   op_xr_get_input_sources,
+  op_xr_frame_begin,
 };
 
 globalThis.__indexeddb = {
@@ -118,6 +121,7 @@ globalThis.__gfx = {
   op_gfx_decoded_image_drop,
   op_gfx_render_depth_only,
   op_gfx_resource_drop,
+  op_gfx_flush_commands,
   op_gfx_render_xr_frame,
   op_gfx_multi_draw_indexed_indirect,
   op_gfx_queue_submit_empty,

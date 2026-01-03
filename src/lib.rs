@@ -127,6 +127,7 @@ extension!(
         gfx::op_gfx_render_depth_only,
 
         gfx::op_gfx_resource_drop,
+        gfx::op_gfx_flush_commands,
         gfx::op_gfx_render_xr_frame,
 
         // XR ops
@@ -141,6 +142,7 @@ extension!(
         xr::op_xr_end_session,
         xr::op_xr_get_swapchain_texture_view,
         xr::op_xr_get_input_sources,
+        xr::op_xr_frame_begin,
 
         // event loop
         op_yield_to_runtime

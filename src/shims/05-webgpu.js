@@ -227,6 +227,9 @@ if (!gfx) {
           : { r: cv.r ?? 0, g: cv.g ?? 0, b: cv.b ?? 0, a: cv.a ?? 1 };
       }
 
+      // Capture color attachment store op
+      this._colorStoreOp = ca?.storeOp || "store";
+
       const da = desc?.depthStencilAttachment;
       this._depthAttachment =
         da?.view?.__rid != null
@@ -516,6 +519,8 @@ if (!gfx) {
             draw_calls: this._drawCalls,
             depth_view_rid: this._depthAttachment?.viewRid ?? null,
             depth_clear_value: this._depthAttachment?.depthClearValue ?? 1.0,
+            depth_store_op: this._depthAttachment?.depthStoreOp ?? "store",
+            color_store_op: this._colorStoreOp,
             clear_color: this._clearColor,
           });
         }

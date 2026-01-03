@@ -145,6 +145,15 @@ pub struct XrInputSourcesState {
     pub sources: Vec<XrInputSourceData>,
 }
 
+/// Combined frame begin result - reduces 4 separate lock acquisitions to 1
+#[derive(Serialize)]
+pub struct XrFrameBeginResult {
+    pub frame_state: XrFrameState,
+    pub viewer_pose: Option<XrViewerPose>,
+    pub input_sources: XrInputSourcesState,
+    pub swapchain_info: Option<XrSwapchainTextureInfo>,
+}
+
 // ======================= XR State =======================
 
 pub struct XrState {
@@ -193,7 +202,6 @@ pub struct XrState {
     pub right_b_button_action: xr::Action<bool>,
     pub left_hand_path: xr::Path,
     pub right_hand_path: xr::Path,
-    
 }
 
 unsafe impl Send for XrState {}
@@ -206,6 +214,10 @@ pub fn get_xr_state() -> &'static Mutex<Option<XrState>> {
 }
 
 pub static XR_SWAPCHAIN_TEXTURES: OnceLock<Vec<wgpu::Texture>> = OnceLock::new();
+
+/// Cached texture views for XR swapchain - indexed as [swapchain_index][view_index (eye)]
+/// Pre-created during session init to avoid per-frame allocation
+pub static XR_SWAPCHAIN_VIEWS: OnceLock<Vec<[std::sync::Arc<wgpu::TextureView>; 2]>> = OnceLock::new();
 
 // ======================= Helper Functions =======================
 
@@ -280,83 +292,6 @@ pub async fn op_xr_is_supported() -> Result<bool, JsErrorBox> {
     }
 }
 
-unsafe fn enable_foveation(
-    instance: &xr::Instance,
-    session: &xr::Session<xr::Vulkan>,
-    swapchain: &xr::Swapchain<xr::Vulkan>,
-) -> Result<(), JsErrorBox> {
-    eprintln!("Attempting to enable foveation...");
-    
-    // Get function pointers
-    let mut create_foveation_profile: Option<sys::pfn::CreateFoveationProfileFB> = None;
-    let mut update_swapchain: Option<sys::pfn::UpdateSwapchainFB> = None;
-
-    let _ = (instance.fp().get_instance_proc_addr)(
-        instance.as_raw(),
-        c"xrCreateFoveationProfileFB".as_ptr(),
-        &mut create_foveation_profile as *mut _ as *mut _,
-    );
-    
-    let _ = (instance.fp().get_instance_proc_addr)(
-        instance.as_raw(),
-        c"xrUpdateSwapchainFB".as_ptr(),
-        &mut update_swapchain as *mut _ as *mut _,
-    );
-
-    eprintln!("create_foveation_profile fn: {}", create_foveation_profile.is_some());
-    eprintln!("update_swapchain fn: {}", update_swapchain.is_some());
-
-    let create_fn = create_foveation_profile
-        .ok_or_else(|| JsErrorBox::generic("xrCreateFoveationProfileFB not found"))?;
-    let update_fn = update_swapchain
-        .ok_or_else(|| JsErrorBox::generic("xrUpdateSwapchainFB not found"))?;
-
-    // Create fixed foveation profile (high quality setting)
-    let level_profile = sys::FoveationLevelProfileCreateInfoFB {
-        ty: sys::FoveationLevelProfileCreateInfoFB::TYPE,
-        next: std::ptr::null_mut(),
-        level: sys::FoveationLevelFB::HIGH,
-        vertical_offset: 0.0,
-        dynamic: sys::FoveationDynamicFB::LEVEL_ENABLED,
-    };
-
-    let profile_create_info = sys::FoveationProfileCreateInfoFB {
-        ty: sys::FoveationProfileCreateInfoFB::TYPE,
-        next: &level_profile as *const _ as *mut _,
-    };
-
-    let mut foveation_profile = sys::FoveationProfileFB::NULL;
-    let result = (create_fn)(
-        session.as_raw(),
-        &profile_create_info,
-        &mut foveation_profile,
-    );
-    
-    if result != sys::Result::SUCCESS {
-        return Err(JsErrorBox::generic(format!("Failed to create foveation profile: {:?}", result)));
-    }
-
-    // Apply foveation to swapchain
-    let swapchain_state = sys::SwapchainStateFoveationFB {
-        ty: sys::SwapchainStateFoveationFB::TYPE,
-        next: std::ptr::null_mut(),
-        flags: sys::SwapchainStateFoveationFlagsFB::EMPTY,
-        profile: foveation_profile,
-    };
-
-    let result = (update_fn)(
-        swapchain.as_raw(),
-        &swapchain_state as *const _ as *const sys::SwapchainStateBaseHeaderFB,
-    );
-
-    if result != sys::Result::SUCCESS {
-        return Err(JsErrorBox::generic(format!("Failed to update swapchain foveation: {:?}", result)));
-    }
-
-    log::info!("Foveation enabled (HIGH level, dynamic)");
-    Ok(())
-}
-
 pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
     log::info!("Requesting XR session...");
     
@@ -372,7 +307,6 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
     let xr_entry = unsafe { xr::Entry::load() }
         .map_err(|e| JsErrorBox::generic(format!("Failed to load OpenXR: {}", e)))?;
 
-    // Also replace ash::Entry::load with:
     #[cfg(target_os = "android")]
     let vk_entry = unsafe { ash::Entry::load() }.expect("Failed to load Vulkan");
 
@@ -383,12 +317,6 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
     let mut enabled_extensions = xr::ExtensionSet::default();
     enabled_extensions.khr_vulkan_enable2 = true;
 
-    // enabled_extensions.fb_foveation = true;
-    // enabled_extensions.fb_foveation_configuration = true;
-    // enabled_extensions.fb_swapchain_update_state = true;
-
-
-    
     let instance = xr_entry.create_instance(
         &xr::ApplicationInfo {
             application_name: "App",
@@ -408,11 +336,8 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
     let views = instance.enumerate_view_configuration_views(system, view_config_type)
         .map_err(|e| JsErrorBox::generic(format!("Failed to get view config: {}", e)))?;
     
-    // 1680x1760 on Quest 3
     let width = views[0].recommended_image_rect_width;
     let height = views[0].recommended_image_rect_height;
-
-    
     
     let _reqs = instance.graphics_requirements::<xr::Vulkan>(system)
         .map_err(|e| JsErrorBox::generic(format!("Graphics requirements error: {}", e)))?;
@@ -421,15 +346,12 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         .map_err(|e| JsErrorBox::generic(format!("Failed to load Vulkan: {}", e)))?;
     
     let flags = wgpu::InstanceFlags::default();
-    
 
     let instance_exts = <wgpu_hal::vulkan::Api as wgpu_hal::Api>::Instance::desired_extensions(
         &vk_entry,
         VK_TARGET_VERSION,
         flags,
     ).map_err(|e| JsErrorBox::generic(format!("Failed to get instance extensions: {}", e)))?;
-
-    
     
     let extensions_cchar: Vec<_> = instance_exts.iter().map(|s| s.as_ptr()).collect();
     
@@ -494,14 +416,10 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         .ok_or_else(|| JsErrorBox::generic("Failed to expose adapter"))?;
     
     let wgpu_features = wgpu_exposed_adapter.features;
-    let hal_adapter_features = wgpu_exposed_adapter.features;  // Save before move
 
-
-
-    let mut enabled_device_extensions = wgpu_exposed_adapter
+    let enabled_device_extensions = wgpu_exposed_adapter
         .adapter
         .required_device_extensions(wgpu_features);
-
     
     let queue_families = unsafe { 
         vk_instance.get_physical_device_queue_family_properties(vk_physical_device) 
@@ -528,18 +446,16 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         multiview: vk::TRUE,
         ..Default::default()
     };
-
-
     
     let device_extensions: Vec<_> = enabled_device_extensions.iter().map(|s| s.as_ptr()).collect();
     
     let device_create_info = enabled_phd_features
-        .add_to_device_create(
-            vk::DeviceCreateInfo::default()
-                .queue_create_infos(&family_infos)
-                .push_next(&mut multiview_features),
-        )
-        .enabled_extension_names(&device_extensions);
+    .add_to_device_create(
+        vk::DeviceCreateInfo::default()
+            .queue_create_infos(&family_infos)
+            .push_next(&mut multiview_features),
+    )
+    .enabled_extension_names(&device_extensions);
     
     let vk_device = unsafe {
         let get_instance_proc_addr = vk_entry.static_fn().get_instance_proc_addr;
@@ -575,7 +491,6 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         wgpu_instance.create_adapter_from_hal(wgpu_exposed_adapter) 
     };
 
-
     let limits = wgpu_adapter.limits();
     let (wgpu_device, wgpu_queue) = unsafe {
         wgpu_adapter.create_device_from_hal(
@@ -590,8 +505,6 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
             },
         )
     }.map_err(|e| JsErrorBox::generic(format!("Failed to finalize wgpu device: {}", e)))?;
-
-    
     
     let (session, frame_waiter, frame_stream) = unsafe {
         instance.create_session::<xr::Vulkan>(
@@ -620,75 +533,23 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
     let action_set = instance.create_action_set("gameplay", "Gameplay", 0)
         .map_err(|e| JsErrorBox::generic(format!("Failed to create action set: {}", e)))?;
     
-    // Pose actions
-    let left_grip_action = action_set.create_action::<xr::Posef>(
-        "left_grip", "Left Grip Pose", &[left_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let left_grip_action = action_set.create_action::<xr::Posef>("left_grip", "Left Grip Pose", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let right_grip_action = action_set.create_action::<xr::Posef>("right_grip", "Right Grip Pose", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let left_aim_action = action_set.create_action::<xr::Posef>("left_aim", "Left Aim Pose", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let right_aim_action = action_set.create_action::<xr::Posef>("right_aim", "Right Aim Pose", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let left_trigger_action = action_set.create_action::<f32>("left_trigger", "Left Trigger", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let right_trigger_action = action_set.create_action::<f32>("right_trigger", "Right Trigger", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let left_squeeze_action = action_set.create_action::<f32>("left_squeeze", "Left Squeeze", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let right_squeeze_action = action_set.create_action::<f32>("right_squeeze", "Right Squeeze", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let left_thumbstick_action = action_set.create_action::<xr::Vector2f>("left_thumbstick", "Left Thumbstick", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let right_thumbstick_action = action_set.create_action::<xr::Vector2f>("right_thumbstick", "Right Thumbstick", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let left_thumbstick_click_action = action_set.create_action::<bool>("left_thumbstick_click", "Left Thumbstick Click", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let right_thumbstick_click_action = action_set.create_action::<bool>("right_thumbstick_click", "Right Thumbstick Click", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let left_x_button_action = action_set.create_action::<bool>("left_x", "Left X Button", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let left_y_button_action = action_set.create_action::<bool>("left_y", "Left Y Button", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let right_a_button_action = action_set.create_action::<bool>("right_a", "Right A Button", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let right_b_button_action = action_set.create_action::<bool>("right_b", "Right B Button", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
     
-    let right_grip_action = action_set.create_action::<xr::Posef>(
-        "right_grip", "Right Grip Pose", &[right_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let left_aim_action = action_set.create_action::<xr::Posef>(
-        "left_aim", "Left Aim Pose", &[left_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let right_aim_action = action_set.create_action::<xr::Posef>(
-        "right_aim", "Right Aim Pose", &[right_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    // Float actions
-    let left_trigger_action = action_set.create_action::<f32>(
-        "left_trigger", "Left Trigger", &[left_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let right_trigger_action = action_set.create_action::<f32>(
-        "right_trigger", "Right Trigger", &[right_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let left_squeeze_action = action_set.create_action::<f32>(
-        "left_squeeze", "Left Squeeze", &[left_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let right_squeeze_action = action_set.create_action::<f32>(
-        "right_squeeze", "Right Squeeze", &[right_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    // Thumbstick actions
-    let left_thumbstick_action = action_set.create_action::<xr::Vector2f>(
-        "left_thumbstick", "Left Thumbstick", &[left_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let right_thumbstick_action = action_set.create_action::<xr::Vector2f>(
-        "right_thumbstick", "Right Thumbstick", &[right_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let left_thumbstick_click_action = action_set.create_action::<bool>(
-        "left_thumbstick_click", "Left Thumbstick Click", &[left_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let right_thumbstick_click_action = action_set.create_action::<bool>(
-        "right_thumbstick_click", "Right Thumbstick Click", &[right_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    // Button actions
-    let left_x_button_action = action_set.create_action::<bool>(
-        "left_x", "Left X Button", &[left_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let left_y_button_action = action_set.create_action::<bool>(
-        "left_y", "Left Y Button", &[left_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let right_a_button_action = action_set.create_action::<bool>(
-        "right_a", "Right A Button", &[right_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    let right_b_button_action = action_set.create_action::<bool>(
-        "right_b", "Right B Button", &[right_hand_path]
-    ).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
-    // Suggest bindings for Oculus Touch
     let oculus_profile = instance.string_to_path("/interaction_profiles/oculus/touch_controller").unwrap();
     
     instance.suggest_interaction_profile_bindings(oculus_profile, &[
@@ -710,34 +571,19 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         xr::Binding::new(&right_b_button_action, instance.string_to_path("/user/hand/right/input/b/click").unwrap()),
     ]).map_err(|e| JsErrorBox::generic(format!("Failed to suggest bindings: {}", e)))?;
     
-    // Create action spaces
-    let left_grip_space = left_grip_action.create_space(
-        session.clone(), left_hand_path, xr::Posef::IDENTITY
-    ).map_err(|e| JsErrorBox::generic(format!("Space error: {}", e)))?;
+    let left_grip_space = left_grip_action.create_space(session.clone(), left_hand_path, xr::Posef::IDENTITY).map_err(|e| JsErrorBox::generic(format!("Space error: {}", e)))?;
+    let right_grip_space = right_grip_action.create_space(session.clone(), right_hand_path, xr::Posef::IDENTITY).map_err(|e| JsErrorBox::generic(format!("Space error: {}", e)))?;
+    let left_aim_space = left_aim_action.create_space(session.clone(), left_hand_path, xr::Posef::IDENTITY).map_err(|e| JsErrorBox::generic(format!("Space error: {}", e)))?;
+    let right_aim_space = right_aim_action.create_space(session.clone(), right_hand_path, xr::Posef::IDENTITY).map_err(|e| JsErrorBox::generic(format!("Space error: {}", e)))?;
     
-    let right_grip_space = right_grip_action.create_space(
-        session.clone(), right_hand_path, xr::Posef::IDENTITY
-    ).map_err(|e| JsErrorBox::generic(format!("Space error: {}", e)))?;
-    
-    let left_aim_space = left_aim_action.create_space(
-        session.clone(), left_hand_path, xr::Posef::IDENTITY
-    ).map_err(|e| JsErrorBox::generic(format!("Space error: {}", e)))?;
-    
-    let right_aim_space = right_aim_action.create_space(
-        session.clone(), right_hand_path, xr::Posef::IDENTITY
-    ).map_err(|e| JsErrorBox::generic(format!("Space error: {}", e)))?;
-    
-    // Attach action set
     session.attach_action_sets(&[&action_set])
         .map_err(|e| JsErrorBox::generic(format!("Failed to attach action sets: {}", e)))?;
     
-    
     // ======================= Swapchain =======================
-    let swapchain = session.create_swapchain(&xr::SwapchainCreateInfo {
-        create_flags: xr::SwapchainCreateFlags::EMPTY,
-        usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT 
-            | xr::SwapchainUsageFlags::SAMPLED,
-        format: vk::Format::R8G8B8A8_SRGB.as_raw() as _,
+    let swapchain = session.create_swapchain(&openxr::SwapchainCreateInfo {
+        create_flags: openxr::SwapchainCreateFlags::EMPTY,
+        usage_flags: openxr::SwapchainUsageFlags::COLOR_ATTACHMENT | openxr::SwapchainUsageFlags::SAMPLED,
+        format: vk::Format::R8G8B8A8_SRGB.as_raw() as u32,
         sample_count: 1,
         width,
         height,
@@ -746,54 +592,16 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         mip_count: 1,
     }).map_err(|e| JsErrorBox::generic(format!("Failed to create swapchain: {}", e)))?;
 
-
-    // Not working  / part of the WebGPU spec yet :/
-    // unsafe {
-    //     match enable_foveation(&instance, &session, &swapchain) {
-    //         Ok(()) => eprintln!("Foveation setup succeeded"),
-    //         Err(e) => eprintln!("Failed to enable foveation: {}", e),
-    //     }
-    // }
-
-    let mut get_foveation: Option<sys::pfn::GetSwapchainStateFB> = None;
-    let _ = unsafe {
-        (instance.fp().get_instance_proc_addr)(
-            instance.as_raw(),
-            c"xrGetSwapchainStateFB".as_ptr(),
-            &mut get_foveation as *mut _ as *mut _,
-        )
-    };
-
-    if let Some(get_fn) = get_foveation {
-        let mut foveation_state = sys::SwapchainStateFoveationFB {
-            ty: sys::SwapchainStateFoveationFB::TYPE,
-            next: std::ptr::null_mut(),
-            flags: sys::SwapchainStateFoveationFlagsFB::EMPTY,
-            profile: sys::FoveationProfileFB::NULL,
-        };
-        
-        let result = unsafe {
-            (get_fn)(
-                swapchain.as_raw(),
-                &mut foveation_state as *mut _ as *mut sys::SwapchainStateBaseHeaderFB,
-            )
-        };
-        
-        eprintln!("Get foveation state result: {:?}", result);
-        eprintln!("Foveation profile is null: {}", foveation_state.profile == sys::FoveationProfileFB::NULL);
-    } else {
-        eprintln!("xrGetSwapchainStateFB not found");
-    }
-    
+    // ======================= Enumerate Images =======================
     let swapchain_images = swapchain.enumerate_images()
         .map_err(|e| JsErrorBox::generic(format!("Failed to enumerate swapchain images: {}", e)))?;
-    
     let swapchain_length = swapchain_images.len() as u32;
-    
+
+    // ======================= Create wgpu Textures =======================
     let swapchain_textures: Vec<wgpu::Texture> = swapchain_images
-        .into_iter()
-        .map(|vk_image| {
-            let vk_image = vk::Image::from_raw(vk_image);
+        .iter()
+        .map(|&vk_image_raw| {
+            let vk_image = vk::Image::from_raw(vk_image_raw);
             
             let wgpu_hal_texture = unsafe {
                 wgpu_device
@@ -836,8 +644,9 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
             Ok(texture)
         })
         .collect::<Result<Vec<_>, JsErrorBox>>()?;
-    
-    // Set GfxContext
+  
+
+    // ======================= Set GfxContext =======================
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let gfx_box = Box::new(GfxContext {
         device: wgpu_device,
@@ -896,8 +705,41 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
     };
     
     *get_xr_state().lock().unwrap() = Some(state);
+
+    // Pre-create texture views for all swapchain images and both eyes
+    // This avoids per-frame view creation overhead
+    let swapchain_views: Vec<[std::sync::Arc<wgpu::TextureView>; 2]> = swapchain_textures
+        .iter()
+        .map(|texture| {
+            let left_view = std::sync::Arc::new(texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("XR Swapchain View Left"),
+                format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                aspect: wgpu::TextureAspect::All,
+                base_mip_level: 0,
+                mip_level_count: Some(1),
+                base_array_layer: 0,
+                array_layer_count: Some(1),
+                usage: None,
+            }));
+            let right_view = std::sync::Arc::new(texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("XR Swapchain View Right"),
+                format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                aspect: wgpu::TextureAspect::All,
+                base_mip_level: 0,
+                mip_level_count: Some(1),
+                base_array_layer: 1,
+                array_layer_count: Some(1),
+                usage: None,
+            }));
+            [left_view, right_view]
+        })
+        .collect();
+
     let _ = XR_SWAPCHAIN_TEXTURES.set(swapchain_textures);
-    
+    let _ = XR_SWAPCHAIN_VIEWS.set(swapchain_views);
+
     log::info!("XR session created successfully");
     
     Ok(XrSessionInfo {
@@ -908,7 +750,6 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         swapchain_length,
     })
 }
-
 
 #[op2(async)]
 #[serde]
@@ -1131,6 +972,203 @@ pub fn op_xr_get_input_sources() -> Result<XrInputSourcesState, JsErrorBox> {
     Ok(XrInputSourcesState { sources })
 }
 
+/// Combined frame begin operation - performs wait_frame, get_viewer_pose,
+/// get_input_sources, and acquire_swapchain_image in a single lock acquisition.
+/// This reduces mutex overhead from 4 separate locks to 1 per frame.
+#[op2]
+#[serde]
+pub fn op_xr_frame_begin() -> Result<XrFrameBeginResult, JsErrorBox> {
+    let mut guard = get_xr_state().lock().unwrap();
+    let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
+
+    // === wait_frame ===
+    if !state.session_running {
+        return Ok(XrFrameBeginResult {
+            frame_state: XrFrameState { predicted_display_time: 0, should_render: false },
+            viewer_pose: None,
+            input_sources: XrInputSourcesState { sources: Vec::new() },
+            swapchain_info: None,
+        });
+    }
+
+    let frame_state = state.frame_waiter.wait()
+        .map_err(|e| JsErrorBox::generic(format!("Wait failed: {}", e)))?;
+
+    state.frame_stream.begin()
+        .map_err(|e| JsErrorBox::generic(format!("Begin failed: {}", e)))?;
+
+    state.frame_state = Some(frame_state);
+
+    let js_frame_state = XrFrameState {
+        predicted_display_time: frame_state.predicted_display_time.as_nanos(),
+        should_render: frame_state.should_render,
+    };
+
+    // If we shouldn't render, return early with minimal data
+    if !frame_state.should_render {
+        return Ok(XrFrameBeginResult {
+            frame_state: js_frame_state,
+            viewer_pose: None,
+            input_sources: XrInputSourcesState { sources: Vec::new() },
+            swapchain_info: None,
+        });
+    }
+
+    // === get_viewer_pose ===
+    let (_, views) = state.session.locate_views(
+        state.view_config_type,
+        frame_state.predicted_display_time,
+        &state.stage_space,
+    ).map_err(|e| JsErrorBox::generic(format!("Locate views failed: {}", e)))?;
+
+    let w = state.render_width;
+    let h = state.render_height;
+
+    let xr_views: Vec<XrView> = views.iter().enumerate().map(|(i, view)| {
+        XrView {
+            projection_matrix: fov_to_projection_matrix(&view.fov, 0.05, 500.0),
+            transform: XrPose {
+                position: [view.pose.position.x, view.pose.position.y, view.pose.position.z],
+                orientation: [view.pose.orientation.x, view.pose.orientation.y, view.pose.orientation.z, view.pose.orientation.w],
+                matrix: pose_to_matrix(&view.pose),
+            },
+            view_index: i as u32,
+            viewport_x: 0,
+            viewport_y: 0,
+            viewport_width: w,
+            viewport_height: h,
+        }
+    }).collect();
+
+    state.cached_views = Some(views);
+    let viewer_pose = Some(XrViewerPose { views: xr_views });
+
+    // === get_input_sources ===
+    let active_action_set = xr::ActiveActionSet::new(&state.action_set);
+    let input_sources = if state.session.sync_actions(&[active_action_set]).is_ok() {
+        let time = frame_state.predicted_display_time;
+        let mut sources = Vec::with_capacity(2);
+
+        // Helper to get pose
+        let get_pose = |space: &xr::Space, stage: &xr::Space, time: xr::Time| -> Option<XrPose> {
+            space.locate(stage, time).ok()
+                .filter(|loc| loc.location_flags.contains(
+                    xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID
+                ))
+                .map(|loc| XrPose {
+                    position: [loc.pose.position.x, loc.pose.position.y, loc.pose.position.z],
+                    orientation: [loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w],
+                    matrix: pose_to_matrix(&loc.pose),
+                })
+        };
+
+        // Left controller
+        let left_grip = get_pose(&state.left_grip_space, &state.stage_space, time);
+        let left_aim = get_pose(&state.left_aim_space, &state.stage_space, time);
+
+        if left_grip.is_some() || left_aim.is_some() {
+            let trigger = state.left_trigger_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(0.0);
+            let squeeze = state.left_squeeze_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(0.0);
+            let thumbstick = state.left_thumbstick_action.state(&state.session, xr::Path::NULL)
+                .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
+            let stick_click = state.left_thumbstick_click_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+            let x_btn = state.left_x_button_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+            let y_btn = state.left_y_button_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+
+            sources.push(XrInputSourceData {
+                handedness: "left".to_string(),
+                target_ray_mode: "tracked-pointer".to_string(),
+                profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
+                grip_space_pose: left_grip,
+                target_ray_pose: left_aim,
+                gamepad: Some(XrGamepadData {
+                    buttons: vec![
+                        XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
+                        XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
+                        XrButtonData { pressed: false, touched: false, value: 0.0 },
+                        XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
+                        XrButtonData { pressed: x_btn, touched: x_btn, value: if x_btn { 1.0 } else { 0.0 } },
+                        XrButtonData { pressed: y_btn, touched: y_btn, value: if y_btn { 1.0 } else { 0.0 } },
+                    ],
+                    axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
+                }),
+                hand: None,
+            });
+        }
+
+        // Right controller
+        let right_grip = get_pose(&state.right_grip_space, &state.stage_space, time);
+        let right_aim = get_pose(&state.right_aim_space, &state.stage_space, time);
+
+        if right_grip.is_some() || right_aim.is_some() {
+            let trigger = state.right_trigger_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(0.0);
+            let squeeze = state.right_squeeze_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(0.0);
+            let thumbstick = state.right_thumbstick_action.state(&state.session, xr::Path::NULL)
+                .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
+            let stick_click = state.right_thumbstick_click_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+            let a_btn = state.right_a_button_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+            let b_btn = state.right_b_button_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+
+            sources.push(XrInputSourceData {
+                handedness: "right".to_string(),
+                target_ray_mode: "tracked-pointer".to_string(),
+                profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
+                grip_space_pose: right_grip,
+                target_ray_pose: right_aim,
+                gamepad: Some(XrGamepadData {
+                    buttons: vec![
+                        XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
+                        XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
+                        XrButtonData { pressed: false, touched: false, value: 0.0 },
+                        XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
+                        XrButtonData { pressed: a_btn, touched: a_btn, value: if a_btn { 1.0 } else { 0.0 } },
+                        XrButtonData { pressed: b_btn, touched: b_btn, value: if b_btn { 1.0 } else { 0.0 } },
+                    ],
+                    axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
+                }),
+                hand: None,
+            });
+        }
+
+        XrInputSourcesState { sources }
+    } else {
+        XrInputSourcesState { sources: Vec::new() }
+    };
+
+    // === acquire_swapchain_image ===
+    let index = state.swapchain.acquire_image()
+        .map_err(|e| JsErrorBox::generic(format!("Acquire failed: {}", e)))?;
+
+    state.swapchain.wait_image(xr::Duration::INFINITE)
+        .map_err(|e| JsErrorBox::generic(format!("Wait failed: {}", e)))?;
+
+    state.current_swapchain_index = Some(index);
+
+    let swapchain_info = Some(XrSwapchainTextureInfo {
+        index,
+        width: state.render_width,
+        height: state.render_height,
+        array_layers: 2,
+    });
+
+    Ok(XrFrameBeginResult {
+        frame_state: js_frame_state,
+        viewer_pose,
+        input_sources,
+        swapchain_info,
+    })
+}
+
 #[op2]
 #[serde]
 pub fn op_xr_acquire_swapchain_image() -> Result<XrSwapchainTextureInfo, JsErrorBox> {
@@ -1144,6 +1182,8 @@ pub fn op_xr_acquire_swapchain_image() -> Result<XrSwapchainTextureInfo, JsError
         .map_err(|e| JsErrorBox::generic(format!("Wait failed: {}", e)))?;
     
     state.current_swapchain_index = Some(index);
+
+
     
     Ok(XrSwapchainTextureInfo {
         index,
@@ -1158,12 +1198,15 @@ pub fn op_xr_release_swapchain_image() -> Result<(), JsErrorBox> {
     let mut guard = get_xr_state().lock().unwrap();
     let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
     
+    
     state.swapchain.release_image()
         .map_err(|e| JsErrorBox::generic(format!("Release failed: {}", e)))?;
     
     state.current_swapchain_index = None;
     Ok(())
 }
+
+
 #[op2(fast)]
 pub fn op_xr_end_frame() -> Result<(), JsErrorBox> {
 
@@ -1254,33 +1297,25 @@ pub fn op_xr_get_swapchain_texture_view(
 ) -> Result<crate::gfx::JsGfxTextureView, JsErrorBox> {
     let guard = get_xr_state().lock().unwrap();
     let xr_state = guard.as_ref().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
-    
+
     let swapchain_index = xr_state.current_swapchain_index
         .ok_or_else(|| JsErrorBox::generic("No swapchain image acquired"))?;
-    
-    let textures = XR_SWAPCHAIN_TEXTURES.get()
-        .ok_or_else(|| JsErrorBox::generic("Swapchain textures not initialized"))?;
-    
-    let texture = textures.get(swapchain_index as usize)
+
+    // Use pre-cached texture views instead of creating new ones each frame
+    let cached_views = XR_SWAPCHAIN_VIEWS.get()
+        .ok_or_else(|| JsErrorBox::generic("Swapchain views not initialized"))?;
+
+    let views_for_image = cached_views.get(swapchain_index as usize)
         .ok_or_else(|| JsErrorBox::generic("Invalid swapchain index"))?;
-    
-    let view = texture.create_view(&wgpu::TextureViewDescriptor {
-        label: Some("XR Swapchain View"),
-        format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-        dimension: Some(wgpu::TextureViewDimension::D2),
-        aspect: wgpu::TextureAspect::All,
-        base_mip_level: 0,
-        mip_level_count: Some(1),
-        base_array_layer: view_index,
-        array_layer_count: Some(1),
-        usage: None,
-    });
-    
+
+    let view = views_for_image.get(view_index as usize)
+        .ok_or_else(|| JsErrorBox::generic("Invalid view index (must be 0 or 1)"))?;
+
     let rid = state.resource_table.add(crate::gfx::GfxTextureView {
-        view: std::sync::Arc::new(view),
+        view: view.clone(),
         width: xr_state.render_width,
         height: xr_state.render_height,
     });
-    
+
     Ok(crate::gfx::JsGfxTextureView { rid })
 }

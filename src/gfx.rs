@@ -29,7 +29,7 @@ struct MsaaState {
 pub struct GfxContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    pub surface: Option<wgpu::Surface<'static>>,  // Make optional
+    pub surface: Option<wgpu::Surface<'static>>, 
     pub format: wgpu::TextureFormat,
 }
 
@@ -341,7 +341,6 @@ fn sanitize_wgsl(code: &str) -> String {
 
     let re_vecu_i32 = regex::Regex::new(r"(\d+)i(\s*[,\)])").unwrap();
     
-    // Only apply within vec*u context - more targeted approach
     let re_vec2u = regex::Regex::new(r"vec2u\([^)]+\)").unwrap();
     result = re_vec2u.replace_all(&result, |caps: &regex::Captures| {
         let matched = &caps[0];
@@ -737,6 +736,25 @@ fn get_msaa_state() -> &'static RwLock<Option<MsaaState>> {
 
 const SAMPLE_COUNT: u32 = 4;
 
+// ======================= Command Buffer Batching =======================
+// Accumulates command buffers for batched submission to reduce CPU overhead
+static PENDING_COMMAND_BUFFERS: OnceLock<Mutex<Vec<wgpu::CommandBuffer>>> = OnceLock::new();
+
+fn get_pending_commands() -> &'static Mutex<Vec<wgpu::CommandBuffer>> {
+    PENDING_COMMAND_BUFFERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn queue_command_buffer(cmd: wgpu::CommandBuffer) {
+    get_pending_commands().lock().unwrap().push(cmd);
+}
+
+fn flush_pending_commands(queue: &wgpu::Queue) {
+    let mut pending = get_pending_commands().lock().unwrap();
+    if !pending.is_empty() {
+        queue.submit(pending.drain(..));
+    }
+}
+
 fn ensure_msaa_texture(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -756,6 +774,8 @@ fn ensure_msaa_texture(
     }
 
     // Need to create/recreate
+    // TRANSIENT hint tells tile-based GPUs this texture never needs system memory backing
+    // since we discard it after resolve. possibly? saves memory bandwidth on Quest 3.
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("MSAA Texture"),
         size: wgpu::Extent3d {
@@ -767,7 +787,7 @@ fn ensure_msaa_texture(
         sample_count: SAMPLE_COUNT,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -938,7 +958,7 @@ pub struct DecodeImageStoreArgs {
 #[op2]
 #[serde]
 pub fn op_gfx_decode_image_store(
-    _state: &mut OpState,  // No longer using state.resource_table
+    _state: &mut OpState,
     #[buffer] data: JsBuffer,
     #[serde] args: DecodeImageStoreArgs,
 ) -> Result<DecodeImageStoreResult, JsErrorBox> {
@@ -2009,18 +2029,10 @@ pub fn op_gfx_surface_draw(
         }
     }
 
-    let mut encoder = ctx
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("GFX Encoder"),
-        });
-
-    let mut first_pass = true;
-
+    // Pre-collect depth view and ops from first draw call that has depth
     let mut depth_view: Option<Arc<wgpu::TextureView>> = None;
-    let mut depth_ops_base: Option<wgpu::Operations<f32>> = None;
+    let mut depth_ops: Option<wgpu::Operations<f32>> = None;
 
-    // Pre-validate and collect depth view
     for dc in args.draw_calls.iter() {
         if depth_view.is_none() {
             if let Some(view_rid) = dc.depth_view_rid {
@@ -2033,22 +2045,57 @@ pub fn op_gfx_surface_draw(
                 let clear = dc.depth_clear_value.unwrap_or(1.0);
                 let load = match dc.depth_load_op.as_deref() {
                     Some("load") => wgpu::LoadOp::Load,
-                    Some("clear") | _ => wgpu::LoadOp::Clear(clear),
+                    _ => wgpu::LoadOp::Clear(clear),
                 };
                 let store = match dc.depth_store_op.as_deref() {
                     Some("discard") => wgpu::StoreOp::Discard,
                     _ => wgpu::StoreOp::Store,
                 };
 
-                depth_ops_base = Some(wgpu::Operations { load, store });
+                depth_ops = Some(wgpu::Operations { load, store });
+                break;
             }
         }
     }
 
-    for (call_idx, dc) in args.draw_calls.iter().enumerate() {
+    // Determine color clear from first draw call
+    let color_load_op = if let Some(c) = args.draw_calls.first().and_then(|dc| dc.clear_color.as_ref()) {
+        wgpu::LoadOp::Clear(wgpu::Color {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        })
+    } else {
+        wgpu::LoadOp::Load
+    };
 
+    // Pre-collect all draw data BEFORE starting the render pass
+    struct SurfaceDrawData {
+        pipeline_rid: u32,
+        vbufs: Vec<Arc<wgpu::Buffer>>,
+        bgs: Vec<Option<Arc<wgpu::BindGroup>>>,
+        index_buf: Option<Arc<wgpu::Buffer>>,
+        indirect_buf: Option<Arc<wgpu::Buffer>>,
+        index_format: wgpu::IndexFormat,
+        is_multi_draw: bool,
+        is_indirect: bool,
+        indirect_offset: u64,
+        draw_count: u32,
+        index_count: u32,
+        first_index: u32,
+        base_vertex: i32,
+        instance_count: u32,
+        first_instance: u32,
+        vertex_count: u32,
+        first_vertex: u32,
+    }
+
+    let mut draw_data_list: Vec<SurfaceDrawData> = Vec::with_capacity(args.draw_calls.len());
+
+    for (call_idx, dc) in args.draw_calls.iter().enumerate() {
         // Validate pipeline exists
-        let pipeline_res = state
+        let _ = state
             .resource_table
             .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
             .map_err(|e| {
@@ -2058,61 +2105,57 @@ pub fn op_gfx_surface_draw(
                 ))
             })?;
 
-        // Validate and collect vertex buffers
         let mut vbufs: Vec<Arc<wgpu::Buffer>> = Vec::new();
         for (slot, rid) in dc.vertex_buffer_rids.iter().enumerate() {
-            let buf_res =
-                state
-                    .resource_table
-                    .get::<GfxBuffer>(ResourceId::from(*rid))
-                    .map_err(|e| {
-                        JsErrorBox::generic(format!(
-                            "Draw call {}: invalid vertex buffer at slot {}: {}",
-                            call_idx, slot, e
-                        ))
-                    })?;
+            let buf_res = state
+                .resource_table
+                .get::<GfxBuffer>(ResourceId::from(*rid))
+                .map_err(|e| {
+                    JsErrorBox::generic(format!(
+                        "Draw call {}: invalid vertex buffer at slot {}: {}",
+                        call_idx, slot, e
+                    ))
+                })?;
             vbufs.push(buf_res.buffer.clone());
         }
 
-        // Validate and collect bind groups
         let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
         for (idx, rid_opt) in dc.bind_group_rids.iter().enumerate() {
             if let Some(rid) = rid_opt {
-                let bg_res =
-                    state
-                        .resource_table
-                        .get::<GfxBindGroup>(ResourceId::from(*rid))
-                        .map_err(|e| {
-                            JsErrorBox::generic(format!(
-                                "Draw call {}: invalid bind group at index {}: {}",
-                                call_idx, idx, e
-                            ))
-                        })?;
+                let bg_res = state
+                    .resource_table
+                    .get::<GfxBindGroup>(ResourceId::from(*rid))
+                    .map_err(|e| {
+                        JsErrorBox::generic(format!(
+                            "Draw call {}: invalid bind group at index {}: {}",
+                            call_idx, idx, e
+                        ))
+                    })?;
                 bgs.push(Some(bg_res.group.clone()));
             } else {
                 bgs.push(None);
             }
         }
 
-        // Validate index buffer if used
         let index_buf: Option<Arc<wgpu::Buffer>> = if let Some(rid) = dc.index_buffer_rid {
-            let buf_res =
-                state
-                    .resource_table
-                    .get::<GfxBuffer>(ResourceId::from(rid))
-                    .map_err(|e| {
-                        JsErrorBox::generic(format!(
-                            "Draw call {}: invalid index buffer: {}",
-                            call_idx, e
-                        ))
-                    })?;
+            let buf_res = state
+                .resource_table
+                .get::<GfxBuffer>(ResourceId::from(rid))
+                .map_err(|e| {
+                    JsErrorBox::generic(format!(
+                        "Draw call {}: invalid index buffer: {}",
+                        call_idx, e
+                    ))
+                })?;
             Some(buf_res.buffer.clone())
         } else {
             None
         };
 
-        // Get indirect buffer if multi-draw
-        let indirect_buf: Option<Arc<wgpu::Buffer>> = if dc.is_multi_draw.unwrap_or(false) || dc.is_indirect.unwrap_or(false) {
+        let is_multi_draw = dc.is_multi_draw.unwrap_or(false);
+        let is_indirect = dc.is_indirect.unwrap_or(false);
+
+        let indirect_buf: Option<Arc<wgpu::Buffer>> = if is_multi_draw || is_indirect {
             if let Some(rid) = dc.indirect_buffer_rid {
                 let buf_res = state
                     .resource_table
@@ -2131,130 +2174,107 @@ pub fn op_gfx_surface_draw(
             None
         };
 
-        let load_op_color = if first_pass {
-            if let Some(c) = dc.clear_color.as_ref() {
-                wgpu::LoadOp::Clear(wgpu::Color {
-                    r: c.r,
-                    g: c.g,
-                    b: c.b,
-                    a: c.a,
-                })
-            } else {
-                wgpu::LoadOp::Load
-            }
-        } else {
-            wgpu::LoadOp::Load
+        let index_format = match dc.index_format.as_deref() {
+            Some("uint16") => wgpu::IndexFormat::Uint16,
+            _ => wgpu::IndexFormat::Uint32,
         };
 
-        let depth_attachment: Option<wgpu::RenderPassDepthStencilAttachment> =
-            match (&depth_view, &depth_ops_base) {
-                (Some(dv), Some(ops_base)) => {
-                    let load = if first_pass {
-                        ops_base.load
-                    } else {
-                        wgpu::LoadOp::Load
-                    };
-                    Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: dv.as_ref(),
-                        depth_ops: Some(wgpu::Operations {
-                            load,
-                            store: ops_base.store,
-                        }),
-                        stencil_ops: None,
-                    })
-                }
-                _ => None,
-            };
+        draw_data_list.push(SurfaceDrawData {
+            pipeline_rid: dc.pipeline_rid,
+            vbufs,
+            bgs,
+            index_buf,
+            indirect_buf,
+            index_format,
+            is_multi_draw,
+            is_indirect,
+            indirect_offset: dc.indirect_offset.unwrap_or(0),
+            draw_count: dc.draw_count.unwrap_or(0),
+            index_count: dc.index_count,
+            first_index: dc.first_index,
+            base_vertex: dc.base_vertex,
+            instance_count: dc.instance_count,
+            first_instance: dc.first_instance,
+            vertex_count: dc.vertex_count,
+            first_vertex: dc.first_vertex,
+        });
+    }
 
-        if first_pass {
-            first_pass = false;
-        }
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GFX Encoder"),
+    });
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("GFX Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: msaa_view,
-                    resolve_target: Some(&resolve_view),
-                    ops: wgpu::Operations {
-                        load: load_op_color,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: depth_attachment,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,  
-            });
+    // SINGLE render pass for ALL draw calls - critical for tile-based GPU performance
+    {
+        let depth_attachment = match (&depth_view, &depth_ops) {
+            (Some(dv), Some(ops)) => Some(wgpu::RenderPassDepthStencilAttachment {
+                view: dv.as_ref(),
+                depth_ops: Some(*ops),
+                stencil_ops: None,
+            }),
+            _ => None,
+        };
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("GFX Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: msaa_view,
+                resolve_target: Some(&resolve_view),
+                ops: wgpu::Operations {
+                    load: color_load_op,
+                    store: wgpu::StoreOp::Discard, // MSAA not needed after resolve
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: depth_attachment,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+            multiview_mask: None,
+        });
+
+        // Issue all draw calls within the single pass
+        for data in draw_data_list.iter() {
+            let pipeline_res = state
+                .resource_table
+                .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
+                .unwrap(); // Safe: we validated above
 
             pass.set_pipeline(&pipeline_res.pipeline);
 
-            for (slot, buf) in vbufs.iter().enumerate() {
+            for (slot, buf) in data.vbufs.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buf.slice(..));
             }
 
-            for (idx, bg_opt) in bgs.iter().enumerate() {
+            for (idx, bg_opt) in data.bgs.iter().enumerate() {
                 if let Some(bg) = bg_opt {
                     pass.set_bind_group(idx as u32, bg.as_ref(), &[]);
                 }
             }
 
-            // Handle multi-draw vs regular draw
-            if dc.is_multi_draw.unwrap_or(false) {
-                
-
-                if let (Some(idx_buf), Some(indirect_buf)) = (index_buf.as_ref(), indirect_buf.as_ref()) {
-                    let fmt = match dc.index_format.as_deref() {
-                        Some("uint16") => wgpu::IndexFormat::Uint16,
-                        _ => wgpu::IndexFormat::Uint32,
-                    };
-                    pass.set_index_buffer(idx_buf.slice(..), fmt);
-                    pass.multi_draw_indexed_indirect(
-                        &indirect_buf,
-                        dc.indirect_offset.unwrap_or(0),
-                        dc.draw_count.unwrap_or(0),
-                    );
+            if data.is_multi_draw {
+                if let (Some(ref idx_buf), Some(ref indirect)) = (&data.index_buf, &data.indirect_buf) {
+                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.multi_draw_indexed_indirect(indirect, data.indirect_offset, data.draw_count);
                 }
-            }
-            else if dc.is_indirect.unwrap_or(false) {
-                eprintln!("Using indirect");
-                if let (Some(idx_buf), Some(indirect_buf)) = (index_buf.as_ref(), indirect_buf.as_ref()) {
-                    let fmt = match dc.index_format.as_deref() {
-                        Some("uint16") => wgpu::IndexFormat::Uint16,
-                        _ => wgpu::IndexFormat::Uint32,
-                    };
-                    pass.set_index_buffer(idx_buf.slice(..), fmt);
-                    pass.draw_indexed_indirect(&indirect_buf, dc.indirect_offset.unwrap_or(0));
+            } else if data.is_indirect {
+                if let (Some(ref idx_buf), Some(ref indirect)) = (&data.index_buf, &data.indirect_buf) {
+                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.draw_indexed_indirect(indirect, data.indirect_offset);
                 }
-            }
-            else if let Some(idx_buf) = index_buf.as_ref() {
-                if dc.index_count > 0 {
-                    let fmt = match dc.index_format.as_deref() {
-                        Some("uint16") => wgpu::IndexFormat::Uint16,
-                        _ => wgpu::IndexFormat::Uint32,
-                    };
-
-                    pass.set_index_buffer(idx_buf.slice(..), fmt);
-
-                    let first_index = dc.first_index;
-                    let last_index = first_index + dc.index_count;
-                    let first_instance = dc.first_instance;
-                    let last_instance = first_instance + dc.instance_count;
-
+            } else if let Some(ref idx_buf) = data.index_buf {
+                if data.index_count > 0 {
+                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
                     pass.draw_indexed(
-                        first_index..last_index,
-                        dc.base_vertex,
-                        first_instance..last_instance,
+                        data.first_index..(data.first_index + data.index_count),
+                        data.base_vertex,
+                        data.first_instance..(data.first_instance + data.instance_count),
                     );
                 }
-            } else if dc.vertex_count > 0 && dc.instance_count > 0 {
-                let first_v = dc.first_vertex;
-                let last_v = first_v + dc.vertex_count;
-                let first_i = dc.first_instance;
-                let last_i = first_i + dc.instance_count;
-
-                pass.draw(first_v..last_v, first_i..last_i);
+            } else if data.vertex_count > 0 && data.instance_count > 0 {
+                pass.draw(
+                    data.first_vertex..(data.first_vertex + data.vertex_count),
+                    data.first_instance..(data.first_instance + data.instance_count),
+                );
             }
         }
     }
@@ -2403,9 +2423,32 @@ pub struct RenderXrFrameArgs {
     pub draw_calls: Vec<DrawCall>,
     pub depth_view_rid: Option<u32>,
     pub depth_clear_value: Option<f32>,
+    pub depth_store_op: Option<String>,
+    pub color_store_op: Option<String>,
     pub clear_color: Option<ClearColor>,
 }
 
+
+// Pre-collected draw call data for single-pass rendering (avoids borrow issues)
+struct XrDrawData {
+    pipeline_rid: u32,
+    vbufs: Vec<Arc<wgpu::Buffer>>,
+    bgs: Vec<Option<Arc<wgpu::BindGroup>>>,
+    index_buf: Option<Arc<wgpu::Buffer>>,
+    indirect_buf: Option<Arc<wgpu::Buffer>>,
+    index_format: wgpu::IndexFormat,
+    is_multi_draw: bool,
+    is_indirect: bool,
+    indirect_offset: u64,
+    draw_count: u32,
+    index_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    instance_count: u32,
+    first_instance: u32,
+    vertex_count: u32,
+    first_vertex: u32,
+}
 
 #[op2]
 pub fn op_gfx_render_xr_frame(
@@ -2439,21 +2482,13 @@ pub fn op_gfx_render_xr_frame(
         None
     };
 
-    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("XR Frame Encoder"),
-    });
-
-    let clear_color = args.clear_color.as_ref().map(|c| wgpu::Color {
-        r: c.r,
-        g: c.g,
-        b: c.b,
-        a: c.a,
-    });
-
-    let mut first_pass = true;
+    // Pre-collect all resources BEFORE starting the render pass
+    // This avoids multiple tile flushes on tile-based GPUs like Quest 3
+    let mut draw_data_list: Vec<XrDrawData> = Vec::with_capacity(args.draw_calls.len());
 
     for dc in args.draw_calls.iter() {
-        let pipeline_res = state
+        // Validate pipeline exists (we'll fetch it again in the pass)
+        let _ = state
             .resource_table
             .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
             .map_err(|e| JsErrorBox::generic(e.to_string()))?;
@@ -2490,8 +2525,10 @@ pub fn op_gfx_render_xr_frame(
             None
         };
 
-        // Get indirect buffer if multi-draw
-        let indirect_buf: Option<Arc<wgpu::Buffer>> = if dc.is_multi_draw.unwrap_or(false) || dc.is_indirect.unwrap_or(false) {
+        let is_multi_draw = dc.is_multi_draw.unwrap_or(false);
+        let is_indirect = dc.is_indirect.unwrap_or(false);
+
+        let indirect_buf: Option<Arc<wgpu::Buffer>> = if is_multi_draw || is_indirect {
             if let Some(rid) = dc.indirect_buffer_rid {
                 let buf_res = state
                     .resource_table
@@ -2505,128 +2542,147 @@ pub fn op_gfx_render_xr_frame(
             None
         };
 
-        let color_load_op = if first_pass {
-            match clear_color {
-                Some(c) => wgpu::LoadOp::Clear(c),
-                None => wgpu::LoadOp::Load,
+        let index_format = match dc.index_format.as_deref() {
+            Some("uint16") => wgpu::IndexFormat::Uint16,
+            _ => wgpu::IndexFormat::Uint32,
+        };
+
+        draw_data_list.push(XrDrawData {
+            pipeline_rid: dc.pipeline_rid,
+            vbufs,
+            bgs,
+            index_buf,
+            indirect_buf,
+            index_format,
+            is_multi_draw,
+            is_indirect,
+            indirect_offset: dc.indirect_offset.unwrap_or(0),
+            draw_count: dc.draw_count.unwrap_or(0),
+            index_count: dc.index_count,
+            first_index: dc.first_index,
+            base_vertex: dc.base_vertex,
+            instance_count: dc.instance_count,
+            first_instance: dc.first_instance,
+            vertex_count: dc.vertex_count,
+            first_vertex: dc.first_vertex,
+        });
+    }
+
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("XR Frame Encoder"),
+    });
+
+    let clear_color = args.clear_color.as_ref().map(|c| wgpu::Color {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+        a: c.a,
+    });
+
+    // Convert store ops from JS strings to wgpu types
+    let depth_store = match args.depth_store_op.as_deref() {
+        Some("discard") => wgpu::StoreOp::Discard,
+        _ => wgpu::StoreOp::Store,
+    };
+    let color_store = match args.color_store_op.as_deref() {
+        Some("discard") => wgpu::StoreOp::Discard,
+        _ => wgpu::StoreOp::Store,
+    };
+
+    // single render pass for all draw calls - good for TBRs
+    {
+        let depth_attachment = depth_view.as_ref().map(|dv| {
+            wgpu::RenderPassDepthStencilAttachment {
+                view: &dv.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(args.depth_clear_value.unwrap_or(1.0)),
+                    store: depth_store,
+                }),
+                stencil_ops: None,
             }
-        } else {
-            wgpu::LoadOp::Load
+        });
+
+        let color_load_op = match clear_color {
+            Some(c) => wgpu::LoadOp::Clear(c),
+            None => wgpu::LoadOp::Load,
         };
 
-        let depth_load_op = if first_pass {
-            wgpu::LoadOp::Clear(args.depth_clear_value.unwrap_or(1.0))
-        } else {
-            wgpu::LoadOp::Load
-        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("XR Frame Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &msaa_view.view,
+                resolve_target: Some(&resolve_view.view),
+                ops: wgpu::Operations {
+                    load: color_load_op,
+                    store: color_store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: depth_attachment,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+            multiview_mask: None,
+        });
 
-        first_pass = false;
-
-        {
-            let depth_attachment = depth_view.as_ref().map(|dv| {
-                wgpu::RenderPassDepthStencilAttachment {
-                    view: &dv.view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: depth_load_op,
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }
-            });
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("XR Frame Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &msaa_view.view,
-                    resolve_target: Some(&resolve_view.view),
-                    ops: wgpu::Operations {
-                        load: color_load_op,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: depth_attachment,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,  
-            });
+        // Issue all draw calls within the single pass
+        for data in draw_data_list.iter() {
+            // Get pipeline reference 
+            let pipeline_res = state
+                .resource_table
+                .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
+                .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
 
-            for (slot, buf) in vbufs.iter().enumerate() {
+            for (slot, buf) in data.vbufs.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buf.slice(..));
             }
 
-            for (idx, bg_opt) in bgs.iter().enumerate() {
+            for (idx, bg_opt) in data.bgs.iter().enumerate() {
                 if let Some(bg) = bg_opt {
                     pass.set_bind_group(idx as u32, bg.as_ref(), &[]);
                 }
             }
 
-            // These are not currently working on Quest 3
-            if dc.is_multi_draw.unwrap_or(false) {
-                if let Some(ref idx_buf) = index_buf {
-                    let fmt = match dc.index_format.as_deref() {
-                        Some("uint16") => wgpu::IndexFormat::Uint16,
-                        _ => wgpu::IndexFormat::Uint32,
-                    };
-                    pass.set_index_buffer(idx_buf.slice(..), fmt);
-                    
-                    if let Some(ref indirect) = indirect_buf {
+            if data.is_multi_draw {
+                if let Some(ref idx_buf) = data.index_buf {
+                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+
+                    if let Some(ref indirect) = data.indirect_buf {
                         pass.multi_draw_indexed_indirect(
                             indirect,
-                            dc.indirect_offset.unwrap_or(0),
-                            dc.draw_count.unwrap_or(0),
+                            data.indirect_offset,
+                            data.draw_count,
                         );
                     }
                 }
-            }
-            else if dc.is_indirect.unwrap_or(false) {
-                if let (Some(ref idx_buf), Some(ref indirect)) = (&index_buf, &indirect_buf) {
-                    let fmt = match dc.index_format.as_deref() {
-                        Some("uint16") => wgpu::IndexFormat::Uint16,
-                        _ => wgpu::IndexFormat::Uint32,
-                    };
-                    pass.set_index_buffer(idx_buf.slice(..), fmt);
-                    pass.draw_indexed_indirect(indirect, dc.indirect_offset.unwrap_or(0));
-                } else {
-                    eprintln!("XR: Missing buffers - index_buf={}, indirect_buf={}", index_buf.is_some(), indirect_buf.is_some());
+            } else if data.is_indirect {
+                if let (Some(ref idx_buf), Some(ref indirect)) = (&data.index_buf, &data.indirect_buf) {
+                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.draw_indexed_indirect(indirect, data.indirect_offset);
                 }
-            }
-            // debug fallback, this works: Direct draw_indexed 
-            // if dc.is_multi_draw.unwrap_or(false) {
-            //     if let Some(ref idx_buf) = index_buf {
-            //         let fmt = match dc.index_format.as_deref() {
-            //             Some("uint16") => wgpu::IndexFormat::Uint16,
-            //             _ => wgpu::IndexFormat::Uint32,
-            //         };
-            //         pass.set_index_buffer(idx_buf.slice(..), fmt);
-            //         pass.draw_indexed(0..50000, 0, 0..1);
-            //     }
-            // }
-            else if let Some(idx_buf) = index_buf.as_ref() {
-                if dc.index_count > 0 {
-                    let fmt = match dc.index_format.as_deref() {
-                        Some("uint16") => wgpu::IndexFormat::Uint16,
-                        _ => wgpu::IndexFormat::Uint32,
-                    };
-                    pass.set_index_buffer(idx_buf.slice(..), fmt);
+            } else if let Some(ref idx_buf) = data.index_buf {
+                if data.index_count > 0 {
+                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
                     pass.draw_indexed(
-                        dc.first_index..(dc.first_index + dc.index_count),
-                        dc.base_vertex,
-                        dc.first_instance..(dc.first_instance + dc.instance_count),
+                        data.first_index..(data.first_index + data.index_count),
+                        data.base_vertex,
+                        data.first_instance..(data.first_instance + data.instance_count),
                     );
                 }
-            } else if dc.vertex_count > 0 && dc.instance_count > 0 {
+            } else if data.vertex_count > 0 && data.instance_count > 0 {
                 pass.draw(
-                    dc.first_vertex..(dc.first_vertex + dc.vertex_count),
-                    dc.first_instance..(dc.first_instance + dc.instance_count),
+                    data.first_vertex..(data.first_vertex + data.vertex_count),
+                    data.first_instance..(data.first_instance + data.instance_count),
                 );
             }
         }
     }
 
-    ctx.queue.submit(std::iter::once(encoder.finish()));
+    // Queue this command buffer and flush all pending commands
+    // XR frame is the final pass, so we submit everything together
+    queue_command_buffer(encoder.finish());
+    flush_pending_commands(&ctx.queue);
     Ok(())
 }
 
@@ -2646,16 +2702,9 @@ pub fn op_gfx_render_to_texture(
         .get::<GfxTextureView>(ResourceId::from(args.target_view_rid))
         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
 
-    let mut encoder =
-        ctx.device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("GFX Texture Encoder"),
-            });
-
-    let mut first_pass = true;
-
+    // Pre-collect depth view and ops from first draw call that has depth
     let mut depth_view: Option<Arc<wgpu::TextureView>> = None;
-    let mut depth_ops_base: Option<wgpu::Operations<f32>> = None;
+    let mut depth_ops: Option<wgpu::Operations<f32>> = None;
 
     for dc in args.draw_calls.iter() {
         if depth_view.is_none() {
@@ -2669,20 +2718,52 @@ pub fn op_gfx_render_to_texture(
                 let clear = dc.depth_clear_value.unwrap_or(1.0);
                 let load = match dc.depth_load_op.as_deref() {
                     Some("load") => wgpu::LoadOp::Load,
-                    Some("clear") | _ => wgpu::LoadOp::Clear(clear),
+                    _ => wgpu::LoadOp::Clear(clear),
                 };
                 let store = match dc.depth_store_op.as_deref() {
                     Some("discard") => wgpu::StoreOp::Discard,
                     _ => wgpu::StoreOp::Store,
                 };
 
-                depth_ops_base = Some(wgpu::Operations { load, store });
+                depth_ops = Some(wgpu::Operations { load, store });
+                break;
             }
         }
     }
 
+    // Determine color clear from first draw call
+    let color_load_op = if let Some(c) = args.draw_calls.first().and_then(|dc| dc.clear_color.as_ref()) {
+        wgpu::LoadOp::Clear(wgpu::Color {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        })
+    } else {
+        wgpu::LoadOp::Load
+    };
+
+    // Pre-collect all draw data BEFORE starting the render pass
+    struct TextureDrawData {
+        pipeline_rid: u32,
+        vbufs: Vec<Arc<wgpu::Buffer>>,
+        bgs: Vec<Option<Arc<wgpu::BindGroup>>>,
+        index_buf: Option<Arc<wgpu::Buffer>>,
+        index_format: wgpu::IndexFormat,
+        index_count: u32,
+        first_index: u32,
+        base_vertex: i32,
+        instance_count: u32,
+        first_instance: u32,
+        vertex_count: u32,
+        first_vertex: u32,
+    }
+
+    let mut draw_data_list: Vec<TextureDrawData> = Vec::with_capacity(args.draw_calls.len());
+
     for dc in args.draw_calls.iter() {
-        let pipeline_res = state
+        // Validate pipeline exists
+        let _ = state
             .resource_table
             .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
             .map_err(|e| JsErrorBox::generic(e.to_string()))?;
@@ -2709,121 +2790,108 @@ pub fn op_gfx_render_to_texture(
             }
         }
 
-        let index_buf: Option<Arc<wgpu::Buffer>> =
-            if let Some(rid) = dc.index_buffer_rid {
-                let buf_res =
-                    state
-                        .resource_table
-                        .get::<GfxBuffer>(ResourceId::from(rid))
-                        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-                Some(buf_res.buffer.clone())
-            } else {
-                None
-            };
-
-        let load_op_color = if first_pass {
-            if let Some(c) = dc.clear_color.as_ref() {
-                wgpu::LoadOp::Clear(wgpu::Color {
-                    r: c.r,
-                    g: c.g,
-                    b: c.b,
-                    a: c.a,
-                })
-            } else {
-                wgpu::LoadOp::Load
-            }
+        let index_buf: Option<Arc<wgpu::Buffer>> = if let Some(rid) = dc.index_buffer_rid {
+            let buf_res = state
+                .resource_table
+                .get::<GfxBuffer>(ResourceId::from(rid))
+                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            Some(buf_res.buffer.clone())
         } else {
-            wgpu::LoadOp::Load
+            None
         };
 
-        let depth_attachment: Option<wgpu::RenderPassDepthStencilAttachment> =
-            match (&depth_view, &depth_ops_base) {
-                (Some(dv), Some(ops_base)) => {
-                    let load = if first_pass {
-                        ops_base.load
-                    } else {
-                        wgpu::LoadOp::Load
-                    };
-                    Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: dv.as_ref(),
-                        depth_ops: Some(wgpu::Operations {
-                            load,
-                            store: ops_base.store,
-                        }),
-                        stencil_ops: None,
-                    })
-                }
-                _ => None,
-            };
+        let index_format = match dc.index_format.as_deref() {
+            Some("uint16") => wgpu::IndexFormat::Uint16,
+            _ => wgpu::IndexFormat::Uint32,
+        };
 
-        if first_pass {
-            first_pass = false;
-        }
+        draw_data_list.push(TextureDrawData {
+            pipeline_rid: dc.pipeline_rid,
+            vbufs,
+            bgs,
+            index_buf,
+            index_format,
+            index_count: dc.index_count,
+            first_index: dc.first_index,
+            base_vertex: dc.base_vertex,
+            instance_count: dc.instance_count,
+            first_instance: dc.first_instance,
+            vertex_count: dc.vertex_count,
+            first_vertex: dc.first_vertex,
+        });
+    }
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("GFX Texture Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target_view.view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: load_op_color,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None, 
-                })],
-                depth_stencil_attachment: depth_attachment,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None, 
-            });
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GFX Texture Encoder"),
+    });
+
+    // SINGLE render pass for ALL draw calls - critical for tile-based GPU performance
+    {
+        let depth_attachment = match (&depth_view, &depth_ops) {
+            (Some(dv), Some(ops)) => Some(wgpu::RenderPassDepthStencilAttachment {
+                view: dv.as_ref(),
+                depth_ops: Some(*ops),
+                stencil_ops: None,
+            }),
+            _ => None,
+        };
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("GFX Texture Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view.view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: color_load_op,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: depth_attachment,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+            multiview_mask: None,
+        });
+
+        // Issue all draw calls within the single pass
+        for data in draw_data_list.iter() {
+            let pipeline_res = state
+                .resource_table
+                .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
+                .unwrap(); // Safe: we validated above
 
             pass.set_pipeline(&pipeline_res.pipeline);
 
-            for (slot, buf) in vbufs.iter().enumerate() {
+            for (slot, buf) in data.vbufs.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buf.slice(..));
             }
 
-            for (idx, bg_opt) in bgs.iter().enumerate() {
+            for (idx, bg_opt) in data.bgs.iter().enumerate() {
                 if let Some(bg) = bg_opt {
                     pass.set_bind_group(idx as u32, bg.as_ref(), &[]);
                 }
             }
 
-            if let Some(idx_buf) = index_buf.as_ref() {
-                if dc.index_count > 0 {
-                    let fmt = match dc.index_format.as_deref() {
-                        Some("uint16") => wgpu::IndexFormat::Uint16,
-                        _ => wgpu::IndexFormat::Uint32,
-                    };
-
-                    pass.set_index_buffer(idx_buf.slice(..), fmt);
-
-                    let first_index = dc.first_index;
-                    let last_index = first_index + dc.index_count;
-                    let first_instance = dc.first_instance;
-                    let last_instance = first_instance + dc.instance_count;
-
-
-
+            if let Some(ref idx_buf) = data.index_buf {
+                if data.index_count > 0 {
+                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
                     pass.draw_indexed(
-                        first_index..last_index,
-                        dc.base_vertex,
-                        first_instance..last_instance,
+                        data.first_index..(data.first_index + data.index_count),
+                        data.base_vertex,
+                        data.first_instance..(data.first_instance + data.instance_count),
                     );
                 }
-            } else if dc.vertex_count > 0 && dc.instance_count > 0 {
-                let first_v = dc.first_vertex;
-                let last_v = first_v + dc.vertex_count;
-                let first_i = dc.first_instance;
-                let last_i = first_i + dc.instance_count;
-
-                pass.draw(first_v..last_v, first_i..last_i);
+            } else if data.vertex_count > 0 && data.instance_count > 0 {
+                pass.draw(
+                    data.first_vertex..(data.first_vertex + data.vertex_count),
+                    data.first_instance..(data.first_instance + data.instance_count),
+                );
             }
         }
     }
 
-    ctx.queue.submit(iter::once(encoder.finish()));
+    // Queue command buffer for batched submission instead of immediate submit
+    queue_command_buffer(encoder.finish());
 
     Ok(())
 }
@@ -2908,14 +2976,32 @@ pub fn op_gfx_render_depth_only(
         .get::<GfxTextureView>(ResourceId::from(args.depth_view_rid))
         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
 
-    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("GFX Depth Only Encoder"),
-    });
+    // Get depth clear value from first draw call
+    let depth_clear_value = args.draw_calls.first()
+        .and_then(|dc| dc.depth_clear_value)
+        .unwrap_or(1.0);
 
-    let mut first_pass = true;
+    // Pre-collect all draw data BEFORE starting the render pass
+    struct DepthDrawData {
+        pipeline_rid: u32,
+        vbufs: Vec<Arc<wgpu::Buffer>>,
+        bgs: Vec<Option<Arc<wgpu::BindGroup>>>,
+        index_buf: Option<Arc<wgpu::Buffer>>,
+        index_format: wgpu::IndexFormat,
+        index_count: u32,
+        first_index: u32,
+        base_vertex: i32,
+        instance_count: u32,
+        first_instance: u32,
+        vertex_count: u32,
+        first_vertex: u32,
+    }
+
+    let mut draw_data_list: Vec<DepthDrawData> = Vec::with_capacity(args.draw_calls.len());
 
     for dc in args.draw_calls.iter() {
-        let pipeline_res = state
+        // Validate pipeline exists
+        let _ = state
             .resource_table
             .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
             .map_err(|e| JsErrorBox::generic(e.to_string()))?;
@@ -2952,66 +3038,87 @@ pub fn op_gfx_render_depth_only(
             None
         };
 
-        let depth_load_op = if first_pass {
-            wgpu::LoadOp::Clear(dc.depth_clear_value.unwrap_or(1.0))
-        } else {
-            wgpu::LoadOp::Load
+        let index_format = match dc.index_format.as_deref() {
+            Some("uint16") => wgpu::IndexFormat::Uint16,
+            _ => wgpu::IndexFormat::Uint32,
         };
 
-        first_pass = false;
+        draw_data_list.push(DepthDrawData {
+            pipeline_rid: dc.pipeline_rid,
+            vbufs,
+            bgs,
+            index_buf,
+            index_format,
+            index_count: dc.index_count,
+            first_index: dc.first_index,
+            base_vertex: dc.base_vertex,
+            instance_count: dc.instance_count,
+            first_instance: dc.first_instance,
+            vertex_count: dc.vertex_count,
+            first_vertex: dc.first_vertex,
+        });
+    }
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("GFX Depth Only Pass"),
-                color_attachments: &[],  // No color attachments!
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view.view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: depth_load_op,
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GFX Depth Only Encoder"),
+    });
+
+    // SINGLE render pass for ALL draw calls - critical for tile-based GPU performance
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("GFX Depth Only Pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(depth_clear_value),
+                    store: wgpu::StoreOp::Store,
                 }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None, 
-            });
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+            multiview_mask: None,
+        });
+
+        // Issue all draw calls within the single pass
+        for data in draw_data_list.iter() {
+            let pipeline_res = state
+                .resource_table
+                .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
+                .unwrap(); // Safe: we validated above
 
             pass.set_pipeline(&pipeline_res.pipeline);
 
-            for (slot, buf) in vbufs.iter().enumerate() {
+            for (slot, buf) in data.vbufs.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buf.slice(..));
             }
 
-            for (idx, bg_opt) in bgs.iter().enumerate() {
+            for (idx, bg_opt) in data.bgs.iter().enumerate() {
                 if let Some(bg) = bg_opt {
                     pass.set_bind_group(idx as u32, bg.as_ref(), &[]);
                 }
             }
 
-            if let Some(idx_buf) = index_buf.as_ref() {
-                if dc.index_count > 0 {
-                    let fmt = match dc.index_format.as_deref() {
-                        Some("uint16") => wgpu::IndexFormat::Uint16,
-                        _ => wgpu::IndexFormat::Uint32,
-                    };
-                    pass.set_index_buffer(idx_buf.slice(..), fmt);
+            if let Some(ref idx_buf) = data.index_buf {
+                if data.index_count > 0 {
+                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
                     pass.draw_indexed(
-                        dc.first_index..(dc.first_index + dc.index_count),
-                        dc.base_vertex,
-                        dc.first_instance..(dc.first_instance + dc.instance_count),
+                        data.first_index..(data.first_index + data.index_count),
+                        data.base_vertex,
+                        data.first_instance..(data.first_instance + data.instance_count),
                     );
                 }
-            } else if dc.vertex_count > 0 && dc.instance_count > 0 {
+            } else if data.vertex_count > 0 && data.instance_count > 0 {
                 pass.draw(
-                    dc.first_vertex..(dc.first_vertex + dc.vertex_count),
-                    dc.first_instance..(dc.first_instance + dc.instance_count),
+                    data.first_vertex..(data.first_vertex + data.vertex_count),
+                    data.first_instance..(data.first_instance + data.instance_count),
                 );
             }
         }
     }
 
-    ctx.queue.submit(iter::once(encoder.finish()));
+    queue_command_buffer(encoder.finish());
     Ok(())
 }
 
@@ -3021,5 +3128,12 @@ pub fn op_gfx_resource_drop(
     rid: u32,
 ) -> Result<(), JsErrorBox> {
     let _ = state.resource_table.take::<GfxTextureView>(ResourceId::from(rid));
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_flush_commands() -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+    flush_pending_commands(&ctx.queue);
     Ok(())
 }

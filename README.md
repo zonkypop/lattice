@@ -17,3 +17,8 @@ Lattice is a WIP, to do :
 - Ergonomics etc
 - Steam Frame Builds
 
+Supported:
+- Linux Desktop + OpenXR
+- Windows Desktop + OpenXR
+- Quest OpenXR
+- Computer Shaders

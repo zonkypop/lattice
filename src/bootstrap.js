@@ -33,6 +33,12 @@ import {
   op_gfx_multi_draw_indexed_indirect,
   op_gfx_queue_submit_empty,
 
+  // Compute shader ops
+  op_gfx_device_create_compute_pipeline,
+  op_gfx_compute_pipeline_get_bind_group_layout,
+  op_gfx_compute_dispatch,
+  op_gfx_compute_dispatch_indirect,
+
   // Input ops
   op_input_poll_events,
   op_input_get_window_size,
@@ -125,6 +131,12 @@ globalThis.__gfx = {
   op_gfx_render_xr_frame,
   op_gfx_multi_draw_indexed_indirect,
   op_gfx_queue_submit_empty,
+
+  // Compute shader ops
+  op_gfx_device_create_compute_pipeline,
+  op_gfx_compute_pipeline_get_bind_group_layout,
+  op_gfx_compute_dispatch,
+  op_gfx_compute_dispatch_indirect,
 };
 
 // Expose input ops to globalThis

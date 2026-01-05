@@ -25,6 +25,11 @@ if (!gfx) {
     RENDER_ATTACHMENT: 16,
   };
   globalThis.GPUMapMode = { READ: 1, WRITE: 2 };
+  globalThis.GPUShaderStage = {
+    VERTEX: 1,
+    FRAGMENT: 2,
+    COMPUTE: 4,
+  };
 
   // ImageBitmap
   class ImageBitmap {
@@ -539,6 +544,83 @@ if (!gfx) {
     }
   }
 
+  // Compute pass
+  class EmulatedComputePass {
+    constructor() {
+      this._pipelineRid = null;
+      this._bindGroups = new Map();
+      this._dispatches = [];
+    }
+
+    setPipeline(p) {
+      this._pipelineRid = p.__rid;
+      this._isComputePipeline = p.__isComputePipeline === true;
+    }
+
+    setBindGroup(index, bg) {
+      if (bg?.__rid != null) this._bindGroups.set(index >>> 0, bg.__rid);
+    }
+
+    dispatchWorkgroups(x, y = 1, z = 1) {
+      if (this._pipelineRid == null) return;
+
+      const bgRids = [];
+      for (const [idx, rid] of this._bindGroups) bgRids[idx] = rid;
+
+      this._dispatches.push({
+        type: "direct",
+        pipeline_rid: this._pipelineRid,
+        bind_group_rids: bgRids,
+        workgroup_count_x: x >>> 0,
+        workgroup_count_y: y >>> 0,
+        workgroup_count_z: z >>> 0,
+      });
+    }
+
+    dispatchWorkgroupsIndirect(indirectBuffer, indirectOffset) {
+      if (this._pipelineRid == null) return;
+      if (!indirectBuffer?.__rid)
+        throw new Error("dispatchWorkgroupsIndirect: no indirect buffer");
+
+      const bgRids = [];
+      for (const [idx, rid] of this._bindGroups) bgRids[idx] = rid;
+
+      this._dispatches.push({
+        type: "indirect",
+        pipeline_rid: this._pipelineRid,
+        bind_group_rids: bgRids,
+        indirect_buffer_rid: indirectBuffer.__rid,
+        indirect_offset: indirectOffset >>> 0,
+      });
+    }
+
+    insertDebugMarker() {}
+    pushDebugGroup() {}
+    popDebugGroup() {}
+
+    end() {
+      // Execute all dispatches
+      for (const dispatch of this._dispatches) {
+        if (dispatch.type === "direct") {
+          gfx.op_gfx_compute_dispatch({
+            pipeline_rid: dispatch.pipeline_rid,
+            bind_group_rids: dispatch.bind_group_rids,
+            workgroup_count_x: dispatch.workgroup_count_x,
+            workgroup_count_y: dispatch.workgroup_count_y,
+            workgroup_count_z: dispatch.workgroup_count_z,
+          });
+        } else if (dispatch.type === "indirect") {
+          gfx.op_gfx_compute_dispatch_indirect({
+            pipeline_rid: dispatch.pipeline_rid,
+            bind_group_rids: dispatch.bind_group_rids,
+            indirect_buffer_rid: dispatch.indirect_buffer_rid,
+            indirect_offset: dispatch.indirect_offset,
+          });
+        }
+      }
+    }
+  }
+
   // Command encoder
   class EmulatedEncoder {
     constructor(context) {
@@ -547,6 +629,10 @@ if (!gfx) {
 
     beginRenderPass(desc) {
       return new EmulatedRenderPass(this._context, desc);
+    }
+
+    beginComputePass(desc) {
+      return new EmulatedComputePass();
     }
 
     copyBufferToBuffer() {}
@@ -682,6 +768,33 @@ if (!gfx) {
                   };
                 },
               };
+            },
+
+            createComputePipeline(desc) {
+              const rid = gfx.op_gfx_device_create_compute_pipeline({
+                shader_module_rid: desc.compute.module.__rid,
+                entry_point: desc.compute.entryPoint ?? "main",
+                pipeline_layout_rid:
+                  desc.layout === "auto" ? null : desc.layout?.__rid ?? null,
+              }).rid;
+
+              return {
+                __rid: rid,
+                __isComputePipeline: true,
+                getBindGroupLayout(index) {
+                  return {
+                    __rid: gfx.op_gfx_compute_pipeline_get_bind_group_layout({
+                      pipeline_rid: rid,
+                      index: index >>> 0,
+                    }).rid,
+                  };
+                },
+              };
+            },
+
+            async createComputePipelineAsync(desc) {
+              // Synchronous implementation wrapped in Promise for API compatibility
+              return this.createComputePipeline(desc);
             },
 
             createBuffer(options) {

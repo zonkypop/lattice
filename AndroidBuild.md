@@ -4,8 +4,8 @@
 
 # very rough guide for building Deno/V8 for Android (Quest 3) :
 
-
 ### Android SDK/NDK Setup
+
 ```bash
 export ANDROID_HOME=~/android
 export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/{your version}
@@ -14,12 +14,14 @@ export CMAKE_ANDROID_NDK=$ANDROID_NDK_HOME
 ```
 
 ### Rust Target
+
 ```bash
 rustup target add aarch64-linux-android
 cargo install cargo-apk
 ```
 
 ### Build Tools
+
 ```bash
 sudo apt-get install -y ninja-build python3 clang lld cmake
 
@@ -41,6 +43,7 @@ sudo cp out/gn /usr/local/bin/
 V8 doesn't have prebuilt Android binaries, so we build from source. The v8 crate is missing several files:
 
 ### 1. Create known target triples file
+
 ```bash
 V8_RUST="$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/v8-140.2.0"
 
@@ -52,6 +55,7 @@ EOF
 ```
 
 ### 2. Create missing pydeps files
+
 ```bash
 cd "$V8_RUST/build/android"
 grep -o '"[^"]*\.pydeps"' BUILD.gn 2>/dev/null | tr -d '"' | while read f; do
@@ -61,6 +65,7 @@ done
 ```
 
 ### 3. Symlink NDK sysroot
+
 ```bash
 mkdir -p "$V8_RUST/third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/"
 ln -sf "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64" \
@@ -89,6 +94,7 @@ dl icu_calendar_data 2.0.0 icu_calendar_data/v2.
 ```
 
 ### 5. Create versioned symlinks in vendor directory
+
 ```bash
 cd "$V8_RUST/third_party/rust/chromium_crates_io/vendor"
 
@@ -126,6 +132,7 @@ done
 ```
 
 ### 6. Create missing metadata files
+
 ```bash
 # For crates like jiff-tzdb that need these
 echo '{"files":{}}' > "$V8_RUST/third_party/rust/jiff_tzdb/v0_1/.cargo-checksum.json"
@@ -137,6 +144,7 @@ echo '{}' > "$V8_RUST/third_party/rust/jiff_tzdb/v0_1/.cargo_vcs_info.json"
 ## V8 Source Patches
 
 ### Patch 1: simdutf atomic functions (C++20 compatibility)
+
 ```bash
 V8_FILE="$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/v8-140.2.0/v8/src/builtins/builtins-typed-array.cc"
 
@@ -145,6 +153,7 @@ sed -i 's/simdutf::atomic_binary_to_base64/simdutf::binary_to_base64/g' "$V8_FIL
 ```
 
 ### Patch 2: std::atomic_ref (not available in Android NDK's libc++)
+
 ```bash
 V8_FILE="$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/v8-140.2.0/v8/src/objects/simd.cc"
 
@@ -169,18 +178,17 @@ Build takes 20-40 minutes.
 
 ---
 
-
-
 In Cargo.toml uncomment
-
 
 [lib]
 path = "src/lib.rs"
+
 # android
+
 crate-type = ["rlib", "cdylib"]
 
-
 # Build
+
 echo "Building..."
 RUSTFLAGS="-C link-arg=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/19/lib/linux/libclang_rt.builtins-aarch64-android.a" \
 GN_ARGS="use_custom_libcxx=false" \

@@ -29,7 +29,7 @@ struct MsaaState {
 pub struct GfxContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    pub surface: Option<wgpu::Surface<'static>>, 
+    pub surface: Option<wgpu::Surface<'static>>,
     pub format: wgpu::TextureFormat,
 }
 
@@ -109,6 +109,11 @@ pub struct GfxPipeline {
     pub pipeline: wgpu::RenderPipeline,
 }
 impl Resource for GfxPipeline {}
+
+pub struct GfxComputePipeline {
+    pub pipeline: wgpu::ComputePipeline,
+}
+impl Resource for GfxComputePipeline {}
 
 // ======================= Mapping helpers =======================
 
@@ -341,6 +346,7 @@ fn sanitize_wgsl(code: &str) -> String {
 
     let re_vecu_i32 = regex::Regex::new(r"(\d+)i(\s*[,\)])").unwrap();
     
+    // Only apply within vec*u context - more targeted approach
     let re_vec2u = regex::Regex::new(r"vec2u\([^)]+\)").unwrap();
     result = re_vec2u.replace_all(&result, |caps: &regex::Captures| {
         let matched = &caps[0];
@@ -649,6 +655,35 @@ pub struct JsGfxPipeline {
 }
 
 #[derive(Deserialize)]
+pub struct ComputePipelineCreate {
+    pub shader_module_rid: u32,
+    pub entry_point: String,
+    pub pipeline_layout_rid: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct JsGfxComputePipeline {
+    pub rid: ResourceId,
+}
+
+#[derive(Deserialize)]
+pub struct ComputeDispatchArgs {
+    pub pipeline_rid: u32,
+    pub bind_group_rids: Vec<Option<u32>>,
+    pub workgroup_count_x: u32,
+    pub workgroup_count_y: u32,
+    pub workgroup_count_z: u32,
+}
+
+#[derive(Deserialize)]
+pub struct ComputeDispatchIndirectArgs {
+    pub pipeline_rid: u32,
+    pub bind_group_rids: Vec<Option<u32>>,
+    pub indirect_buffer_rid: u32,
+    pub indirect_offset: u64,
+}
+
+#[derive(Deserialize)]
 pub struct ClearColor {
     pub r: f64,
     pub g: f64,
@@ -775,7 +810,7 @@ fn ensure_msaa_texture(
 
     // Need to create/recreate
     // TRANSIENT hint tells tile-based GPUs this texture never needs system memory backing
-    // since we discard it after resolve. possibly? saves memory bandwidth on Quest 3.
+    // since we discard it after resolve. Saves memory bandwidth on Quest 3.
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("MSAA Texture"),
         size: wgpu::Extent3d {
@@ -958,7 +993,7 @@ pub struct DecodeImageStoreArgs {
 #[op2]
 #[serde]
 pub fn op_gfx_decode_image_store(
-    _state: &mut OpState,
+    _state: &mut OpState, 
     #[buffer] data: JsBuffer,
     #[serde] args: DecodeImageStoreArgs,
 ) -> Result<DecodeImageStoreResult, JsErrorBox> {
@@ -1866,7 +1901,6 @@ pub fn op_gfx_surface_draw(
         return Ok(());
     }
 
-    // Validate resources BEFORE acquiring surface
     for (call_idx, dc) in args.draw_calls.iter().enumerate() {
         if state
             .resource_table
@@ -2070,7 +2104,7 @@ pub fn op_gfx_surface_draw(
         wgpu::LoadOp::Load
     };
 
-    // Pre-collect all draw data BEFORE starting the render pass
+    // Pre-collect all draw data before starting the render pass
     struct SurfaceDrawData {
         pipeline_rid: u32,
         vbufs: Vec<Arc<wgpu::Buffer>>,
@@ -2204,7 +2238,7 @@ pub fn op_gfx_surface_draw(
         label: Some("GFX Encoder"),
     });
 
-    // SINGLE render pass for ALL draw calls - critical for tile-based GPU performance
+    // single render pass for all draw calls 
     {
         let depth_attachment = match (&depth_view, &depth_ops) {
             (Some(dv), Some(ops)) => Some(wgpu::RenderPassDepthStencilAttachment {
@@ -2237,7 +2271,7 @@ pub fn op_gfx_surface_draw(
             let pipeline_res = state
                 .resource_table
                 .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
-                .unwrap(); // Safe: we validated above
+                .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
 
@@ -2292,7 +2326,7 @@ pub fn op_gfx_decode_image(
     #[string] format: String,
 ) -> DecodeImageResult {
     let slice: &[u8] = &data;
-    let result = decode_image_internal(slice, &format, None);  // Add None for options
+    let result = decode_image_internal(slice, &format, None);
     match result {
         Ok((width, height, pixels)) => DecodeImageResult {
             width,
@@ -2482,12 +2516,11 @@ pub fn op_gfx_render_xr_frame(
         None
     };
 
-    // Pre-collect all resources BEFORE starting the render pass
+    // Pre-collect all resources before starting the render pass
     // This avoids multiple tile flushes on tile-based GPUs like Quest 3
     let mut draw_data_list: Vec<XrDrawData> = Vec::with_capacity(args.draw_calls.len());
 
     for dc in args.draw_calls.iter() {
-        // Validate pipeline exists (we'll fetch it again in the pass)
         let _ = state
             .resource_table
             .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
@@ -2825,7 +2858,6 @@ pub fn op_gfx_render_to_texture(
         label: Some("GFX Texture Encoder"),
     });
 
-    // SINGLE render pass for ALL draw calls - critical for tile-based GPU performance
     {
         let depth_attachment = match (&depth_view, &depth_ops) {
             (Some(dv), Some(ops)) => Some(wgpu::RenderPassDepthStencilAttachment {
@@ -2858,7 +2890,7 @@ pub fn op_gfx_render_to_texture(
             let pipeline_res = state
                 .resource_table
                 .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
-                .unwrap(); // Safe: we validated above
+                .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
 
@@ -2890,8 +2922,8 @@ pub fn op_gfx_render_to_texture(
         }
     }
 
-    // Queue command buffer for batched submission instead of immediate submit
-    queue_command_buffer(encoder.finish());
+    // Submit immediately - these render-to-texture ops must complete before main render
+    ctx.queue.submit(iter::once(encoder.finish()));
 
     Ok(())
 }
@@ -3063,7 +3095,6 @@ pub fn op_gfx_render_depth_only(
         label: Some("GFX Depth Only Encoder"),
     });
 
-    // SINGLE render pass for ALL draw calls - critical for tile-based GPU performance
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("GFX Depth Only Pass"),
@@ -3086,7 +3117,7 @@ pub fn op_gfx_render_depth_only(
             let pipeline_res = state
                 .resource_table
                 .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
-                .unwrap(); // Safe: we validated above
+                .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
 
@@ -3118,7 +3149,8 @@ pub fn op_gfx_render_depth_only(
         }
     }
 
-    queue_command_buffer(encoder.finish());
+    // Submit immediately - depth-only renders must complete before main render
+    ctx.queue.submit(iter::once(encoder.finish()));
     Ok(())
 }
 
@@ -3131,9 +3163,184 @@ pub fn op_gfx_resource_drop(
     Ok(())
 }
 
+/// Flush all pending command buffers to the GPU.
+/// Call this when you need to ensure all prior render commands are submitted,
+/// e.g., before a buffer readback or at end of frame.
 #[op2(fast)]
 pub fn op_gfx_flush_commands() -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
     flush_pending_commands(&ctx.queue);
+    Ok(())
+}
+
+// ======================= Compute Shader Support =======================
+
+#[op2]
+#[serde]
+pub fn op_gfx_device_create_compute_pipeline(
+    state: &mut OpState,
+    #[serde] desc: ComputePipelineCreate,
+) -> Result<JsGfxComputePipeline, JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    let shader = state
+        .resource_table
+        .get::<GfxShader>(ResourceId::from(desc.shader_module_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let pipeline = if let Some(layout_rid) = desc.pipeline_layout_rid {
+        let pl = state
+            .resource_table
+            .get::<GfxPipelineLayout>(ResourceId::from(layout_rid))
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+        ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("GFX Compute Pipeline"),
+            layout: Some(&pl.layout),
+            module: &shader.module,
+            entry_point: Some(&desc.entry_point),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        })
+    } else {
+        ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("GFX Compute Pipeline (auto layout)"),
+            layout: None,
+            module: &shader.module,
+            entry_point: Some(&desc.entry_point),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        })
+    };
+
+    let rid = state.resource_table.add(GfxComputePipeline { pipeline });
+    Ok(JsGfxComputePipeline { rid })
+}
+
+#[op2]
+#[serde]
+pub fn op_gfx_compute_pipeline_get_bind_group_layout(
+    state: &mut OpState,
+    #[serde] args: GetBindGroupLayoutArgs,
+) -> Result<JsGfxBindGroupLayout, JsErrorBox> {
+    let pipeline = state
+        .resource_table
+        .get::<GfxComputePipeline>(ResourceId::from(args.pipeline_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let layout = pipeline.pipeline.get_bind_group_layout(args.index);
+
+    let rid = state
+        .resource_table
+        .add(GfxBindGroupLayout { layout: Arc::new(layout) });
+    Ok(JsGfxBindGroupLayout { rid })
+}
+
+#[op2]
+pub fn op_gfx_compute_dispatch(
+    state: &mut OpState,
+    #[serde] args: ComputeDispatchArgs,
+) -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    let pipeline = state
+        .resource_table
+        .get::<GfxComputePipeline>(ResourceId::from(args.pipeline_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
+    for rid_opt in args.bind_group_rids.iter() {
+        if let Some(rid) = rid_opt {
+            let bg = state
+                .resource_table
+                .get::<GfxBindGroup>(ResourceId::from(*rid))
+                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            bgs.push(Some(bg.group.clone()));
+        } else {
+            bgs.push(None);
+        }
+    }
+
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Compute Dispatch Encoder"),
+    });
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Compute Pass"),
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&pipeline.pipeline);
+
+        for (idx, bg_opt) in bgs.iter().enumerate() {
+            if let Some(bg) = bg_opt {
+                pass.set_bind_group(idx as u32, bg.as_ref(), &[]);
+            }
+        }
+
+        pass.dispatch_workgroups(
+            args.workgroup_count_x,
+            args.workgroup_count_y,
+            args.workgroup_count_z,
+        );
+    }
+
+    ctx.queue.submit(iter::once(encoder.finish()));
+    Ok(())
+}
+
+#[op2]
+pub fn op_gfx_compute_dispatch_indirect(
+    state: &mut OpState,
+    #[serde] args: ComputeDispatchIndirectArgs,
+) -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    let pipeline = state
+        .resource_table
+        .get::<GfxComputePipeline>(ResourceId::from(args.pipeline_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let indirect_buf = state
+        .resource_table
+        .get::<GfxBuffer>(ResourceId::from(args.indirect_buffer_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
+    for rid_opt in args.bind_group_rids.iter() {
+        if let Some(rid) = rid_opt {
+            let bg = state
+                .resource_table
+                .get::<GfxBindGroup>(ResourceId::from(*rid))
+                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            bgs.push(Some(bg.group.clone()));
+        } else {
+            bgs.push(None);
+        }
+    }
+
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Compute Dispatch Indirect Encoder"),
+    });
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Compute Pass Indirect"),
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&pipeline.pipeline);
+
+        for (idx, bg_opt) in bgs.iter().enumerate() {
+            if let Some(bg) = bg_opt {
+                pass.set_bind_group(idx as u32, bg.as_ref(), &[]);
+            }
+        }
+
+        pass.dispatch_workgroups_indirect(&indirect_buf.buffer, args.indirect_offset);
+    }
+
+    ctx.queue.submit(iter::once(encoder.finish()));
     Ok(())
 }

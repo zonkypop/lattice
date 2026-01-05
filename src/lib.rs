@@ -130,6 +130,12 @@ extension!(
         gfx::op_gfx_flush_commands,
         gfx::op_gfx_render_xr_frame,
 
+        // Compute shader ops
+        gfx::op_gfx_device_create_compute_pipeline,
+        gfx::op_gfx_compute_pipeline_get_bind_group_layout,
+        gfx::op_gfx_compute_dispatch,
+        gfx::op_gfx_compute_dispatch_indirect,
+
         // XR ops
         xr::op_xr_is_supported,
         xr::op_xr_request_session,

@@ -227,6 +227,17 @@ pub fn map_texture_format(fmt: &str) -> wgpu::TextureFormat {
         "rgba32float" => wgpu::TextureFormat::Rgba32Float,
         "r16float" => wgpu::TextureFormat::R16Float,
         "r32float" => wgpu::TextureFormat::R32Float,
+        "r32uint" => wgpu::TextureFormat::R32Uint,
+        "r32sint" => wgpu::TextureFormat::R32Sint,
+        "rg32uint" => wgpu::TextureFormat::Rg32Uint,
+        "rg32sint" => wgpu::TextureFormat::Rg32Sint,
+        "rg32float" => wgpu::TextureFormat::Rg32Float,
+        "rgba32uint" => wgpu::TextureFormat::Rgba32Uint,
+        "rgba32sint" => wgpu::TextureFormat::Rgba32Sint,
+        "rgba8uint" => wgpu::TextureFormat::Rgba8Uint,
+        "rgba8sint" => wgpu::TextureFormat::Rgba8Sint,
+        "rgba16uint" => wgpu::TextureFormat::Rgba16Uint,
+        "rgba16sint" => wgpu::TextureFormat::Rgba16Sint,
         "depth16unorm" => wgpu::TextureFormat::Depth16Unorm,
         "depth24plus" => wgpu::TextureFormat::Depth24Plus,
         "depth24plus-stencil8" => wgpu::TextureFormat::Depth24PlusStencil8,
@@ -2349,14 +2360,14 @@ pub fn op_gfx_write_texture_image(
     texture_rid: u32,
     width: u32,
     height: u32,
+    depth: u32,
     origin_x: u32,
     origin_y: u32,
-    origin_z: u32,  
+    origin_z: u32,
     mip_level: u32,
     #[buffer] data: JsBuffer,
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
-
 
     let texture = state
         .resource_table
@@ -2367,6 +2378,8 @@ pub fn op_gfx_write_texture_image(
     if width == 0 || height == 0 {
         return Err(JsErrorBox::generic("write_texture: width and height must be > 0"));
     }
+
+    let depth_layers = if depth == 0 { 1 } else { depth };
 
     // Get the texture format and calculate bytes per pixel
     let format = texture.texture.format();
@@ -2379,15 +2392,15 @@ pub fn op_gfx_write_texture_image(
 
     // Calculate expected data size
     let bytes_per_row = bpp * width;
-    let expected_size = (bytes_per_row * height) as usize;
-    
+    let expected_size = (bytes_per_row * height * depth_layers) as usize;
+
     let bytes: &[u8] = &data;
-    
+
     // Validate data size
     if bytes.len() < expected_size {
         return Err(JsErrorBox::generic(format!(
-            "write_texture: data buffer too small. Expected at least {} bytes for {}x{} {:?} texture, got {} bytes",
-            expected_size, width, height, format, bytes.len()
+            "write_texture: data buffer too small. Expected at least {} bytes for {}x{}x{} {:?} texture, got {} bytes",
+            expected_size, width, height, depth_layers, format, bytes.len()
         )));
     }
 
@@ -2395,7 +2408,7 @@ pub fn op_gfx_write_texture_image(
     let tex_size = texture.texture.size();
     let mip_width = (tex_size.width >> mip_level).max(1);
     let mip_height = (tex_size.height >> mip_level).max(1);
-    
+
     if origin_x + width > mip_width || origin_y + height > mip_height {
         return Err(JsErrorBox::generic(format!(
             "write_texture: write region (origin: ({}, {}), size: {}x{}) exceeds texture bounds ({}x{}) at mip level {}",
@@ -2410,7 +2423,7 @@ pub fn op_gfx_write_texture_image(
             origin: wgpu::Origin3d {
                 x: origin_x,
                 y: origin_y,
-                z: origin_z,  
+                z: origin_z,
             },
             aspect: wgpu::TextureAspect::All,
         },
@@ -2423,7 +2436,7 @@ pub fn op_gfx_write_texture_image(
         wgpu::Extent3d {
             width,
             height,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: depth_layers,
         },
     );
 

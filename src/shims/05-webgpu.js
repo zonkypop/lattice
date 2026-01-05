@@ -1057,6 +1057,7 @@ if (!gfx) {
                 if (!tex?.__rid) throw new Error("writeTexture: no __rid");
                 const w = size.width ?? size[0] ?? 1;
                 const h = size.height ?? size[1] ?? 1;
+                const d = size.depthOrArrayLayers ?? size[2] ?? 1;
                 if (w > tex.width || h > tex.height) return;
                 const bytes =
                   data instanceof Uint8Array
@@ -1076,6 +1077,7 @@ if (!gfx) {
                   tex.__rid,
                   w,
                   h,
+                  d,
                   dest.origin?.x ?? dest.origin?.[0] ?? 0,
                   dest.origin?.y ?? dest.origin?.[1] ?? 0,
                   dest.origin?.z ?? dest.origin?.[2] ?? 0,

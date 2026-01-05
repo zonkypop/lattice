@@ -21,4 +21,4 @@ Supported:
 - Linux Desktop + OpenXR
 - Windows Desktop + OpenXR
 - Quest OpenXR
-- Computer Shaders
+- Compute Shaders

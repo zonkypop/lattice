@@ -796,6 +796,9 @@ if (!gfx) {
                 depth_format: depth?.format ?? null,
                 depth_write_enabled: depth?.depthWriteEnabled ?? null,
                 depth_compare: depth?.depthCompare ?? null,
+                depth_bias: depth?.depthBias ?? null,
+                depth_bias_slope_scale: depth?.depthBiasSlopeScale ?? null,
+                depth_bias_clamp: depth?.depthBiasClamp ?? null,
                 color_format: desc.fragment?.targets?.[0]?.format ?? null,
                 sample_count: desc.multisample?.count ?? 1,
                 alpha_to_coverage_enabled:

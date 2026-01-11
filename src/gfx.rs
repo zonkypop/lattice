@@ -659,6 +659,9 @@ pub struct PipelineCreate {
     pub depth_format: Option<String>,
     pub depth_write_enabled: Option<bool>,
     pub depth_compare: Option<String>,
+    pub depth_bias: Option<i32>,
+    pub depth_bias_slope_scale: Option<f32>,
+    pub depth_bias_clamp: Option<f32>,
     pub color_format: Option<String>,
     pub sample_count: Option<u32>,
     pub alpha_to_coverage_enabled: Option<bool>,
@@ -1869,7 +1872,11 @@ pub fn op_gfx_device_create_pipeline(
             depth_write_enabled: desc.depth_write_enabled.unwrap_or(true),
             depth_compare: map_compare_function(desc.depth_compare.as_deref()),
             stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
+            bias: wgpu::DepthBiasState {
+                constant: desc.depth_bias.unwrap_or(0),
+                slope_scale: desc.depth_bias_slope_scale.unwrap_or(0.0),
+                clamp: desc.depth_bias_clamp.unwrap_or(0.0),
+            },
         })
     } else {
         None

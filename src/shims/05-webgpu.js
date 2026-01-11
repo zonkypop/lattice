@@ -637,6 +637,41 @@ if (!gfx) {
 
     copyBufferToBuffer() {}
 
+    copyBufferToTexture(source, dest, copySize) {
+      if (!source.buffer?.__rid) {
+        throw new Error("copyBufferToTexture: buffer missing __rid");
+      }
+      if (!dest.texture?.__rid) {
+        throw new Error("copyBufferToTexture: texture missing __rid");
+      }
+      const d = dest.origin || {};
+      const width = copySize?.width ?? copySize?.[0] ?? 1;
+      const height = copySize?.height ?? copySize?.[1] ?? 1;
+      const depth = copySize?.depthOrArrayLayers ?? copySize?.[2] ?? 1;
+      // bytesPerRow must be provided and valid for 3D textures
+      // If not provided, calculate based on texture width (assuming r8unorm = 1 byte per texel)
+      // Must be aligned to 256 bytes for wgpu
+      let bytesPerRow = source.bytesPerRow;
+      if (!bytesPerRow || bytesPerRow < width) {
+        bytesPerRow = Math.ceil(width / 256) * 256;
+        if (bytesPerRow < 256) bytesPerRow = 256;
+      }
+      gfx.op_gfx_copy_buffer_to_texture({
+        buffer_rid: source.buffer.__rid,
+        buffer_offset: source.offset ?? 0,
+        bytes_per_row: bytesPerRow,
+        rows_per_image: source.rowsPerImage ?? height,
+        texture_rid: dest.texture.__rid,
+        mip_level: dest.mipLevel ?? 0,
+        origin_x: d.x ?? 0,
+        origin_y: d.y ?? 0,
+        origin_z: d.z ?? 0,
+        width,
+        height,
+        depth_or_array_layers: depth,
+      });
+    }
+
     copyTextureToTexture(src, dst, copySize) {
       if (!src.texture?.__rid || !dst.texture?.__rid) {
         throw new Error("copyTextureToTexture: texture missing __rid");
@@ -662,6 +697,16 @@ if (!gfx) {
     }
 
     copyTextureToBuffer() {}
+
+    clearBuffer(buffer, offset = 0, size) {
+      if (!buffer?.__rid) throw new Error("clearBuffer: buffer missing __rid");
+      const clearSize = size ?? buffer.byteLength - offset;
+      gfx.op_gfx_clear_buffer({
+        buffer_rid: buffer.__rid,
+        offset: offset >>> 0,
+        size: clearSize >>> 0,
+      });
+    }
 
     finish() {
       globalThis.__gpuCanvasContext?.__submitFrame();

@@ -90,6 +90,7 @@ extension!(
         gfx::op_gfx_device_create_buffer_init,
         gfx::op_gfx_device_create_buffer,
         gfx::op_gfx_queue_write_buffer,
+        gfx::op_gfx_clear_buffer,
         gfx::op_gfx_device_create_texture,
         gfx::op_gfx_texture_create_view,
         gfx::op_gfx_device_create_sampler,
@@ -103,6 +104,7 @@ extension!(
         gfx::op_gfx_pipeline_get_bind_group_layout,
         gfx::op_gfx_render_to_texture,
         gfx::op_gfx_copy_texture_to_texture,
+        gfx::op_gfx_copy_buffer_to_texture,
         gfx::op_gfx_decode_image_store,
         gfx::op_gfx_upload_decoded_image_to_texture,
         gfx::op_gfx_decoded_image_drop,
@@ -412,8 +414,11 @@ async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpec
     let xr_enabled = std::env::args().any(|a| a == "--xr");
 
     worker.js_runtime.execute_script(
-        "<xr_flag>",
-        deno_core::ModuleCodeString::from(format!("globalThis.__nativeXR = {};", xr_enabled)),
+        "<native_flags>",
+        deno_core::ModuleCodeString::from(format!(
+            "globalThis.__isNative__ = true; globalThis.__nativeXR = {};",
+            xr_enabled
+        )),
     )?;
 
     Ok((worker, main_module, shared_array_buffer_store))

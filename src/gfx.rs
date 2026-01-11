@@ -219,6 +219,10 @@ fn map_buffer_binding_type(t: Option<&str>) -> wgpu::BufferBindingType {
 
 pub fn map_texture_format(fmt: &str) -> wgpu::TextureFormat {
     match fmt {
+        "r8unorm" => wgpu::TextureFormat::R8Unorm,
+        "r8snorm" => wgpu::TextureFormat::R8Snorm,
+        "r8uint" => wgpu::TextureFormat::R8Uint,
+        "r8sint" => wgpu::TextureFormat::R8Sint,
         "rgba8unorm" => wgpu::TextureFormat::Rgba8Unorm,
         "rgba8unorm-srgb" => wgpu::TextureFormat::Rgba8UnormSrgb,
         "bgra8unorm" => wgpu::TextureFormat::Bgra8Unorm,
@@ -768,6 +772,22 @@ pub struct CopyTextureToTextureArgs {
     pub dst_origin_x: u32,
     pub dst_origin_y: u32,
     pub dst_origin_z: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth_or_array_layers: u32,
+}
+
+#[derive(Deserialize)]
+pub struct CopyBufferToTextureArgs {
+    pub buffer_rid: u32,
+    pub buffer_offset: u64,
+    pub bytes_per_row: u32,
+    pub rows_per_image: u32,
+    pub texture_rid: u32,
+    pub mip_level: u32,
+    pub origin_x: u32,
+    pub origin_y: u32,
+    pub origin_z: u32,
     pub width: u32,
     pub height: u32,
     pub depth_or_array_layers: u32,
@@ -1411,6 +1431,36 @@ pub fn op_gfx_queue_write_buffer(
 
     ctx.queue
         .write_buffer(&buffer.buffer, dst_offset as u64, bytes);
+
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct ClearBufferArgs {
+    buffer_rid: u32,
+    offset: u64,
+    size: u64,
+}
+
+#[op2]
+pub fn op_gfx_clear_buffer(
+    state: &mut OpState,
+    #[serde] args: ClearBufferArgs,
+) -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    let buffer = state
+        .resource_table
+        .get::<GfxBuffer>(ResourceId::from(args.buffer_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("clear_buffer_encoder"),
+    });
+
+    encoder.clear_buffer(&buffer.buffer, args.offset, Some(args.size));
+
+    ctx.queue.submit(std::iter::once(encoder.finish()));
 
     Ok(())
 }
@@ -2982,6 +3032,59 @@ pub fn op_gfx_copy_texture_to_texture(
                 x: args.dst_origin_x,
                 y: args.dst_origin_y,
                 z: args.dst_origin_z,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width: args.width,
+            height: args.height,
+            depth_or_array_layers: args.depth_or_array_layers,
+        },
+    );
+
+    ctx.queue.submit(iter::once(encoder.finish()));
+    Ok(())
+}
+
+#[op2]
+pub fn op_gfx_copy_buffer_to_texture(
+    state: &mut OpState,
+    #[serde] args: CopyBufferToTextureArgs,
+) -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    let buffer = state
+        .resource_table
+        .get::<GfxBuffer>(ResourceId::from(args.buffer_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let texture = state
+        .resource_table
+        .get::<GfxTexture>(ResourceId::from(args.texture_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let mut encoder =
+        ctx.device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GFX CopyBufferToTexture"),
+            });
+
+    encoder.copy_buffer_to_texture(
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer.buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: args.buffer_offset,
+                bytes_per_row: Some(args.bytes_per_row),
+                rows_per_image: Some(args.rows_per_image),
+            },
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture.texture,
+            mip_level: args.mip_level,
+            origin: wgpu::Origin3d {
+                x: args.origin_x,
+                y: args.origin_y,
+                z: args.origin_z,
             },
             aspect: wgpu::TextureAspect::All,
         },

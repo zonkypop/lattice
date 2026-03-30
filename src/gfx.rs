@@ -10,11 +10,11 @@ use wgpu::util::DeviceExt;
 
 use std::sync::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
 use std::sync::RwLock;
 
-use wgpu::BufferAsyncError;
+use crate::xr::is_xr_active;
 
 // ======================= Graphics Context =======================
 
@@ -114,6 +114,12 @@ pub struct GfxComputePipeline {
     pub pipeline: wgpu::ComputePipeline,
 }
 impl Resource for GfxComputePipeline {}
+
+pub struct GfxQuerySet {
+    pub query_set: wgpu::QuerySet,
+    pub count: u32,
+}
+impl Resource for GfxQuerySet {}
 
 // ======================= Mapping helpers =======================
 
@@ -346,6 +352,20 @@ fn map_compare_function(s: Option<&str>) -> wgpu::CompareFunction {
     }
 }
 
+fn map_stencil_operation(s: Option<&str>) -> wgpu::StencilOperation {
+    match s {
+        Some("keep") => wgpu::StencilOperation::Keep,
+        Some("zero") => wgpu::StencilOperation::Zero,
+        Some("replace") => wgpu::StencilOperation::Replace,
+        Some("invert") => wgpu::StencilOperation::Invert,
+        Some("increment-clamp") => wgpu::StencilOperation::IncrementClamp,
+        Some("decrement-clamp") => wgpu::StencilOperation::DecrementClamp,
+        Some("increment-wrap") => wgpu::StencilOperation::IncrementWrap,
+        Some("decrement-wrap") => wgpu::StencilOperation::DecrementWrap,
+        _ => wgpu::StencilOperation::Keep,
+    }
+}
+
 // ======================= WGSL Sanitization =======================
 
 fn sanitize_wgsl(code: &str) -> String {
@@ -379,6 +399,52 @@ fn sanitize_wgsl(code: &str) -> String {
         let matched = &caps[0];
         re_vecu_i32.replace_all(matched, "${1}u${2}").to_string()
     }).to_string();
+
+    result
+}
+
+/// Replace `fn linear_to_srgb` with a pass-through version for XR mode.
+/// XR compositors expect linear color output and handle gamma correction themselves,
+/// so we skip the sRGB conversion to prevent double-correction.
+fn replace_linear_to_srgb_for_xr(code: &str) -> String {
+    const FN_NAME: &str = "fn linear_to_srgb";
+    const PASSTHROUGH: &str = "fn linear_to_srgb(c: vec4f) -> vec4f { return c; }";
+
+    let mut result = code.to_string();
+    let mut search_start = 0;
+
+    while let Some(fn_index) = result[search_start..].find(FN_NAME) {
+        let fn_index = search_start + fn_index;
+
+        // Find the opening brace
+        if let Some(brace_offset) = result[fn_index..].find('{') {
+            let brace_start = fn_index + brace_offset;
+
+            // Match braces to find the end of the function
+            let mut depth = 1;
+            let mut i = brace_start + 1;
+            let bytes = result.as_bytes();
+
+            while i < bytes.len() && depth > 0 {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            if depth == 0 {
+                // Replace the entire function with pass-through
+                result = format!("{}{}{}", &result[..fn_index], PASSTHROUGH, &result[i..]);
+                search_start = fn_index + PASSTHROUGH.len();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
 
     result
 }
@@ -662,7 +728,18 @@ pub struct PipelineCreate {
     pub depth_bias: Option<i32>,
     pub depth_bias_slope_scale: Option<f32>,
     pub depth_bias_clamp: Option<f32>,
+    pub stencil_front_compare: Option<String>,
+    pub stencil_front_pass_op: Option<String>,
+    pub stencil_front_fail_op: Option<String>,
+    pub stencil_front_depth_fail_op: Option<String>,
+    pub stencil_back_compare: Option<String>,
+    pub stencil_back_pass_op: Option<String>,
+    pub stencil_back_fail_op: Option<String>,
+    pub stencil_back_depth_fail_op: Option<String>,
+    pub stencil_read_mask: Option<u32>,
+    pub stencil_write_mask: Option<u32>,
     pub color_format: Option<String>,
+    pub color_write_mask: Option<u32>,
     pub sample_count: Option<u32>,
     pub alpha_to_coverage_enabled: Option<bool>,
 }
@@ -702,6 +779,58 @@ pub struct ComputeDispatchIndirectArgs {
 }
 
 #[derive(Deserialize)]
+pub struct TimestampWritesDesc {
+    pub query_set_rid: u32,
+    pub beginning_of_pass_write_index: Option<u32>,
+    pub end_of_pass_write_index: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct BatchedComputeCommand {
+    pub cmd: String, // "clear_buffer", "dispatch", "dispatch_indirect", "copy_buffer_to_texture", "copy_texture_to_texture"
+    // clear_buffer fields
+    pub buffer_rid: Option<u32>,
+    pub offset: Option<u64>,
+    pub size: Option<u64>,
+    // dispatch fields
+    pub pipeline_rid: Option<u32>,
+    pub bind_group_rids: Option<Vec<Option<u32>>>,
+    pub workgroup_count_x: Option<u32>,
+    pub workgroup_count_y: Option<u32>,
+    pub workgroup_count_z: Option<u32>,
+    // timestamp writes for compute pass
+    pub timestamp_writes: Option<TimestampWritesDesc>,
+    // dispatch_indirect fields
+    pub indirect_buffer_rid: Option<u32>,
+    pub indirect_offset: Option<u64>,
+    // copy_buffer_to_texture fields
+    pub src_buffer_rid: Option<u32>,
+    pub buffer_offset: Option<u64>,
+    pub bytes_per_row: Option<u32>,
+    pub rows_per_image: Option<u32>,
+    pub texture_rid: Option<u32>,
+    pub mip_level: Option<u32>,
+    pub origin_x: Option<u32>,
+    pub origin_y: Option<u32>,
+    pub origin_z: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub depth_or_array_layers: Option<u32>,
+    // copy_texture_to_texture fields (src)
+    pub src_texture_rid: Option<u32>,
+    pub src_mip_level: Option<u32>,
+    pub src_origin_x: Option<u32>,
+    pub src_origin_y: Option<u32>,
+    pub src_origin_z: Option<u32>,
+    // copy_texture_to_texture fields (dst uses texture_rid, mip_level, origin_x/y/z above)
+}
+
+#[derive(Deserialize)]
+pub struct BatchedComputeArgs {
+    pub commands: Vec<BatchedComputeCommand>,
+}
+
+#[derive(Deserialize)]
 pub struct ClearColor {
     pub r: f64,
     pub g: f64,
@@ -729,6 +858,11 @@ pub struct DrawCall {
     pub depth_load_op: Option<String>,
     pub depth_store_op: Option<String>,
     pub depth_read_only: Option<bool>,
+    pub stencil_clear_value: Option<u32>,
+    pub stencil_load_op: Option<String>,
+    pub stencil_store_op: Option<String>,
+    pub stencil_read_only: Option<bool>,
+    pub stencil_reference: Option<u32>,
     // Multi draw
     pub is_multi_draw: Option<bool>,
     pub indirect_buffer_rid: Option<u32>,
@@ -741,6 +875,31 @@ pub struct DrawCall {
 #[derive(Deserialize)]
 pub struct SurfaceDrawArgs {
     pub draw_calls: Vec<DrawCall>,
+    // Compute commands to execute BEFORE render pass (in same command buffer)
+    pub compute_commands: Option<Vec<BatchedComputeCommand>>,
+    // Timestamp support for frame timing - written at START and END of all work
+    pub timestamp_writes: Option<TimestampWritesDesc>,
+    // Operations to perform after render pass (resolve queries, copy buffers)
+    pub resolve_query_sets: Option<Vec<ResolveQuerySetDesc>>,
+    pub copy_buffers: Option<Vec<CopyBufferDesc>>,
+}
+
+#[derive(Deserialize)]
+pub struct ResolveQuerySetDesc {
+    pub query_set_rid: u32,
+    pub first_query: u32,
+    pub query_count: u32,
+    pub destination_rid: u32,
+    pub destination_offset: u64,
+}
+
+#[derive(Deserialize)]
+pub struct CopyBufferDesc {
+    pub src_rid: u32,
+    pub src_offset: u64,
+    pub dst_rid: u32,
+    pub dst_offset: u64,
+    pub size: u64,
 }
 
 #[derive(Serialize)]
@@ -822,6 +981,13 @@ fn flush_pending_commands(queue: &wgpu::Queue) {
     if !pending.is_empty() {
         queue.submit(pending.drain(..));
     }
+}
+
+/// Public function to flush pending command buffers - called from XR module before frame end
+pub fn flush_pending_command_buffers() -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+    flush_pending_commands(&ctx.queue);
+    Ok(())
 }
 
 fn ensure_msaa_texture(
@@ -1002,14 +1168,17 @@ pub fn op_gfx_multi_draw_indexed_indirect(
         pass.multi_draw_indexed_indirect(&indirect_buf.buffer, args.indirect_offset, args.count);
     }
 
-    ctx.queue.submit(std::iter::once(encoder.finish()));
+    // Queue for batched submission instead of immediate submit
+    queue_command_buffer(encoder.finish());
     Ok(())
 }
 
 #[op2(fast)]
 pub fn op_gfx_queue_submit_empty() -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
-    ctx.queue.submit(std::iter::empty());
+    // Flush any pending command buffers so JS queue.submit() properly synchronizes
+    // all prior GPU work (render-to-texture, compute, mipmap gen, etc.)
+    flush_pending_commands(&ctx.queue);
     Ok(())
 }
 
@@ -1067,6 +1236,9 @@ static MIPMAP_RESOURCES: OnceLock<MipmapResources> = OnceLock::new();
 struct MipmapResources {
     shader: wgpu::ShaderModule,
     sampler: wgpu::Sampler,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    pipelines: std::sync::Mutex<std::collections::HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
 }
 
 const MIPMAP_SHADER: &str = r#"
@@ -1103,8 +1275,75 @@ fn get_mipmap_resources(device: &wgpu::Device) -> &'static MipmapResources {
             mag_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        MipmapResources { shader, sampler }
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Mipmap Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Mipmap Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            ..Default::default()
+        });
+        MipmapResources {
+            shader,
+            sampler,
+            bind_group_layout,
+            pipeline_layout,
+            pipelines: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     })
+}
+
+fn get_mipmap_pipeline(device: &wgpu::Device, resources: &'static MipmapResources, format: wgpu::TextureFormat) -> &'static wgpu::RenderPipeline {
+    let mut pipelines = resources.pipelines.lock().unwrap();
+    if !pipelines.contains_key(&format) {
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Mipmap Pipeline"),
+            layout: Some(&resources.pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &resources.shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &resources.shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        pipelines.insert(format, pipeline);
+    }
+    // SAFETY: We're returning a reference to a pipeline that lives in a static OnceLock.
+    // The HashMap is only ever inserted into, never removed from, so the reference is stable.
+    unsafe { &*(pipelines.get(&format).unwrap() as *const _) }
 }
 
 pub fn generate_mipmaps(
@@ -1117,7 +1356,8 @@ pub fn generate_mipmaps(
 ) {
     let resources = get_mipmap_resources(device);
     let format = texture.format();
-    
+    let pipeline = get_mipmap_pipeline(device, resources, format);
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Mipmap Encoder"),
     });
@@ -1149,35 +1389,9 @@ pub fn generate_mipmaps(
             ..Default::default()
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Mipmap Pipeline"),
-            layout: None,
-            vertex: wgpu::VertexState {
-                module: &resources.shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &resources.shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None, 
-        });
-
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Mipmap Bind Group"),
-            layout: &pipeline.get_bind_group_layout(0),
+            layout: &resources.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -1199,18 +1413,22 @@ pub fn generate_mipmaps(
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
-                depth_slice: None, 
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             ..Default::default()
         });
 
-        pass.set_pipeline(&pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
 
-    queue.submit(std::iter::once(encoder.finish()));
+    // Deferred submission: encoder.finish() produces a CommandBuffer that holds
+    // Arc references to all recorded resources (views, bind groups), so they
+    // survive even after local variables are dropped. Batching avoids per-image
+    // GPU sync points which serializes texture loading.
+    queue_command_buffer(encoder.finish());
 }
 
 #[op2(fast)]
@@ -1306,7 +1524,14 @@ pub fn op_gfx_upload_decoded_image_to_texture(
         },
     );
 
-    generate_mipmaps(&ctx.device, &ctx.queue, &texture.texture, img.width, img.height, origin_z);
+    // Generate mipmaps natively if texture has multiple mip levels.
+    // This must happen on the Rust side because the JS shim's render pipeline
+    // hardcodes alpha blending, which corrupts mipmap data for transparent textures.
+    // No flush needed: queue.write_texture() above is ordered before subsequent submits.
+    // generate_mipmaps uses queue_command_buffer (deferred) to avoid per-image sync points.
+    if texture.texture.mip_level_count() > 1 {
+        generate_mipmaps(&ctx.device, &ctx.queue, &texture.texture, img.width, img.height, origin_z);
+    }
 
     Ok(())
 }
@@ -1350,9 +1575,16 @@ pub fn op_gfx_device_create_shader(
 
     let sanitized = sanitize_wgsl(&desc.code);
 
+    // In XR mode, replace linear_to_srgb with pass-through to avoid double gamma correction
+    let final_code = if is_xr_active() {
+        replace_linear_to_srgb_for_xr(&sanitized)
+    } else {
+        sanitized
+    };
+
     let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: desc.label.as_deref(),
-        source: wgpu::ShaderSource::Wgsl(sanitized.into()),
+        source: wgpu::ShaderSource::Wgsl(final_code.into()),
     });
 
     let rid = state.resource_table.add(GfxShader { module });
@@ -1478,6 +1710,8 @@ pub fn op_gfx_device_create_texture(
     let usage = wgpu::TextureUsages::from_bits(desc.usage)
         .ok_or_else(|| JsErrorBox::generic("invalid texture usage flags"))?;
 
+    let format = map_texture_format(&desc.format);
+    let error_guard = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
         label: desc.label.as_deref(),
         size: wgpu::Extent3d {
@@ -1488,10 +1722,16 @@ pub fn op_gfx_device_create_texture(
         mip_level_count: desc.mip_level_count,
         sample_count: desc.sample_count,
         dimension: map_texture_dimension(&desc.dimension),
-        format: map_texture_format(&desc.format),
+        format,
         usage,
         view_formats: &[],
     });
+    let maybe_err = pollster::block_on(error_guard.pop());
+    if let Some(err) = maybe_err {
+        eprintln!("[TEX-DIAG] ERROR creating texture label={:?} size={}x{}x{} format={:?} usage={:?} mips={} samples={}: {}",
+            desc.label, desc.size.width, desc.size.height, desc.size.depth_or_array_layers,
+            format, usage, desc.mip_level_count, desc.sample_count, err);
+    }
 
     let rid = state.resource_table.add(GfxTexture { texture });
     Ok(JsGfxTexture { rid })
@@ -1780,11 +2020,41 @@ pub fn op_gfx_device_create_bind_group(
         }
     }
 
+    // Auto-label bind groups for debugging (so we can identify which one is invalid)
+    static BG_COUNTER: AtomicU32 = AtomicU32::new(0);
+    let bg_id = BG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let auto_label = if let Some(ref l) = desc.label {
+        format!("BG#{} {}", bg_id, l)
+    } else {
+        format!("BG#{} layout_rid={} entries={}", bg_id, desc.layout_rid, desc.entries.len())
+    };
+
+    // Log detailed entry info for large bind groups (targeting the problematic 20-entry one)
+    if desc.entries.len() >= 15 {
+        eprintln!("[BG-DIAG] Creating {} with layout_rid={}", auto_label, desc.layout_rid);
+        for e in desc.entries.iter() {
+            if let Some(buf_rid) = e.buffer_rid {
+                eprintln!("  binding={} -> buffer_rid={} offset={} size={:?}", e.binding, buf_rid, e.offset, e.size);
+            } else if let Some(sam_rid) = e.sampler_rid {
+                eprintln!("  binding={} -> sampler_rid={}", e.binding, sam_rid);
+            } else if let Some(view_rid) = e.texture_view_rid {
+                eprintln!("  binding={} -> texture_view_rid={}", e.binding, view_rid);
+            } else {
+                eprintln!("  binding={} -> NO RESOURCE!", e.binding);
+            }
+        }
+    }
+
+    let error_guard = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: desc.label.as_deref(),
+        label: Some(&auto_label),
         layout: &layout.layout,
         entries: &entries,
     });
+    let maybe_err = pollster::block_on(error_guard.pop());
+    if let Some(err) = maybe_err {
+        eprintln!("[BG-DIAG] ERROR creating {}: {}", auto_label, err);
+    }
 
     let rid = state
         .resource_table
@@ -1867,11 +2137,32 @@ pub fn op_gfx_device_create_pipeline(
 
     let depth_stencil = if let Some(fmt_str) = desc.depth_format.as_deref() {
         let tfmt = map_texture_format(fmt_str);
+        let has_stencil = desc.stencil_front_compare.is_some() || desc.stencil_back_compare.is_some();
+        let stencil = if has_stencil {
+            wgpu::StencilState {
+                front: wgpu::StencilFaceState {
+                    compare: map_compare_function(desc.stencil_front_compare.as_deref()),
+                    pass_op: map_stencil_operation(desc.stencil_front_pass_op.as_deref()),
+                    fail_op: map_stencil_operation(desc.stencil_front_fail_op.as_deref()),
+                    depth_fail_op: map_stencil_operation(desc.stencil_front_depth_fail_op.as_deref()),
+                },
+                back: wgpu::StencilFaceState {
+                    compare: map_compare_function(desc.stencil_back_compare.as_deref()),
+                    pass_op: map_stencil_operation(desc.stencil_back_pass_op.as_deref()),
+                    fail_op: map_stencil_operation(desc.stencil_back_fail_op.as_deref()),
+                    depth_fail_op: map_stencil_operation(desc.stencil_back_depth_fail_op.as_deref()),
+                },
+                read_mask: desc.stencil_read_mask.unwrap_or(0xFF),
+                write_mask: desc.stencil_write_mask.unwrap_or(0xFF),
+            }
+        } else {
+            wgpu::StencilState::default()
+        };
         Some(wgpu::DepthStencilState {
             format: tfmt,
             depth_write_enabled: desc.depth_write_enabled.unwrap_or(true),
             depth_compare: map_compare_function(desc.depth_compare.as_deref()),
-            stencil: wgpu::StencilState::default(),
+            stencil,
             bias: wgpu::DepthBiasState {
                 constant: desc.depth_bias.unwrap_or(0),
                 slope_scale: desc.depth_bias_slope_scale.unwrap_or(0.0),
@@ -1892,6 +2183,8 @@ pub fn op_gfx_device_create_pipeline(
 
         let entry_point = desc.fragment_entry.as_deref().unwrap_or("fs_main");
 
+        let color_write_mask = wgpu::ColorWrites::from_bits(desc.color_write_mask.unwrap_or(0xF))
+            .unwrap_or(wgpu::ColorWrites::ALL);
         Some(wgpu::FragmentState {
             module: &f.module,
             entry_point: Some(entry_point),
@@ -1899,7 +2192,7 @@ pub fn op_gfx_device_create_pipeline(
             targets: &[Some(wgpu::ColorTargetState {
                 format: color_format,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
+                write_mask: color_write_mask,
             })],
         })
     } else {
@@ -2131,9 +2424,10 @@ pub fn op_gfx_surface_draw(
         }
     }
 
-    // Pre-collect depth view and ops from first draw call that has depth
+    // Pre-collect depth view, depth ops, and stencil ops from first draw call that has depth
     let mut depth_view: Option<Arc<wgpu::TextureView>> = None;
     let mut depth_ops: Option<wgpu::Operations<f32>> = None;
+    let mut stencil_ops: Option<wgpu::Operations<u32>> = None;
 
     for dc in args.draw_calls.iter() {
         if depth_view.is_none() {
@@ -2153,8 +2447,21 @@ pub fn op_gfx_surface_draw(
                     Some("discard") => wgpu::StoreOp::Discard,
                     _ => wgpu::StoreOp::Store,
                 };
-
                 depth_ops = Some(wgpu::Operations { load, store });
+
+                if dc.stencil_load_op.is_some() || dc.stencil_store_op.is_some() {
+                    let s_clear = dc.stencil_clear_value.unwrap_or(0);
+                    let s_load = match dc.stencil_load_op.as_deref() {
+                        Some("load") => wgpu::LoadOp::Load,
+                        _ => wgpu::LoadOp::Clear(s_clear),
+                    };
+                    let s_store = match dc.stencil_store_op.as_deref() {
+                        Some("discard") => wgpu::StoreOp::Discard,
+                        _ => wgpu::StoreOp::Store,
+                    };
+                    stencil_ops = Some(wgpu::Operations { load: s_load, store: s_store });
+                }
+
                 break;
             }
         }
@@ -2191,6 +2498,7 @@ pub fn op_gfx_surface_draw(
         first_instance: u32,
         vertex_count: u32,
         first_vertex: u32,
+        stencil_reference: u32,
     }
 
     let mut draw_data_list: Vec<SurfaceDrawData> = Vec::with_capacity(args.draw_calls.len());
@@ -2299,6 +2607,7 @@ pub fn op_gfx_surface_draw(
             first_instance: dc.first_instance,
             vertex_count: dc.vertex_count,
             first_vertex: dc.first_vertex,
+            stencil_reference: dc.stencil_reference.unwrap_or(0),
         });
     }
 
@@ -2306,17 +2615,192 @@ pub fn op_gfx_surface_draw(
         label: Some("GFX Encoder"),
     });
 
-    // single render pass for all draw calls 
+    // Get query set for timestamp writes if provided
+    let qs_ref = args.timestamp_writes.as_ref().and_then(|tw| {
+        state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+    });
+
+    // Write START timestamp BEFORE any work (compute or render) at encoder level
+    // This ensures we measure ALL GPU work including compute passes
+    if let (Some(tw), Some(qs)) = (&args.timestamp_writes, &qs_ref) {
+        if let Some(start_idx) = tw.beginning_of_pass_write_index {
+            encoder.write_timestamp(&qs.query_set, start_idx);
+        }
+    }
+
+    // Execute compute commands BEFORE render pass (all in same command buffer)
+    if let Some(ref compute_cmds) = args.compute_commands {
+        for cmd in compute_cmds.iter() {
+            match cmd.cmd.as_str() {
+                "clear_buffer" => {
+                    if let Some(buf_rid) = cmd.buffer_rid {
+                        if let Ok(buf) = state.resource_table.get::<GfxBuffer>(ResourceId::from(buf_rid)) {
+                            encoder.clear_buffer(&buf.buffer, cmd.offset.unwrap_or(0), Some(cmd.size.unwrap_or(0)));
+                        }
+                    }
+                }
+                "dispatch" => {
+                    if let Some(p_rid) = cmd.pipeline_rid {
+                        if let Ok(pipeline) = state.resource_table.get::<GfxComputePipeline>(ResourceId::from(p_rid)) {
+                            // Get query set if timestamp writes provided for this compute pass
+                            let compute_qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
+                                state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+                            });
+                            let compute_ts_writes = match (&cmd.timestamp_writes, &compute_qs_ref) {
+                                (Some(tw), Some(qs)) => Some(wgpu::ComputePassTimestampWrites {
+                                    query_set: &qs.query_set,
+                                    beginning_of_pass_write_index: tw.beginning_of_pass_write_index,
+                                    end_of_pass_write_index: tw.end_of_pass_write_index,
+                                }),
+                                _ => None,
+                            };
+
+                            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("Batched Compute Pass"),
+                                timestamp_writes: compute_ts_writes,
+                            });
+                            pass.set_pipeline(&pipeline.pipeline);
+                            if let Some(ref rids) = cmd.bind_group_rids {
+                                for (idx, rid_opt) in rids.iter().enumerate() {
+                                    if let Some(rid) = rid_opt {
+                                        if let Ok(bg) = state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid)) {
+                                            pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
+                                        }
+                                    }
+                                }
+                            }
+                            pass.dispatch_workgroups(
+                                cmd.workgroup_count_x.unwrap_or(1),
+                                cmd.workgroup_count_y.unwrap_or(1),
+                                cmd.workgroup_count_z.unwrap_or(1),
+                            );
+                        }
+                    }
+                }
+                "dispatch_indirect" => {
+                    if let (Some(p_rid), Some(ib_rid)) = (cmd.pipeline_rid, cmd.indirect_buffer_rid) {
+                        if let (Ok(pipeline), Ok(indirect_buf)) = (
+                            state.resource_table.get::<GfxComputePipeline>(ResourceId::from(p_rid)),
+                            state.resource_table.get::<GfxBuffer>(ResourceId::from(ib_rid))
+                        ) {
+                            let compute_qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
+                                state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+                            });
+                            let compute_ts_writes = match (&cmd.timestamp_writes, &compute_qs_ref) {
+                                (Some(tw), Some(qs)) => Some(wgpu::ComputePassTimestampWrites {
+                                    query_set: &qs.query_set,
+                                    beginning_of_pass_write_index: tw.beginning_of_pass_write_index,
+                                    end_of_pass_write_index: tw.end_of_pass_write_index,
+                                }),
+                                _ => None,
+                            };
+
+                            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("Batched Compute Pass Indirect"),
+                                timestamp_writes: compute_ts_writes,
+                            });
+                            pass.set_pipeline(&pipeline.pipeline);
+                            if let Some(ref rids) = cmd.bind_group_rids {
+                                for (idx, rid_opt) in rids.iter().enumerate() {
+                                    if let Some(rid) = rid_opt {
+                                        if let Ok(bg) = state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid)) {
+                                            pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
+                                        }
+                                    }
+                                }
+                            }
+                            pass.dispatch_workgroups_indirect(&indirect_buf.buffer, cmd.indirect_offset.unwrap_or(0));
+                        }
+                    }
+                }
+                "copy_buffer_to_texture" => {
+                    if let (Some(buf_rid), Some(tex_rid)) = (cmd.src_buffer_rid, cmd.texture_rid) {
+                        if let (Ok(buf), Ok(tex)) = (
+                            state.resource_table.get::<GfxBuffer>(ResourceId::from(buf_rid)),
+                            state.resource_table.get::<GfxTexture>(ResourceId::from(tex_rid))
+                        ) {
+                            encoder.copy_buffer_to_texture(
+                                wgpu::TexelCopyBufferInfo {
+                                    buffer: &buf.buffer,
+                                    layout: wgpu::TexelCopyBufferLayout {
+                                        offset: cmd.buffer_offset.unwrap_or(0),
+                                        bytes_per_row: Some(cmd.bytes_per_row.unwrap_or(256)),
+                                        rows_per_image: Some(cmd.rows_per_image.unwrap_or(1)),
+                                    },
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &tex.texture,
+                                    mip_level: cmd.mip_level.unwrap_or(0),
+                                    origin: wgpu::Origin3d {
+                                        x: cmd.origin_x.unwrap_or(0),
+                                        y: cmd.origin_y.unwrap_or(0),
+                                        z: cmd.origin_z.unwrap_or(0),
+                                    },
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::Extent3d {
+                                    width: cmd.width.unwrap_or(1),
+                                    height: cmd.height.unwrap_or(1),
+                                    depth_or_array_layers: cmd.depth_or_array_layers.unwrap_or(1),
+                                },
+                            );
+                        }
+                    }
+                }
+                "copy_texture_to_texture" => {
+                    if let (Some(src_rid), Some(dst_rid)) = (cmd.src_texture_rid, cmd.texture_rid) {
+                        if let (Ok(src_tex), Ok(dst_tex)) = (
+                            state.resource_table.get::<GfxTexture>(ResourceId::from(src_rid)),
+                            state.resource_table.get::<GfxTexture>(ResourceId::from(dst_rid))
+                        ) {
+                            encoder.copy_texture_to_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &src_tex.texture,
+                                    mip_level: cmd.src_mip_level.unwrap_or(0),
+                                    origin: wgpu::Origin3d {
+                                        x: cmd.src_origin_x.unwrap_or(0),
+                                        y: cmd.src_origin_y.unwrap_or(0),
+                                        z: cmd.src_origin_z.unwrap_or(0),
+                                    },
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &dst_tex.texture,
+                                    mip_level: cmd.mip_level.unwrap_or(0),
+                                    origin: wgpu::Origin3d {
+                                        x: cmd.origin_x.unwrap_or(0),
+                                        y: cmd.origin_y.unwrap_or(0),
+                                        z: cmd.origin_z.unwrap_or(0),
+                                    },
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::Extent3d {
+                                    width: cmd.width.unwrap_or(1),
+                                    height: cmd.height.unwrap_or(1),
+                                    depth_or_array_layers: cmd.depth_or_array_layers.unwrap_or(1),
+                                },
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Render pass for all draw calls
     {
         let depth_attachment = match (&depth_view, &depth_ops) {
             (Some(dv), Some(ops)) => Some(wgpu::RenderPassDepthStencilAttachment {
                 view: dv.as_ref(),
                 depth_ops: Some(*ops),
-                stencil_ops: None,
+                stencil_ops: stencil_ops,
             }),
             _ => None,
         };
 
+        // No pass-level timestamps - we use encoder-level timestamps to capture
+        // ALL GPU work including compute passes that run before the render pass
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("GFX Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2342,6 +2826,7 @@ pub fn op_gfx_surface_draw(
                 .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
+            pass.set_stencil_reference(data.stencil_reference);
 
             for (slot, buf) in data.vbufs.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buf.slice(..));
@@ -2380,6 +2865,49 @@ pub fn op_gfx_surface_draw(
             }
         }
     }
+
+    // Write END timestamp AFTER all work (compute + render) at encoder level
+    if let (Some(tw), Some(qs)) = (&args.timestamp_writes, &qs_ref) {
+        if let Some(end_idx) = tw.end_of_pass_write_index {
+            encoder.write_timestamp(&qs.query_set, end_idx);
+        }
+    }
+
+    // Resolve query sets after render pass
+    if let Some(ref resolve_ops) = args.resolve_query_sets {
+        for op in resolve_ops {
+            if let Ok(qs) = state.resource_table.get::<GfxQuerySet>(ResourceId::from(op.query_set_rid)) {
+                if let Ok(dst) = state.resource_table.get::<GfxBuffer>(ResourceId::from(op.destination_rid)) {
+                    encoder.resolve_query_set(
+                        &qs.query_set,
+                        op.first_query..op.first_query + op.query_count,
+                        &dst.buffer,
+                        op.destination_offset,
+                    );
+                }
+            }
+        }
+    }
+
+    // Copy buffers after resolve
+    if let Some(ref copy_ops) = args.copy_buffers {
+        for op in copy_ops {
+            if let Ok(src) = state.resource_table.get::<GfxBuffer>(ResourceId::from(op.src_rid)) {
+                if let Ok(dst) = state.resource_table.get::<GfxBuffer>(ResourceId::from(op.dst_rid)) {
+                    encoder.copy_buffer_to_buffer(
+                        &src.buffer,
+                        op.src_offset,
+                        &dst.buffer,
+                        op.dst_offset,
+                        op.size,
+                    );
+                }
+            }
+        }
+    }
+
+    // Flush any pending command buffers before submitting the main frame
+    flush_pending_commands(&ctx.queue);
 
     ctx.queue.submit(iter::once(encoder.finish()));
     output.present();
@@ -2552,6 +3080,7 @@ struct XrDrawData {
     first_instance: u32,
     vertex_count: u32,
     first_vertex: u32,
+    stencil_reference: u32,
 }
 
 #[op2]
@@ -2668,6 +3197,7 @@ pub fn op_gfx_render_xr_frame(
             first_instance: dc.first_instance,
             vertex_count: dc.vertex_count,
             first_vertex: dc.first_vertex,
+            stencil_reference: dc.stencil_reference.unwrap_or(0),
         });
     }
 
@@ -2692,6 +3222,24 @@ pub fn op_gfx_render_xr_frame(
         _ => wgpu::StoreOp::Store,
     };
 
+    // Extract stencil ops from draw calls (matching surface draw path)
+    let mut stencil_ops: Option<wgpu::Operations<u32>> = None;
+    for dc in args.draw_calls.iter() {
+        if dc.stencil_load_op.is_some() || dc.stencil_store_op.is_some() {
+            let s_clear = dc.stencil_clear_value.unwrap_or(0);
+            let s_load = match dc.stencil_load_op.as_deref() {
+                Some("load") => wgpu::LoadOp::Load,
+                _ => wgpu::LoadOp::Clear(s_clear),
+            };
+            let s_store = match dc.stencil_store_op.as_deref() {
+                Some("discard") => wgpu::StoreOp::Discard,
+                _ => wgpu::StoreOp::Store,
+            };
+            stencil_ops = Some(wgpu::Operations { load: s_load, store: s_store });
+            break;
+        }
+    }
+
     // single render pass for all draw calls - good for TBRs
     {
         let depth_attachment = depth_view.as_ref().map(|dv| {
@@ -2701,7 +3249,7 @@ pub fn op_gfx_render_xr_frame(
                     load: wgpu::LoadOp::Clear(args.depth_clear_value.unwrap_or(1.0)),
                     store: depth_store,
                 }),
-                stencil_ops: None,
+                stencil_ops: stencil_ops,
             }
         });
 
@@ -2729,13 +3277,14 @@ pub fn op_gfx_render_xr_frame(
 
         // Issue all draw calls within the single pass
         for data in draw_data_list.iter() {
-            // Get pipeline reference 
+            // Get pipeline reference
             let pipeline_res = state
                 .resource_table
                 .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
                 .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
+            pass.set_stencil_reference(data.stencil_reference);
 
             for (slot, buf) in data.vbufs.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buf.slice(..));
@@ -2805,9 +3354,10 @@ pub fn op_gfx_render_to_texture(
         .get::<GfxTextureView>(ResourceId::from(args.target_view_rid))
         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
 
-    // Pre-collect depth view and ops from first draw call that has depth
+    // Pre-collect depth view, depth ops, and stencil ops from first draw call that has depth
     let mut depth_view: Option<Arc<wgpu::TextureView>> = None;
     let mut depth_ops: Option<wgpu::Operations<f32>> = None;
+    let mut stencil_ops: Option<wgpu::Operations<u32>> = None;
 
     for dc in args.draw_calls.iter() {
         if depth_view.is_none() {
@@ -2827,8 +3377,21 @@ pub fn op_gfx_render_to_texture(
                     Some("discard") => wgpu::StoreOp::Discard,
                     _ => wgpu::StoreOp::Store,
                 };
-
                 depth_ops = Some(wgpu::Operations { load, store });
+
+                if dc.stencil_load_op.is_some() || dc.stencil_store_op.is_some() {
+                    let s_clear = dc.stencil_clear_value.unwrap_or(0);
+                    let s_load = match dc.stencil_load_op.as_deref() {
+                        Some("load") => wgpu::LoadOp::Load,
+                        _ => wgpu::LoadOp::Clear(s_clear),
+                    };
+                    let s_store = match dc.stencil_store_op.as_deref() {
+                        Some("discard") => wgpu::StoreOp::Discard,
+                        _ => wgpu::StoreOp::Store,
+                    };
+                    stencil_ops = Some(wgpu::Operations { load: s_load, store: s_store });
+                }
+
                 break;
             }
         }
@@ -2860,6 +3423,7 @@ pub fn op_gfx_render_to_texture(
         first_instance: u32,
         vertex_count: u32,
         first_vertex: u32,
+        stencil_reference: u32,
     }
 
     let mut draw_data_list: Vec<TextureDrawData> = Vec::with_capacity(args.draw_calls.len());
@@ -2921,6 +3485,7 @@ pub fn op_gfx_render_to_texture(
             first_instance: dc.first_instance,
             vertex_count: dc.vertex_count,
             first_vertex: dc.first_vertex,
+            stencil_reference: dc.stencil_reference.unwrap_or(0),
         });
     }
 
@@ -2933,7 +3498,7 @@ pub fn op_gfx_render_to_texture(
             (Some(dv), Some(ops)) => Some(wgpu::RenderPassDepthStencilAttachment {
                 view: dv.as_ref(),
                 depth_ops: Some(*ops),
-                stencil_ops: None,
+                stencil_ops: stencil_ops,
             }),
             _ => None,
         };
@@ -2963,6 +3528,7 @@ pub fn op_gfx_render_to_texture(
                 .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
+            pass.set_stencil_reference(data.stencil_reference);
 
             for (slot, buf) in data.vbufs.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buf.slice(..));
@@ -2992,8 +3558,8 @@ pub fn op_gfx_render_to_texture(
         }
     }
 
-    // Submit immediately - these render-to-texture ops must complete before main render
-    ctx.queue.submit(iter::once(encoder.finish()));
+    // Queue for batched submission - will be flushed before main render
+    queue_command_buffer(encoder.finish());
 
     Ok(())
 }
@@ -3049,7 +3615,8 @@ pub fn op_gfx_copy_texture_to_texture(
         },
     );
 
-    ctx.queue.submit(iter::once(encoder.finish()));
+    // Queue for batched submission instead of immediate submit
+    queue_command_buffer(encoder.finish());
     Ok(())
 }
 
@@ -3102,7 +3669,8 @@ pub fn op_gfx_copy_buffer_to_texture(
         },
     );
 
-    ctx.queue.submit(iter::once(encoder.finish()));
+    // Queue for batched submission instead of immediate submit
+    queue_command_buffer(encoder.finish());
     Ok(())
 }
 
@@ -3150,6 +3718,7 @@ pub fn op_gfx_render_depth_only(
         first_instance: u32,
         vertex_count: u32,
         first_vertex: u32,
+        stencil_reference: u32,
     }
 
     let mut draw_data_list: Vec<DepthDrawData> = Vec::with_capacity(args.draw_calls.len());
@@ -3211,6 +3780,7 @@ pub fn op_gfx_render_depth_only(
             first_instance: dc.first_instance,
             vertex_count: dc.vertex_count,
             first_vertex: dc.first_vertex,
+            stencil_reference: dc.stencil_reference.unwrap_or(0),
         });
     }
 
@@ -3243,6 +3813,7 @@ pub fn op_gfx_render_depth_only(
                 .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
+            pass.set_stencil_reference(data.stencil_reference);
 
             for (slot, buf) in data.vbufs.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buf.slice(..));
@@ -3272,8 +3843,8 @@ pub fn op_gfx_render_depth_only(
         }
     }
 
-    // Submit immediately - depth-only renders must complete before main render
-    ctx.queue.submit(iter::once(encoder.finish()));
+    // Queue for batched submission - will be flushed before main render
+    queue_command_buffer(encoder.finish());
     Ok(())
 }
 
@@ -3409,7 +3980,8 @@ pub fn op_gfx_compute_dispatch(
         );
     }
 
-    ctx.queue.submit(iter::once(encoder.finish()));
+    // Queue for batched submission instead of immediate submit
+    queue_command_buffer(encoder.finish());
     Ok(())
 }
 
@@ -3464,6 +4036,528 @@ pub fn op_gfx_compute_dispatch_indirect(
         pass.dispatch_workgroups_indirect(&indirect_buf.buffer, args.indirect_offset);
     }
 
-    ctx.queue.submit(iter::once(encoder.finish()));
+    // Queue for batched submission instead of immediate submit
+    queue_command_buffer(encoder.finish());
+    Ok(())
+}
+
+#[op2]
+pub fn op_gfx_compute_batch(
+    state: &mut OpState,
+    #[serde] args: BatchedComputeArgs,
+) -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    // Validate all resource IDs upfront before encoding
+    for (i, cmd) in args.commands.iter().enumerate() {
+        match cmd.cmd.as_str() {
+            "clear_buffer" => {
+                let buf_rid = cmd.buffer_rid.ok_or_else(|| JsErrorBox::generic("clear_buffer: missing buffer_rid"))?;
+                state.resource_table.get::<GfxBuffer>(ResourceId::from(buf_rid))
+                    .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+            }
+            "dispatch" => {
+                let p_rid = cmd.pipeline_rid.ok_or_else(|| JsErrorBox::generic("dispatch: missing pipeline_rid"))?;
+                state.resource_table.get::<GfxComputePipeline>(ResourceId::from(p_rid))
+                    .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+                if let Some(ref rids) = cmd.bind_group_rids {
+                    for rid_opt in rids.iter() {
+                        if let Some(rid) = rid_opt {
+                            state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid))
+                                .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+                        }
+                    }
+                }
+            }
+            "dispatch_indirect" => {
+                let p_rid = cmd.pipeline_rid.ok_or_else(|| JsErrorBox::generic("dispatch_indirect: missing pipeline_rid"))?;
+                state.resource_table.get::<GfxComputePipeline>(ResourceId::from(p_rid))
+                    .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+                let ib_rid = cmd.indirect_buffer_rid.ok_or_else(|| JsErrorBox::generic("dispatch_indirect: missing indirect_buffer_rid"))?;
+                state.resource_table.get::<GfxBuffer>(ResourceId::from(ib_rid))
+                    .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+                if let Some(ref rids) = cmd.bind_group_rids {
+                    for rid_opt in rids.iter() {
+                        if let Some(rid) = rid_opt {
+                            state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid))
+                                .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+                        }
+                    }
+                }
+            }
+            "copy_buffer_to_texture" => {
+                let buf_rid = cmd.src_buffer_rid.ok_or_else(|| JsErrorBox::generic("copy: missing src_buffer_rid"))?;
+                state.resource_table.get::<GfxBuffer>(ResourceId::from(buf_rid))
+                    .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+                let tex_rid = cmd.texture_rid.ok_or_else(|| JsErrorBox::generic("copy: missing texture_rid"))?;
+                state.resource_table.get::<GfxTexture>(ResourceId::from(tex_rid))
+                    .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+            }
+            "copy_texture_to_texture" => {
+                let src_rid = cmd.src_texture_rid.ok_or_else(|| JsErrorBox::generic("copy_t2t: missing src_texture_rid"))?;
+                state.resource_table.get::<GfxTexture>(ResourceId::from(src_rid))
+                    .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+                let dst_rid = cmd.texture_rid.ok_or_else(|| JsErrorBox::generic("copy_t2t: missing texture_rid"))?;
+                state.resource_table.get::<GfxTexture>(ResourceId::from(dst_rid))
+                    .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
+            }
+            other => {
+                return Err(JsErrorBox::generic(format!("Unknown batch command: {}", other)));
+            }
+        }
+    }
+
+    // Now encode everything in a single command buffer
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Batched Compute Encoder"),
+    });
+
+    for cmd in args.commands.iter() {
+        match cmd.cmd.as_str() {
+            "clear_buffer" => {
+                let buf = state.resource_table.get::<GfxBuffer>(ResourceId::from(cmd.buffer_rid.unwrap())).unwrap();
+                encoder.clear_buffer(&buf.buffer, cmd.offset.unwrap_or(0), Some(cmd.size.unwrap()));
+            }
+            "dispatch" => {
+                let pipeline = state.resource_table.get::<GfxComputePipeline>(ResourceId::from(cmd.pipeline_rid.unwrap())).unwrap();
+
+                // Get query set if timestamp writes provided
+                let qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
+                    state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+                });
+
+                // Build timestamp writes descriptor
+                let ts_writes = match (&cmd.timestamp_writes, &qs_ref) {
+                    (Some(tw), Some(qs)) => Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &qs.query_set,
+                        beginning_of_pass_write_index: tw.beginning_of_pass_write_index,
+                        end_of_pass_write_index: tw.end_of_pass_write_index,
+                    }),
+                    _ => None,
+                };
+
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Batched Compute Pass"),
+                    timestamp_writes: ts_writes,
+                });
+                pass.set_pipeline(&pipeline.pipeline);
+                if let Some(ref rids) = cmd.bind_group_rids {
+                    for (idx, rid_opt) in rids.iter().enumerate() {
+                        if let Some(rid) = rid_opt {
+                            let bg = state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid)).unwrap();
+                            pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
+                        }
+                    }
+                }
+                pass.dispatch_workgroups(
+                    cmd.workgroup_count_x.unwrap_or(1),
+                    cmd.workgroup_count_y.unwrap_or(1),
+                    cmd.workgroup_count_z.unwrap_or(1),
+                );
+            }
+            "dispatch_indirect" => {
+                let pipeline = state.resource_table.get::<GfxComputePipeline>(ResourceId::from(cmd.pipeline_rid.unwrap())).unwrap();
+                let indirect_buf = state.resource_table.get::<GfxBuffer>(ResourceId::from(cmd.indirect_buffer_rid.unwrap())).unwrap();
+
+                // Get query set if timestamp writes provided
+                let qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
+                    state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+                });
+
+                // Build timestamp writes descriptor
+                let ts_writes = match (&cmd.timestamp_writes, &qs_ref) {
+                    (Some(tw), Some(qs)) => Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &qs.query_set,
+                        beginning_of_pass_write_index: tw.beginning_of_pass_write_index,
+                        end_of_pass_write_index: tw.end_of_pass_write_index,
+                    }),
+                    _ => None,
+                };
+
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Batched Compute Pass Indirect"),
+                    timestamp_writes: ts_writes,
+                });
+                pass.set_pipeline(&pipeline.pipeline);
+                if let Some(ref rids) = cmd.bind_group_rids {
+                    for (idx, rid_opt) in rids.iter().enumerate() {
+                        if let Some(rid) = rid_opt {
+                            let bg = state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid)).unwrap();
+                            pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
+                        }
+                    }
+                }
+                pass.dispatch_workgroups_indirect(&indirect_buf.buffer, cmd.indirect_offset.unwrap_or(0));
+            }
+            "copy_buffer_to_texture" => {
+                let buf = state.resource_table.get::<GfxBuffer>(ResourceId::from(cmd.src_buffer_rid.unwrap())).unwrap();
+                let tex = state.resource_table.get::<GfxTexture>(ResourceId::from(cmd.texture_rid.unwrap())).unwrap();
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buf.buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: cmd.buffer_offset.unwrap_or(0),
+                            bytes_per_row: Some(cmd.bytes_per_row.unwrap_or(256)),
+                            rows_per_image: Some(cmd.rows_per_image.unwrap_or(1)),
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &tex.texture,
+                        mip_level: cmd.mip_level.unwrap_or(0),
+                        origin: wgpu::Origin3d {
+                            x: cmd.origin_x.unwrap_or(0),
+                            y: cmd.origin_y.unwrap_or(0),
+                            z: cmd.origin_z.unwrap_or(0),
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: cmd.width.unwrap_or(1),
+                        height: cmd.height.unwrap_or(1),
+                        depth_or_array_layers: cmd.depth_or_array_layers.unwrap_or(1),
+                    },
+                );
+            }
+            "copy_texture_to_texture" => {
+                let src_tex = state.resource_table.get::<GfxTexture>(ResourceId::from(cmd.src_texture_rid.unwrap())).unwrap();
+                let dst_tex = state.resource_table.get::<GfxTexture>(ResourceId::from(cmd.texture_rid.unwrap())).unwrap();
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &src_tex.texture,
+                        mip_level: cmd.src_mip_level.unwrap_or(0),
+                        origin: wgpu::Origin3d {
+                            x: cmd.src_origin_x.unwrap_or(0),
+                            y: cmd.src_origin_y.unwrap_or(0),
+                            z: cmd.src_origin_z.unwrap_or(0),
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &dst_tex.texture,
+                        mip_level: cmd.mip_level.unwrap_or(0),
+                        origin: wgpu::Origin3d {
+                            x: cmd.origin_x.unwrap_or(0),
+                            y: cmd.origin_y.unwrap_or(0),
+                            z: cmd.origin_z.unwrap_or(0),
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: cmd.width.unwrap_or(1),
+                        height: cmd.height.unwrap_or(1),
+                        depth_or_array_layers: cmd.depth_or_array_layers.unwrap_or(1),
+                    },
+                );
+            }
+            _ => {} // already validated above
+        }
+    }
+
+    // Queue for batched submission instead of immediate submit
+    queue_command_buffer(encoder.finish());
+    Ok(())
+}
+
+// ======================= GPUTimer / Timestamp Query Support =======================
+
+#[derive(Deserialize)]
+pub struct QuerySetCreateDesc {
+    pub query_type: String, // "timestamp" or "occlusion"
+    pub count: u32,
+}
+
+#[derive(Serialize)]
+pub struct JsGfxQuerySet {
+    pub rid: ResourceId,
+}
+
+#[op2]
+#[serde]
+pub fn op_gfx_device_create_query_set(
+    state: &mut OpState,
+    #[serde] desc: QuerySetCreateDesc,
+) -> Result<JsGfxQuerySet, JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    let query_type = match desc.query_type.as_str() {
+        "timestamp" => wgpu::QueryType::Timestamp,
+        "occlusion" => wgpu::QueryType::Occlusion,
+        _ => return Err(JsErrorBox::generic(format!("Unknown query type: {}", desc.query_type))),
+    };
+
+    let query_set = ctx.device.create_query_set(&wgpu::QuerySetDescriptor {
+        label: Some("GPUTimer QuerySet"),
+        ty: query_type,
+        count: desc.count,
+    });
+
+    let rid = state.resource_table.add(GfxQuerySet {
+        query_set,
+        count: desc.count,
+    });
+
+    Ok(JsGfxQuerySet { rid })
+}
+
+#[op2(fast)]
+pub fn op_gfx_query_set_destroy(
+    state: &mut OpState,
+    #[smi] query_set_rid: u32,
+) -> Result<(), JsErrorBox> {
+    state.resource_table
+        .take::<GfxQuerySet>(ResourceId::from(query_set_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(())
+}
+
+/// Check if timestamp-query feature is available
+#[op2(fast)]
+pub fn op_gfx_has_timestamp_query() -> Result<bool, JsErrorBox> {
+    let ctx = gfx_ctx()?;
+    Ok(ctx.device.features().contains(wgpu::Features::TIMESTAMP_QUERY))
+}
+
+/// Get the timestamp period in nanoseconds per tick.
+/// Timestamps from query sets must be multiplied by this value to get nanoseconds.
+#[op2(fast)]
+pub fn op_gfx_get_timestamp_period() -> Result<f32, JsErrorBox> {
+    let ctx = gfx_ctx()?;
+    Ok(ctx.queue.get_timestamp_period())
+}
+
+// ======================= Timestamp Command Recording =======================
+// These operations build a list of timestamp commands that get executed together
+
+#[derive(Deserialize)]
+pub struct TimestampWriteDesc {
+    pub query_set_rid: u32,
+    pub query_index: u32,
+}
+
+#[derive(Deserialize)]
+pub struct TimestampBatchArgs {
+    pub write_timestamps: Vec<TimestampWriteDesc>,
+    pub resolve_query_sets: Vec<ResolveQuerySetDesc>,
+    pub copy_buffers: Vec<CopyBufferDesc>,
+}
+
+/// Execute a batch of timestamp operations (writeTimestamp, resolveQuerySet, copyBufferToBuffer)
+/// This is designed to be called at the end of each frame to collect timing data.
+#[op2]
+pub fn op_gfx_timestamp_batch(
+    state: &mut OpState,
+    #[serde] args: TimestampBatchArgs,
+) -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Timestamp Batch Encoder"),
+    });
+
+    // Write timestamps
+    for ts in &args.write_timestamps {
+        let qs = state.resource_table
+            .get::<GfxQuerySet>(ResourceId::from(ts.query_set_rid))
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        encoder.write_timestamp(&qs.query_set, ts.query_index);
+    }
+
+    // Resolve query sets to buffers
+    for rq in &args.resolve_query_sets {
+        let qs = state.resource_table
+            .get::<GfxQuerySet>(ResourceId::from(rq.query_set_rid))
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let dest_buf = state.resource_table
+            .get::<GfxBuffer>(ResourceId::from(rq.destination_rid))
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        encoder.resolve_query_set(
+            &qs.query_set,
+            rq.first_query..rq.first_query + rq.query_count,
+            &dest_buf.buffer,
+            rq.destination_offset,
+        );
+    }
+
+    // Copy buffers
+    for cb in &args.copy_buffers {
+        let src_buf = state.resource_table
+            .get::<GfxBuffer>(ResourceId::from(cb.src_rid))
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let dst_buf = state.resource_table
+            .get::<GfxBuffer>(ResourceId::from(cb.dst_rid))
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        encoder.copy_buffer_to_buffer(
+            &src_buf.buffer,
+            cb.src_offset,
+            &dst_buf.buffer,
+            cb.dst_offset,
+            cb.size,
+        );
+    }
+
+    // Queue for batched submission instead of immediate submit
+    queue_command_buffer(encoder.finish());
+    Ok(())
+}
+
+// ======================= Buffer Mapping =======================
+
+// Track pending buffer maps for async polling
+struct PendingMapState {
+    ready: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>,
+}
+
+static PENDING_MAPS: OnceLock<Mutex<HashMap<u32, PendingMapState>>> = OnceLock::new();
+
+fn get_pending_maps() -> &'static Mutex<HashMap<u32, PendingMapState>> {
+    PENDING_MAPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Start mapping a buffer (non-blocking). Call op_gfx_buffer_map_poll to check completion.
+#[op2(nofast)]
+pub fn op_gfx_buffer_map_async(
+    state: &mut OpState,
+    #[smi] buffer_rid: u32,
+    #[smi] mode: u32, // 1 = READ, 2 = WRITE
+    #[bigint] offset: u64,
+    #[bigint] size: u64,
+) -> Result<(), JsErrorBox> {
+    let buffer = state.resource_table
+        .get::<GfxBuffer>(ResourceId::from(buffer_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?
+        .buffer
+        .clone();
+
+    let map_mode = if mode == 1 {
+        wgpu::MapMode::Read
+    } else {
+        wgpu::MapMode::Write
+    };
+
+    let slice = buffer.slice(offset..offset + size);
+
+    // Set up async tracking
+    let ready = Arc::new(AtomicBool::new(false));
+    let result_holder: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> = Arc::new(Mutex::new(None));
+
+    let ready_clone = ready.clone();
+    let result_clone = result_holder.clone();
+
+    slice.map_async(map_mode, move |result| {
+        *result_clone.lock().unwrap() = Some(result);
+        ready_clone.store(true, Ordering::SeqCst);
+    });
+
+    // Store pending state
+    get_pending_maps().lock().unwrap().insert(buffer_rid, PendingMapState {
+        ready,
+        result: result_holder,
+    });
+
+    // Do a quick non-blocking poll to kick off the operation
+    let ctx = gfx_ctx()?;
+    let _ = ctx.device.poll(wgpu::PollType::Poll);
+
+    Ok(())
+}
+
+/// Poll for buffer map completion. Returns true if ready, false if still pending.
+#[op2(fast)]
+pub fn op_gfx_buffer_map_poll(
+    #[smi] buffer_rid: u32,
+) -> Result<bool, JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    // Do a non-blocking poll
+    let _ = ctx.device.poll(wgpu::PollType::Poll);
+
+    // Check if this buffer's map is ready
+    let pending = get_pending_maps().lock().unwrap();
+    if let Some(state) = pending.get(&buffer_rid) {
+        if state.ready.load(Ordering::SeqCst) {
+            // Check the result
+            let result = state.result.lock().unwrap();
+            if let Some(ref r) = *result {
+                if r.is_err() {
+                    return Err(JsErrorBox::generic("Buffer map failed"));
+                }
+            }
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Finish buffer mapping - call after map_poll returns true
+#[op2(fast)]
+pub fn op_gfx_buffer_map_finish(
+    #[smi] buffer_rid: u32,
+) -> Result<(), JsErrorBox> {
+    // Remove from pending
+    get_pending_maps().lock().unwrap().remove(&buffer_rid);
+    Ok(())
+}
+
+/// Get the mapped range of a buffer as a Uint8Array
+#[op2]
+#[buffer]
+pub fn op_gfx_buffer_get_mapped_range(
+    state: &mut OpState,
+    #[smi] buffer_rid: u32,
+    #[bigint] offset: u64,
+    #[bigint] size: u64,
+) -> Result<Vec<u8>, JsErrorBox> {
+    let buffer = state.resource_table
+        .get::<GfxBuffer>(ResourceId::from(buffer_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let slice = buffer.buffer.slice(offset..offset + size);
+    let view = slice.get_mapped_range();
+    let data = view.to_vec();
+
+    Ok(data)
+}
+
+/// Unmap a previously mapped buffer
+#[op2(fast)]
+pub fn op_gfx_buffer_unmap(
+    state: &mut OpState,
+    #[smi] buffer_rid: u32,
+) -> Result<(), JsErrorBox> {
+    let buffer = state.resource_table
+        .get::<GfxBuffer>(ResourceId::from(buffer_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    buffer.buffer.unmap();
+    Ok(())
+}
+
+// ======================= Immediate Timestamp Write =======================
+
+/// Write a timestamp immediately (outside of any pass).
+/// This creates a command encoder, writes the timestamp, and submits it.
+/// Used for frame-level timing that spans multiple passes.
+#[op2(fast)]
+pub fn op_gfx_write_timestamp(
+    state: &mut OpState,
+    #[smi] query_set_rid: u32,
+    #[smi] query_index: u32,
+) -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    let qs = state.resource_table
+        .get::<GfxQuerySet>(ResourceId::from(query_set_rid))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Timestamp Write Encoder"),
+    });
+
+    encoder.write_timestamp(&qs.query_set, query_index);
+
+    // Queue for batched submission instead of immediate submit
+    queue_command_buffer(encoder.finish());
     Ok(())
 }

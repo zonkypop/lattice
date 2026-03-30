@@ -85,6 +85,10 @@ globalThis.cancelAnimationFrame =
     };
 
 globalThis.__runAnimationFrames = () => {
+  // Dispatch queued input events BEFORE RAF callbacks,
+  // matching browser ordering where input fires before rAF.
+  globalThis.__dispatchInputEvents?.();
+
   const cbs = __rafCallbacks;
   __rafCallbacks = [];
   const now = performance.now();
@@ -95,5 +99,4 @@ globalThis.__runAnimationFrames = () => {
       console.error("RAF error:", e);
     }
   }
-  globalThis.__dispatchInputEvents?.();
 };

@@ -2,13 +2,14 @@
 
 use deno_error::JsErrorBox;
 use serde::Serialize;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use deno_core::{op2, OpState};
 
 use openxr as xr;
 use ash::vk::{self, Handle};
 use std::ffi::CString;
-use crate::gfx::{GfxContext, set_gfx_context};
+use crate::gfx::{GfxContext, set_gfx_context, flush_pending_command_buffers};
 use wgpu_hal::vulkan::TextureMemory;
 
 
@@ -213,11 +214,35 @@ pub fn get_xr_state() -> &'static Mutex<Option<XrState>> {
     XR_STATE.get_or_init(|| Mutex::new(None))
 }
 
+/// Returns true if an XR session is currently active
+pub fn is_xr_active() -> bool {
+    if let Some(state_lock) = XR_STATE.get() {
+        if let Ok(guard) = state_lock.lock() {
+            return guard.is_some();
+        }
+    }
+    false
+}
+
 pub static XR_SWAPCHAIN_TEXTURES: OnceLock<Vec<wgpu::Texture>> = OnceLock::new();
 
 /// Cached texture views for XR swapchain - indexed as [swapchain_index][view_index (eye)]
 /// Pre-created during session init to avoid per-frame allocation
 pub static XR_SWAPCHAIN_VIEWS: OnceLock<Vec<[std::sync::Arc<wgpu::TextureView>; 2]>> = OnceLock::new();
+
+// ======================= Async Frame Wait =======================
+// Allows JS to poll for frame readiness instead of blocking
+
+struct PendingFrameWait {
+    ready: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<Result<xr::FrameState, String>>>>,
+}
+
+static PENDING_FRAME_WAIT: OnceLock<Mutex<Option<PendingFrameWait>>> = OnceLock::new();
+
+fn get_pending_frame_wait() -> &'static Mutex<Option<PendingFrameWait>> {
+    PENDING_FRAME_WAIT.get_or_init(|| Mutex::new(None))
+}
 
 // ======================= Helper Functions =======================
 
@@ -1209,8 +1234,9 @@ pub fn op_xr_release_swapchain_image() -> Result<(), JsErrorBox> {
 
 #[op2(fast)]
 pub fn op_xr_end_frame() -> Result<(), JsErrorBox> {
-
-  
+    // Flush any pending command buffers before ending the frame
+    // This ensures all GPU work is submitted before we release the swapchain
+    flush_pending_command_buffers()?;
 
     let mut guard = get_xr_state().lock().unwrap();
     let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
@@ -1318,4 +1344,270 @@ pub fn op_xr_get_swapchain_texture_view(
     });
 
     Ok(crate::gfx::JsGfxTextureView { rid })
+}
+
+// ======================= Async Frame Wait Ops =======================
+
+/// Start an async frame wait - spawns a thread to wait for the next frame
+/// Returns true if started successfully, false if session not running or already waiting
+#[op2(fast)]
+pub fn op_xr_frame_wait_start() -> Result<bool, JsErrorBox> {
+    // Check if already waiting
+    {
+        let pending = get_pending_frame_wait().lock().unwrap();
+        if pending.is_some() {
+            return Ok(false); // Already waiting
+        }
+    }
+
+    // Check if session is running
+    let session_running = {
+        let guard = get_xr_state().lock().unwrap();
+        match guard.as_ref() {
+            Some(state) => state.session_running,
+            None => return Ok(false),
+        }
+    };
+
+    if !session_running {
+        return Ok(false);
+    }
+
+    // Create pending state
+    let ready = Arc::new(AtomicBool::new(false));
+    let result: Arc<Mutex<Option<Result<xr::FrameState, String>>>> = Arc::new(Mutex::new(None));
+
+    let ready_clone = ready.clone();
+    let result_clone = result.clone();
+
+    // Spawn thread to do the blocking wait
+    std::thread::spawn(move || {
+        let wait_result = {
+            let mut guard = get_xr_state().lock().unwrap();
+            match guard.as_mut() {
+                Some(state) => {
+                    state.frame_waiter.wait()
+                        .map_err(|e| format!("Wait failed: {}", e))
+                }
+                None => Err("No XR session".to_string()),
+            }
+        };
+
+        *result_clone.lock().unwrap() = Some(wait_result);
+        ready_clone.store(true, Ordering::SeqCst);
+    });
+
+    // Store pending state
+    *get_pending_frame_wait().lock().unwrap() = Some(PendingFrameWait {
+        ready,
+        result,
+    });
+
+    Ok(true)
+}
+
+/// Poll for frame wait completion - returns true if ready
+#[op2(fast)]
+pub fn op_xr_frame_wait_poll() -> bool {
+    let pending = get_pending_frame_wait().lock().unwrap();
+    match pending.as_ref() {
+        Some(state) => state.ready.load(Ordering::SeqCst),
+        None => false,
+    }
+}
+
+/// Finish the async frame wait and get the result
+/// This completes the frame_stream.begin() call and returns the frame begin result
+#[op2]
+#[serde]
+pub fn op_xr_frame_wait_finish() -> Result<XrFrameBeginResult, JsErrorBox> {
+    // Get and clear pending state
+    let pending = get_pending_frame_wait().lock().unwrap().take();
+    let pending = pending.ok_or_else(|| JsErrorBox::generic("No pending frame wait"))?;
+
+    // Get the frame state from the completed wait
+    let frame_state_result = pending.result.lock().unwrap().take()
+        .ok_or_else(|| JsErrorBox::generic("Frame wait not complete"))?;
+
+    let frame_state = frame_state_result
+        .map_err(|e| JsErrorBox::generic(e))?;
+
+    // Now do the rest of the frame begin (same as op_xr_frame_begin but without wait)
+    let mut guard = get_xr_state().lock().unwrap();
+    let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
+
+    // Begin the frame stream
+    state.frame_stream.begin()
+        .map_err(|e| JsErrorBox::generic(format!("Begin failed: {}", e)))?;
+
+    state.frame_state = Some(frame_state);
+
+    let js_frame_state = XrFrameState {
+        predicted_display_time: frame_state.predicted_display_time.as_nanos(),
+        should_render: frame_state.should_render,
+    };
+
+    // If we shouldn't render, return early with minimal data
+    if !frame_state.should_render {
+        return Ok(XrFrameBeginResult {
+            frame_state: js_frame_state,
+            viewer_pose: None,
+            input_sources: XrInputSourcesState { sources: Vec::new() },
+            swapchain_info: None,
+        });
+    }
+
+    // === get_viewer_pose ===
+    let (_, views) = state.session.locate_views(
+        state.view_config_type,
+        frame_state.predicted_display_time,
+        &state.stage_space,
+    ).map_err(|e| JsErrorBox::generic(format!("Locate views failed: {}", e)))?;
+
+    let w = state.render_width;
+    let h = state.render_height;
+
+    let xr_views: Vec<XrView> = views.iter().enumerate().map(|(i, view)| {
+        XrView {
+            projection_matrix: fov_to_projection_matrix(&view.fov, 0.05, 500.0),
+            transform: XrPose {
+                position: [view.pose.position.x, view.pose.position.y, view.pose.position.z],
+                orientation: [view.pose.orientation.x, view.pose.orientation.y, view.pose.orientation.z, view.pose.orientation.w],
+                matrix: pose_to_matrix(&view.pose),
+            },
+            view_index: i as u32,
+            viewport_x: 0,
+            viewport_y: 0,
+            viewport_width: w,
+            viewport_height: h,
+        }
+    }).collect();
+
+    state.cached_views = Some(views);
+    let viewer_pose = Some(XrViewerPose { views: xr_views });
+
+    // === get_input_sources ===
+    let active_action_set = xr::ActiveActionSet::new(&state.action_set);
+    let input_sources = if state.session.sync_actions(&[active_action_set]).is_ok() {
+        let time = frame_state.predicted_display_time;
+        let mut sources = Vec::with_capacity(2);
+
+        // Helper to get pose
+        let get_pose = |space: &xr::Space, stage: &xr::Space, time: xr::Time| -> Option<XrPose> {
+            space.locate(stage, time).ok()
+                .filter(|loc| loc.location_flags.contains(
+                    xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID
+                ))
+                .map(|loc| XrPose {
+                    position: [loc.pose.position.x, loc.pose.position.y, loc.pose.position.z],
+                    orientation: [loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w],
+                    matrix: pose_to_matrix(&loc.pose),
+                })
+        };
+
+        // Left controller
+        let left_grip = get_pose(&state.left_grip_space, &state.stage_space, time);
+        let left_aim = get_pose(&state.left_aim_space, &state.stage_space, time);
+
+        if left_grip.is_some() || left_aim.is_some() {
+            let trigger = state.left_trigger_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(0.0);
+            let squeeze = state.left_squeeze_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(0.0);
+            let thumbstick = state.left_thumbstick_action.state(&state.session, xr::Path::NULL)
+                .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
+            let stick_click = state.left_thumbstick_click_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+            let x_btn = state.left_x_button_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+            let y_btn = state.left_y_button_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+
+            sources.push(XrInputSourceData {
+                handedness: "left".to_string(),
+                target_ray_mode: "tracked-pointer".to_string(),
+                profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
+                grip_space_pose: left_grip,
+                target_ray_pose: left_aim,
+                gamepad: Some(XrGamepadData {
+                    buttons: vec![
+                        XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
+                        XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
+                        XrButtonData { pressed: false, touched: false, value: 0.0 },
+                        XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
+                        XrButtonData { pressed: x_btn, touched: x_btn, value: if x_btn { 1.0 } else { 0.0 } },
+                        XrButtonData { pressed: y_btn, touched: y_btn, value: if y_btn { 1.0 } else { 0.0 } },
+                    ],
+                    axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
+                }),
+                hand: None,
+            });
+        }
+
+        // Right controller
+        let right_grip = get_pose(&state.right_grip_space, &state.stage_space, time);
+        let right_aim = get_pose(&state.right_aim_space, &state.stage_space, time);
+
+        if right_grip.is_some() || right_aim.is_some() {
+            let trigger = state.right_trigger_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(0.0);
+            let squeeze = state.right_squeeze_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(0.0);
+            let thumbstick = state.right_thumbstick_action.state(&state.session, xr::Path::NULL)
+                .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
+            let stick_click = state.right_thumbstick_click_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+            let a_btn = state.right_a_button_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+            let b_btn = state.right_b_button_action.state(&state.session, xr::Path::NULL)
+                .map(|s| s.current_state).unwrap_or(false);
+
+            sources.push(XrInputSourceData {
+                handedness: "right".to_string(),
+                target_ray_mode: "tracked-pointer".to_string(),
+                profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
+                grip_space_pose: right_grip,
+                target_ray_pose: right_aim,
+                gamepad: Some(XrGamepadData {
+                    buttons: vec![
+                        XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
+                        XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
+                        XrButtonData { pressed: false, touched: false, value: 0.0 },
+                        XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
+                        XrButtonData { pressed: a_btn, touched: a_btn, value: if a_btn { 1.0 } else { 0.0 } },
+                        XrButtonData { pressed: b_btn, touched: b_btn, value: if b_btn { 1.0 } else { 0.0 } },
+                    ],
+                    axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
+                }),
+                hand: None,
+            });
+        }
+
+        XrInputSourcesState { sources }
+    } else {
+        XrInputSourcesState { sources: Vec::new() }
+    };
+
+    // === acquire_swapchain_image ===
+    let index = state.swapchain.acquire_image()
+        .map_err(|e| JsErrorBox::generic(format!("Acquire failed: {}", e)))?;
+
+    state.swapchain.wait_image(xr::Duration::INFINITE)
+        .map_err(|e| JsErrorBox::generic(format!("Wait image failed: {}", e)))?;
+
+    state.current_swapchain_index = Some(index);
+
+    let swapchain_info = Some(XrSwapchainTextureInfo {
+        index,
+        width: state.render_width,
+        height: state.render_height,
+        array_layers: 2,
+    });
+
+    Ok(XrFrameBeginResult {
+        frame_state: js_frame_state,
+        viewer_pose,
+        input_sources,
+        swapchain_info,
+    })
 }

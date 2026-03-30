@@ -40,6 +40,20 @@ import {
   op_gfx_compute_pipeline_get_bind_group_layout,
   op_gfx_compute_dispatch,
   op_gfx_compute_dispatch_indirect,
+  op_gfx_compute_batch,
+
+  // GPUTimer / Timestamp query ops
+  op_gfx_device_create_query_set,
+  op_gfx_query_set_destroy,
+  op_gfx_has_timestamp_query,
+  op_gfx_get_timestamp_period,
+  op_gfx_timestamp_batch,
+  op_gfx_buffer_map_async,
+  op_gfx_buffer_map_poll,
+  op_gfx_buffer_map_finish,
+  op_gfx_buffer_get_mapped_range,
+  op_gfx_buffer_unmap,
+  op_gfx_write_timestamp,
 
   // Input ops
   op_input_poll_events,
@@ -71,6 +85,9 @@ import {
   op_xr_get_swapchain_texture_view,
   op_xr_get_input_sources,
   op_xr_frame_begin,
+  op_xr_frame_wait_start,
+  op_xr_frame_wait_poll,
+  op_xr_frame_wait_finish,
 
   // event loop
   op_yield_to_runtime,
@@ -91,6 +108,9 @@ globalThis.__xr = {
   op_xr_get_swapchain_texture_view,
   op_xr_get_input_sources,
   op_xr_frame_begin,
+  op_xr_frame_wait_start,
+  op_xr_frame_wait_poll,
+  op_xr_frame_wait_finish,
 };
 
 globalThis.__indexeddb = {
@@ -141,6 +161,20 @@ globalThis.__gfx = {
   op_gfx_compute_pipeline_get_bind_group_layout,
   op_gfx_compute_dispatch,
   op_gfx_compute_dispatch_indirect,
+  op_gfx_compute_batch,
+
+  // GPUTimer / Timestamp query ops
+  op_gfx_device_create_query_set,
+  op_gfx_query_set_destroy,
+  op_gfx_has_timestamp_query,
+  op_gfx_get_timestamp_period,
+  op_gfx_timestamp_batch,
+  op_gfx_buffer_map_async,
+  op_gfx_buffer_map_poll,
+  op_gfx_buffer_map_finish,
+  op_gfx_buffer_get_mapped_range,
+  op_gfx_buffer_unmap,
+  op_gfx_write_timestamp,
 };
 
 // Expose input ops to globalThis

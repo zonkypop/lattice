@@ -137,6 +137,20 @@ extension!(
         gfx::op_gfx_compute_pipeline_get_bind_group_layout,
         gfx::op_gfx_compute_dispatch,
         gfx::op_gfx_compute_dispatch_indirect,
+        gfx::op_gfx_compute_batch,
+
+        // GPUTimer / Timestamp query ops
+        gfx::op_gfx_device_create_query_set,
+        gfx::op_gfx_query_set_destroy,
+        gfx::op_gfx_has_timestamp_query,
+        gfx::op_gfx_get_timestamp_period,
+        gfx::op_gfx_timestamp_batch,
+        gfx::op_gfx_buffer_map_async,
+        gfx::op_gfx_buffer_map_poll,
+        gfx::op_gfx_buffer_map_finish,
+        gfx::op_gfx_buffer_get_mapped_range,
+        gfx::op_gfx_buffer_unmap,
+        gfx::op_gfx_write_timestamp,
 
         // XR ops
         xr::op_xr_is_supported,
@@ -151,6 +165,9 @@ extension!(
         xr::op_xr_get_swapchain_texture_view,
         xr::op_xr_get_input_sources,
         xr::op_xr_frame_begin,
+        xr::op_xr_frame_wait_start,
+        xr::op_xr_frame_wait_poll,
+        xr::op_xr_frame_wait_finish,
 
         // event loop
         op_yield_to_runtime
@@ -206,11 +223,27 @@ impl GpuState {
             .await
             .expect("Failed to find adapter");
 
+        // Request timestamp-query features if available (for GPUTimer support)
+        let mut features = wgpu::Features::empty();
+        let adapter_features = adapter.features();
+        info!("Adapter features: {:?}", adapter_features);
+        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            features |= wgpu::Features::TIMESTAMP_QUERY;
+            info!("Enabling TIMESTAMP_QUERY feature for GPU timing");
+        } else {
+            info!("TIMESTAMP_QUERY not available on this adapter");
+        }
+        // Also need TIMESTAMP_QUERY_INSIDE_ENCODERS for writeTimestamp in command encoders
+        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
+            features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+            info!("Enabling TIMESTAMP_QUERY_INSIDE_ENCODERS feature");
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_features: features,
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -416,7 +449,7 @@ async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpec
     worker.js_runtime.execute_script(
         "<native_flags>",
         deno_core::ModuleCodeString::from(format!(
-            "globalThis.__isNative__ = true; globalThis.__nativeXR = {};",
+            "globalThis.__isNative__ = true; globalThis.__nativeXR__ = {};",
             xr_enabled
         )),
     )?;
@@ -511,8 +544,7 @@ impl ApplicationHandler for App {
         }
     
         let input_queue = get_input_queue();
-        let mut needs_immediate_dispatch = false;
-    
+
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -522,13 +554,11 @@ impl ApplicationHandler for App {
                 if let Ok(mut q) = input_queue.lock() {
                     q.handle_resize(size.width, size.height);
                 }
-                needs_immediate_dispatch = true;
             }
             WindowEvent::Focused(focused) => {
                 if let Ok(mut q) = input_queue.lock() {
                     q.handle_focus(focused);
                 }
-                needs_immediate_dispatch = true;
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 if let Ok(mut q) = input_queue.lock() {
@@ -536,31 +566,21 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let locked = {
-                    if let Ok(q) = input_queue.lock() {
-                        q.pointer_locked
-                    } else {
-                        false
-                    }
-                };
-                if !locked {
-                    if let Ok(mut q) = input_queue.lock() {
+                if let Ok(mut q) = input_queue.lock() {
+                    if !q.pointer_locked {
                         q.handle_cursor_moved(position.x, position.y);
                     }
-                    needs_immediate_dispatch = true;
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Ok(mut q) = input_queue.lock() {
                     q.handle_mouse_input(state, button);
                 }
-                needs_immediate_dispatch = true;
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 if let Ok(mut q) = input_queue.lock() {
                     q.handle_mouse_wheel(delta, phase);
                 }
-                needs_immediate_dispatch = true;
             }
             WindowEvent::KeyboardInput { event: key_event, is_synthetic, .. } => {
                 if !is_synthetic {
@@ -571,32 +591,21 @@ impl ApplicationHandler for App {
                             key_event.repeat,
                         );
                     }
-                    needs_immediate_dispatch = true;
                 }
             }
             WindowEvent::Touch(touch) => {
                 if let Ok(mut q) = input_queue.lock() {
                     q.handle_touch(touch);
                 }
-                needs_immediate_dispatch = true;
             }
             WindowEvent::RedrawRequested => {
                 gpu.window.request_redraw();
             }
             _ => {}
         }
-    
-        if needs_immediate_dispatch {
-            if let Some(ref mut worker) = self.worker {
-                let _guard = self.tokio_rt.enter();
-                let _ = worker.js_runtime.execute_script(
-                    "<input_dispatch>",
-                    deno_core::ModuleCodeString::from_static(
-                        "if (globalThis.__dispatchInputEvents) globalThis.__dispatchInputEvents();"
-                    ),
-                );
-            }
-        }
+        // Input events are batched in the queue and dispatched once per frame
+        // from __runAnimationFrames → __dispatchInputEvents, matching browser
+        // behavior where events are processed between tasks, not synchronously.
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
@@ -647,7 +656,10 @@ impl ApplicationHandler for App {
                             log::error!("Event loop error: {:?}", e);
                         }
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    // Drain all currently-ready async work (resolved promises, completed ops)
+                    // without waiting for anything that isn't ready yet.
+                    // This matches browser behavior: process microtask checkpoint, then RAF.
+                    _ = tokio::task::yield_now() => {}
                 }
             });
             
@@ -680,14 +692,32 @@ pub async fn op_yield_to_runtime() -> Result<(), deno_error::JsErrorBox> {
 
 fn run_xr_mode(script_path: &str) -> Result<(), AnyError> {
     info!("Starting XR mode...");
-    
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
-    
+
     rt.block_on(async {
+        // Initialize XR session and GfxContext BEFORE JS runs
+        // This matches desktop mode which sets up GPU context before JS execution
+        // Workers spawned at JS module load time need GfxContext to be ready
+        info!("Initializing XR session before JS...");
+        let xr_info = xr::init_xr_session_internal().await
+            .map_err(|e| anyhow::anyhow!("Failed to init XR session: {}", e))?;
+        info!("XR session initialized: {}x{}, format: {}", xr_info.width, xr_info.height, xr_info.format);
+
         let (mut worker, main_module, _) = create_main_worker(script_path).await?;
+
+        // Store XR session info in JS global so requestSession doesn't try to init again
+        worker.js_runtime.execute_script(
+            "<xr_session_info>",
+            deno_core::ModuleCodeString::from(format!(
+                "globalThis.__xrSessionInfo = {{ width: {}, height: {}, sampleCount: {}, format: '{}', swapchainLength: {} }};",
+                xr_info.width, xr_info.height, xr_info.sample_count, xr_info.format, xr_info.swapchain_length
+            )),
+        )?;
+
         worker.execute_main_module(&main_module).await?;
         info!("JS main executed for XR");
         
@@ -696,16 +726,19 @@ fn run_xr_mode(script_path: &str) -> Result<(), AnyError> {
                 info!("XR session ended, exiting...");
                 break;
             }
-            
-            match worker.js_runtime.run_event_loop(deno_core::PollEventLoopOptions {
-                wait_for_inspector: false,
-                pump_v8_message_loop: true,
-            }).await {
-                Ok(_) => {},
-                Err(e) => {
-                    error!("Event loop error: {:?}", e);
-                    break;
+
+            // Drain all currently-ready async work without blocking.
+            tokio::select! {
+                biased;
+                result = worker.js_runtime.run_event_loop(deno_core::PollEventLoopOptions {
+                    wait_for_inspector: false,
+                    pump_v8_message_loop: true,
+                }) => {
+                    if let Err(e) = result {
+                        error!("Event loop error: {:?}", e);
+                    }
                 }
+                _ = tokio::task::yield_now() => {}
             }
         }
         

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(not(target_os = "android"))]
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase};
 #[cfg(not(target_os = "android"))]
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 // ======================= Global Event Queue =======================
 
@@ -446,14 +446,19 @@ impl InputEventQueue {
         &mut self,
         state: ElementState,
         physical_key: PhysicalKey,
+        logical_key: &Key,
         repeat: bool,
     ) {
-        let (key, code, key_code, location) = match physical_key {
+        let (_fallback_key, code, key_code, location) = match physical_key {
             PhysicalKey::Code(kc) => keycode_to_js(kc),
             PhysicalKey::Unidentified(_) => {
                 ("Unidentified".to_string(), "Unidentified".to_string(), 0, 0)
             }
         };
+
+        // Use logical key for the `key` field to respect keyboard layout and modifiers
+        // (e.g. Shift+2 → "@" on US layout, Shift+a → "A")
+        let key = logical_key_to_js_key(logical_key);
 
         let event_data = KeyEventData {
             key,
@@ -566,6 +571,66 @@ impl InputEventQueue {
             self.push_event(InputEvent::Blur);
         }
     }
+}
+
+// ======================= Logical Key Mapping =======================
+
+/// Convert winit's logical Key to the browser KeyboardEvent.key value.
+/// This respects keyboard layout and modifier state (e.g. Shift+2 → "@").
+#[cfg(not(target_os = "android"))]
+fn logical_key_to_js_key(logical_key: &Key) -> String {
+    match logical_key {
+        Key::Character(s) => s.to_string(),
+        Key::Named(named) => named_key_to_js_string(named),
+        Key::Dead(_) => "Dead".to_string(),
+        Key::Unidentified(_) => "Unidentified".to_string(),
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn named_key_to_js_string(named: &NamedKey) -> String {
+    use NamedKey::*;
+    match named {
+        Shift => "Shift",
+        Control => "Control",
+        Alt => "Alt",
+        Super => "Meta",
+        Enter => "Enter",
+        Tab => "Tab",
+        Space => " ",
+        Backspace => "Backspace",
+        Escape => "Escape",
+        Delete => "Delete",
+        Insert => "Insert",
+        Home => "Home",
+        End => "End",
+        PageUp => "PageUp",
+        PageDown => "PageDown",
+        CapsLock => "CapsLock",
+        ArrowUp => "ArrowUp",
+        ArrowDown => "ArrowDown",
+        ArrowLeft => "ArrowLeft",
+        ArrowRight => "ArrowRight",
+        F1 => "F1",
+        F2 => "F2",
+        F3 => "F3",
+        F4 => "F4",
+        F5 => "F5",
+        F6 => "F6",
+        F7 => "F7",
+        F8 => "F8",
+        F9 => "F9",
+        F10 => "F10",
+        F11 => "F11",
+        F12 => "F12",
+        NumLock => "NumLock",
+        ScrollLock => "ScrollLock",
+        PrintScreen => "PrintScreen",
+        Pause => "Pause",
+        ContextMenu => "ContextMenu",
+        _ => "Unidentified",
+    }
+    .to_string()
 }
 
 // ======================= Keycode Mapping =======================

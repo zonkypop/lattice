@@ -870,6 +870,8 @@ pub struct DrawCall {
     pub draw_count: Option<u32>,
     // Indirect indexed
     pub is_indirect: Option<bool>,
+    // Scissor rect [x, y, width, height]
+    pub scissor_rect: Option<[u32; 4]>,
 }
 
 #[derive(Deserialize)]
@@ -3424,6 +3426,7 @@ pub fn op_gfx_render_to_texture(
         vertex_count: u32,
         first_vertex: u32,
         stencil_reference: u32,
+        scissor_rect: Option<[u32; 4]>,
     }
 
     let mut draw_data_list: Vec<TextureDrawData> = Vec::with_capacity(args.draw_calls.len());
@@ -3486,6 +3489,7 @@ pub fn op_gfx_render_to_texture(
             vertex_count: dc.vertex_count,
             first_vertex: dc.first_vertex,
             stencil_reference: dc.stencil_reference.unwrap_or(0),
+            scissor_rect: dc.scissor_rect,
         });
     }
 
@@ -3529,6 +3533,10 @@ pub fn op_gfx_render_to_texture(
 
             pass.set_pipeline(&pipeline_res.pipeline);
             pass.set_stencil_reference(data.stencil_reference);
+
+            if let Some([sx, sy, sw, sh]) = data.scissor_rect {
+                pass.set_scissor_rect(sx, sy, sw, sh);
+            }
 
             for (slot, buf) in data.vbufs.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buf.slice(..));

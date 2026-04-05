@@ -222,6 +222,11 @@ if (!gfx) {
       ).rid;
       this._mapped = null;
     }
+    destroy() {
+      if (this.__rid != null) {
+        gfx.op_gfx_resource_drop(this.__rid);
+      }
+    }
   }
 
   // Emulated texture
@@ -266,6 +271,7 @@ if (!gfx) {
       this._bindGroups = new Map();
       this._drawCalls = [];
       this._stencilReference = 0;
+      this._scissorRect = null;
 
       const ca = desc?.colorAttachments?.[0];
       this._colorTargetView = ca?.view;
@@ -366,6 +372,7 @@ if (!gfx) {
           ? this._depthAttachment?.stencilReadOnly ?? null
           : null,
         stencil_reference: this._stencilReference || null,
+        scissor_rect: this._scissorRect,
         // Multi-draw specific
         is_multi_draw: true,
         indirect_buffer_rid: indirectBuffer.__rid,
@@ -398,7 +405,7 @@ if (!gfx) {
     }
 
     setViewport() {}
-    setScissorRect() {}
+    setScissorRect(x, y, w, h) { this._scissorRect = [x >>> 0, y >>> 0, w >>> 0, h >>> 0]; }
     setBlendConstant() {}
     setStencilReference(ref) { this._stencilReference = ref; }
     beginOcclusionQuery() {}
@@ -464,6 +471,7 @@ if (!gfx) {
           ? this._depthAttachment?.stencilReadOnly ?? null
           : null,
         stencil_reference: this._stencilReference || null,
+        scissor_rect: this._scissorRect,
       });
     }
 
@@ -551,6 +559,7 @@ if (!gfx) {
           ? this._depthAttachment?.stencilReadOnly ?? null
           : null,
         stencil_reference: this._stencilReference || null,
+        scissor_rect: this._scissorRect,
         is_indirect: true,
         indirect_buffer_rid: indirectBuffer.__rid,
         indirect_offset: indirectOffset >>> 0,

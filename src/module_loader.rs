@@ -218,6 +218,17 @@ impl ModuleLoader for ImportMapModuleLoader {
             }
         };
     
+        // Handle ?raw imports (Vite-style): export file content as a string
+        let is_raw = specifier.query() == Some("raw");
+
+        // Try appending .js if the file doesn't exist (Node/bundler convention)
+        let file_path = if !file_path.exists() && file_path.extension().is_none() {
+            let with_js = file_path.with_extension("js");
+            if with_js.exists() { with_js } else { file_path }
+        } else {
+            file_path
+        };
+
         let code = match std::fs::read_to_string(&file_path) {
             Ok(c) => c,
             Err(e) => {
@@ -227,7 +238,11 @@ impl ModuleLoader for ImportMapModuleLoader {
             }
         };
 
-        let final_code = if self.should_inject_setup(&specifier, &code) {
+        let final_code = if is_raw {
+            // Wrap as default export string, escaping backticks and backslashes
+            let escaped = code.replace('\\', "\\\\").replace('`', "\\`").replace("${", "\\${");
+            format!("export default `{}`;", escaped)
+        } else if self.should_inject_setup(&specifier, &code) {
             self.get_setup_import(&specifier)
                 .map(|import| format!("{}{}", import, code))
                 .unwrap_or(code)

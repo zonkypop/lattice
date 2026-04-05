@@ -588,6 +588,7 @@ impl ApplicationHandler for App {
                         q.handle_keyboard_input(
                             key_event.state,
                             key_event.physical_key,
+                            &key_event.logical_key,
                             key_event.repeat,
                         );
                     }

@@ -10,15 +10,15 @@ cargo run --release -- --xr
 
 
 Lattice is a WIP, to do :
-
-- WebXR examples
-- Audio
 - WebRTC
-- Ergonomics etc
 - Steam Frame Builds
+- General slop cleanup
 
-Supported:
+Supported / tested platforms:
 - Linux Desktop + OpenXR
 - Windows Desktop + OpenXR
 - Quest OpenXR
-- Compute Shaders
+- MacOS Desktop
+
+Audio via [web-audio-api-rs](https://github.com/orottier/web-audio-api-rs) / [cpal](https://github.com/rustaudio/cpal)
+

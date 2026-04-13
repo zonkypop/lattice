@@ -823,6 +823,16 @@ if (!isNativeXR) {
         this._renderState.inlineVerticalFieldOfView =
           state.inlineVerticalFieldOfView;
       if (state.layers !== undefined) this._renderState.layers = state.layers;
+
+      // Push near/far to native XR projection matrix builder
+      if (state.depthNear !== undefined || state.depthFar !== undefined) {
+        if (globalThis.__xr?.op_xr_set_clip_planes) {
+          globalThis.__xr.op_xr_set_clip_planes(
+            this._renderState.depthNear,
+            this._renderState.depthFar
+          );
+        }
+      }
     }
 
     async requestReferenceSpace(type) {
@@ -851,45 +861,30 @@ if (!isNativeXR) {
       if (this._loopRunning) return;
       this._loopRunning = true;
 
-      // CPU timing for performance debugging
-      let cpuTimings = [];
-      let cpuFrameCount = 0;
-      const CPU_LOG_INTERVAL = 200;
-
       while (this._loopRunning && !this._ended) {
         try {
-          const frameStartTime = performance.now();
-
           if (!globalThis.__xr.op_xr_poll_events()) {
             this.end();
             return;
           }
 
-          // Async frame wait pattern - prevents ANR by not blocking main thread
-          const t0 = performance.now();
-
-          // Start the async frame wait
+          // Async frame wait — prevents ANR by not blocking main thread
           const started = globalThis.__xr.op_xr_frame_wait_start();
           if (!started) {
-            // Session not running or already waiting, yield and retry
             await globalThis.__yieldToRuntime();
             continue;
           }
 
-          // Poll until frame is ready (non-blocking)
           while (!globalThis.__xr.op_xr_frame_wait_poll()) {
             await globalThis.__yieldToRuntime();
           }
 
-          // Finish and get the frame data
           const frameBegin = globalThis.__xr.op_xr_frame_wait_finish();
-          const tFrameBegin = performance.now() - t0;
           const frameState = frameBegin.frame_state;
 
           if (frameState.should_render) {
             this._currentSwapchainIndex = frameBegin.swapchain_info?.index ?? 0;
 
-            // Update input sources from combined result
             const inputState = frameBegin.input_sources;
             if (inputState?.sources?.length > 0) {
               this._inputSources._updateFromNative(inputState.sources);
@@ -903,7 +898,6 @@ if (!isNativeXR) {
             this._rafCallbacks = [];
             const time = frameState.predicted_display_time / 1_000_000;
 
-            const t1 = performance.now();
             for (const { callback } of callbacks) {
               try {
                 const result = callback(time, xrFrame);
@@ -914,26 +908,12 @@ if (!isNativeXR) {
                 console.error("XR frame error:", e);
               }
             }
-            const tCallback = performance.now() - t1;
 
             globalThis.__currentXRFrame = null;
-            const t2 = performance.now();
             globalThis.__xr.op_xr_release_swapchain_image();
             globalThis.__xr.op_xr_end_frame();
-            const tEndFrame = performance.now() - t2;
-
-            const totalFrameTime = performance.now() - frameStartTime;
-            cpuTimings.push({ total: totalFrameTime, frameBegin: tFrameBegin, callback: tCallback, endFrame: tEndFrame });
-            cpuFrameCount++;
-
-            if (cpuFrameCount >= CPU_LOG_INTERVAL) {
-              const avg = (arr, key) => arr.reduce((a, b) => a + b[key], 0) / arr.length;
-              console.log(`[CPU] total: ${avg(cpuTimings, 'total').toFixed(2)}ms, frameBegin: ${avg(cpuTimings, 'frameBegin').toFixed(2)}ms, callback: ${avg(cpuTimings, 'callback').toFixed(2)}ms, endFrame: ${avg(cpuTimings, 'endFrame').toFixed(2)}ms`);
-              cpuTimings = [];
-              cpuFrameCount = 0;
-            }
           }
-          await globalThis.__yieldToRuntime();
+          // No trailing yield — the xrWaitFrame poll loop already yields to the event loop.
         } catch (e) {
           console.error("XR loop error:", e);
           this.end();

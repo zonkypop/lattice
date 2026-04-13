@@ -102,8 +102,31 @@ if (!gfx) {
         ? optionsOrSx
         : options || {};
 
+    // Resize from an already-decoded ImageBitmap (pixel-level resize, no re-decode)
+    if (source instanceof ImageBitmap) {
+      if (source._closed || source._rid == null)
+        throw new Error("ImageBitmap is closed");
+      const needsResize = opts.resizeWidth && opts.resizeHeight;
+      if (!needsResize) {
+        // No resize requested — clone by resizing to same dimensions
+        const { rid, width, height } = gfx.op_gfx_resize_decoded_image({
+          source_rid: source._rid,
+          width: source._width,
+          height: source._height,
+        });
+        return new ImageBitmap(width, height, rid);
+      }
+      const { rid, width, height } = gfx.op_gfx_resize_decoded_image({
+        source_rid: source._rid,
+        width: opts.resizeWidth,
+        height: opts.resizeHeight,
+        quality: opts.resizeQuality ?? null,
+      });
+      return new ImageBitmap(width, height, rid);
+    }
+
     if (!(source instanceof Blob))
-      throw new Error("Only Blob sources supported");
+      throw new Error("Only Blob and ImageBitmap sources supported");
 
     const bytes = new Uint8Array(await source.arrayBuffer());
 
@@ -117,7 +140,7 @@ if (!gfx) {
       sniffFormat(bytes) ||
       "auto";
 
-    const { rid, width, height } = gfx.op_gfx_decode_image_store(bytes, {
+    const { rid, width, height } = await gfx.op_gfx_decode_image_store(bytes, {
       format,
       resize_width: opts.resizeWidth ?? null,
       resize_height: opts.resizeHeight ?? null,
@@ -224,7 +247,8 @@ if (!gfx) {
     }
     destroy() {
       if (this.__rid != null) {
-        gfx.op_gfx_resource_drop(this.__rid);
+        gfx.op_gfx_buffer_drop(this.__rid);
+        this.__rid = null;
       }
     }
   }
@@ -248,15 +272,29 @@ if (!gfx) {
         label: viewDesc.label ?? null,
         format: viewDesc.format ?? null,
         dimension: viewDesc.dimension ?? null,
+        usage: viewDesc.usage ?? null,
         base_mip_level: viewDesc.baseMipLevel ?? null,
         mip_level_count: viewDesc.mipLevelCount ?? null,
         base_array_layer: viewDesc.baseArrayLayer ?? null,
         array_layer_count: viewDesc.arrayLayerCount ?? null,
       });
-      return { __rid: v.rid };
+      return {
+        __rid: v.rid,
+        destroy() {
+          if (this.__rid != null) {
+            gfx.op_gfx_resource_drop(this.__rid);
+            this.__rid = null;
+          }
+        },
+      };
     }
 
-    destroy() {}
+    destroy() {
+      if (this.__rid != null) {
+        gfx.op_gfx_texture_drop(this.__rid);
+        this.__rid = null;
+      }
+    }
   }
 
   // Render pass
@@ -945,6 +983,13 @@ if (!gfx) {
         });
       }
 
+      // Clean up deferred GPU resources (e.g. compute mipmap views/bind groups
+      // that must survive until commands are submitted above)
+      if (this._deferredCleanup) {
+        for (const r of this._deferredCleanup) if (r.destroy) r.destroy();
+        this._deferredCleanup = null;
+      }
+
       return { __finished: true };
     }
   }
@@ -999,10 +1044,9 @@ if (!gfx) {
         // Start the async map operation (non-blocking)
         gfx.op_gfx_buffer_map_async(this.__rid, mode, offset, mapSize);
 
-        // Poll until ready (non-blocking polls with yielding between)
+        // Poll until ready with cheap yields (non-blocking)
         while (!gfx.op_gfx_buffer_map_poll(this.__rid)) {
-          // Yield to allow other work to happen
-          await new Promise(resolve => setTimeout(resolve, 0));
+          await globalThis.__yieldToRuntime();
         }
 
         // Finish the mapping
@@ -1045,7 +1089,27 @@ if (!gfx) {
       this._mappedSize = 0;
     }
 
-    destroy() {}
+    // Low-level sync helpers for per-frame polling (avoids async spinning).
+    // Usage: _startMap → (next frame) _pollMap → if true: _finishMap → getMappedRange → unmap
+    _startMap(mode, offset, size) {
+      gfx.op_gfx_buffer_map_async(this.__rid, mode, offset, size);
+    }
+    _pollMap() {
+      return gfx.op_gfx_buffer_map_poll(this.__rid);
+    }
+    _finishMap(offset, size) {
+      gfx.op_gfx_buffer_map_finish(this.__rid);
+      this._mapState = "mapped";
+      this._mappedOffset = offset;
+      this._mappedSize = size;
+    }
+
+    destroy() {
+      if (this.__rid != null) {
+        gfx.op_gfx_buffer_drop(this.__rid);
+        this.__rid = null;
+      }
+    }
   }
 
   // GPU adapter/device
@@ -1218,7 +1282,12 @@ if (!gfx) {
                 __rid: rid,
                 byteLength: size,
                 usage,
-                destroy() {},
+                destroy() {
+                  if (this.__rid != null) {
+                    gfx.op_gfx_buffer_drop(this.__rid);
+                    this.__rid = null;
+                  }
+                },
               };
             },
 
@@ -1234,7 +1303,12 @@ if (!gfx) {
                 __rid: rid,
                 byteLength: bytes.byteLength,
                 usage: u,
-                destroy() {},
+                destroy() {
+                  if (this.__rid != null) {
+                    gfx.op_gfx_buffer_drop(this.__rid);
+                    this.__rid = null;
+                  }
+                },
               };
             },
 
@@ -1252,11 +1326,8 @@ if (!gfx) {
                 sample_count: (desc.sampleCount ?? 1) >>> 0,
                 dimension: desc.dimension || "2d",
                 format: desc.format,
-                usage:
-                  (desc.usage |
-                    GPUTextureUsage.COPY_SRC |
-                    GPUTextureUsage.COPY_DST) >>>
-                  0,
+                usage: (desc.usage >>> 0),
+                view_formats: desc.viewFormats || [],
               };
               return new EmulatedTexture(
                 desc,
@@ -1353,12 +1424,19 @@ if (!gfx) {
                   texture_view_rid: textureViewRid,
                 };
               });
-              return {
-                __rid: gfx.op_gfx_device_create_bind_group({
+              const rid = gfx.op_gfx_device_create_bind_group({
                   label: desc.label ?? null,
                   layout_rid: desc.layout.__rid,
                   entries,
-                }).rid,
+                }).rid;
+              return {
+                __rid: rid,
+                destroy() {
+                  if (this.__rid != null) {
+                    gfx.op_gfx_bind_group_drop(this.__rid);
+                    this.__rid = null;
+                  }
+                },
               };
             },
 

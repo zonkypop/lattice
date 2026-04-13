@@ -1,14 +1,16 @@
-## Building for Android is possible with courage and Claude 4.5 Opus
+## Building for Android (Quest 3) - Deno/V8 147.x
 
-### Most of the suffering is from V8 / Deno / rusty_v8 not providing binaries for arm64.
+### The suffering is from V8 / Deno / rusty_v8 not providing prebuilt binaries for Android arm64.
 
-# very rough guide for building Deno/V8 for Android (Quest 3) :
+---
+
+## Prerequisites
 
 ### Android SDK/NDK Setup
 
 ```bash
 export ANDROID_HOME=~/android
-export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/{your version}
+export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358
 export ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
 export CMAKE_ANDROID_NDK=$ANDROID_NDK_HOME
 ```
@@ -34,166 +36,121 @@ ninja -C out
 sudo cp out/gn /usr/local/bin/
 ```
 
----
+### Cargo.toml
 
----
-
-## V8 Source Build Fixes
-
-V8 doesn't have prebuilt Android binaries, so we build from source. The v8 crate is missing several files:
-
-### 1. Create known target triples file
-
-```bash
-V8_RUST="$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/v8-140.2.0"
-
-mkdir -p "$V8_RUST/build/rust"
-cat > "$V8_RUST/build/rust/known-target-triples.txt" << 'EOF'
-aarch64-linux-android
-x86_64-unknown-linux-gnu
-EOF
-```
-
-### 2. Create missing pydeps files
-
-```bash
-cd "$V8_RUST/build/android"
-grep -o '"[^"]*\.pydeps"' BUILD.gn 2>/dev/null | tr -d '"' | while read f; do
-  mkdir -p "$(dirname "$f")"
-  touch "$f"
-done
-```
-
-### 3. Symlink NDK sysroot
-
-```bash
-mkdir -p "$V8_RUST/third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/"
-ln -sf "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64" \
-  "$V8_RUST/third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64"
-```
-
-### 4. Download missing Rust crates
-
-V8's third_party/rust/ has BUILD.gn files but missing source code. Download from crates.io:
-
-```bash
-dl() {
-  local crate=$1 ver=$2 dir=$3
-  echo "Downloading $crate..."
-  curl -sL "https://static.crates.io/crates/$crate/$crate-$ver.crate" -o /tmp/c.crate
-  rm -rf /tmp/cx && mkdir /tmp/cx
-  tar xzf /tmp/c.crate -C /tmp/cx
-  cp -r /tmp/cx/$crate-$ver/* "$V8_RUST/third_party/rust/$dir/"
-}
-
-# ICU crates
-dl icu_calendar 2.0.1 icu_calendar/v2
-dl icu_calendar_data 2.0.0 icu_calendar_data/v2.
-
-.... many many more
-```
-
-### 5. Create versioned symlinks in vendor directory
-
-```bash
-cd "$V8_RUST/third_party/rust/chromium_crates_io/vendor"
-
-# Create symlinks for all versioned crates
-for crate_dir in */; do
-  if [ -d "$crate_dir" ]; then
-    crate_name="${crate_dir%/}"
-    for version_dir in "$crate_dir"v*/; do
-      if [ -d "$version_dir" ]; then
-        version="${version_dir#$crate_dir}"
-        version="${version%/}"
-        symlink_name="${crate_name}-${version}"
-        rm -f "$symlink_name"
-        ln -sf "${crate_name}/${version}" "$symlink_name"
-      fi
-    done
-  fi
-done
-
-# Also create hyphenated versions for underscore names
-for crate_dir in */; do
-  crate_name="${crate_dir%/}"
-  if [[ "$crate_name" == *"_"* ]]; then
-    hyphen_name="${crate_name//_/-}"
-    for version_dir in "$crate_dir"v*/; do
-      if [ -d "$version_dir" ]; then
-        version="${version_dir#$crate_dir}"
-        version="${version%/}"
-        symlink_name="${hyphen_name}-${version}"
-        ln -sf "${crate_name}/${version}" "$symlink_name"
-      fi
-    done
-  fi
-done
-```
-
-### 6. Create missing metadata files
-
-```bash
-# For crates like jiff-tzdb that need these
-echo '{"files":{}}' > "$V8_RUST/third_party/rust/jiff_tzdb/v0_1/.cargo-checksum.json"
-echo '{}' > "$V8_RUST/third_party/rust/jiff_tzdb/v0_1/.cargo_vcs_info.json"
+Ensure `[lib]` section has:
+```toml
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 ```
 
 ---
 
-## V8 Source Patches
+## Quick Start
 
-### Patch 1: simdutf atomic functions (C++20 compatibility)
-
-```bash
-V8_FILE="$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/v8-140.2.0/v8/src/builtins/builtins-typed-array.cc"
-
-sed -i 's/simdutf::atomic_base64_to_binary_safe/simdutf::base64_to_binary_safe/g' "$V8_FILE"
-sed -i 's/simdutf::atomic_binary_to_base64/simdutf::binary_to_base64/g' "$V8_FILE"
-```
-
-### Patch 2: std::atomic_ref (not available in Android NDK's libc++)
+All V8/Deno fixes are automated in `fix_v8_android.sh`. After `cargo fetch`:
 
 ```bash
-V8_FILE="$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/v8-140.2.0/v8/src/objects/simd.cc"
+# 1. Apply all V8 + deno_core patches
+./fix_v8_android.sh
 
-sed -i 's/std::atomic_ref<char>(mutable_bytes\[i\]).load(std::memory_order_relaxed)/mutable_bytes[i]/g' "$V8_FILE"
-sed -i 's/std::atomic_ref<uint8_t>(buffer\[index++\])\s*\.store(result.value(), std::memory_order_relaxed)/buffer[index++] = result.value()/g' "$V8_FILE"
+# 2. Build, install, and run
+./run_quest.sh
 ```
+
+First build takes 20-40 minutes (V8 compiles ~3600 C++ targets). Subsequent builds are incremental.
 
 ---
 
 ## Build Command
 
 ```bash
-cd ~/Desktop/research
-
-BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/c++/v1" \
+RUSTFLAGS="-C link-arg=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/19/lib/linux/libclang_rt.builtins-aarch64-android.a" \
+GN_ARGS="use_custom_libcxx=false" \
+LIBCLANG_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib" \
+BINDGEN_EXTRA_CLANG_ARGS="--target=aarch64-linux-android23 --sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot" \
+RUSTY_V8_SRC_BINDING_PATH="$PWD/src_binding_release_aarch64-linux-android.rs" \
 V8_FROM_SOURCE=1 \
-EXTRA_GN_ARGS="use_custom_libcxx=false" \
 cargo apk build --release --lib
 ```
 
-Build takes 20-40 minutes.
+Key env vars explained:
+- `RUSTFLAGS` - links clang builtins for Android aarch64
+- `GN_ARGS` - disables V8's custom libc++ (use NDK's instead)
+- `LIBCLANG_PATH` - points bindgen to NDK's clang 19
+- `BINDGEN_EXTRA_CLANG_ARGS` - cross-compilation target/sysroot for non-V8 crates (libnghttp2 etc.)
+- `RUSTY_V8_SRC_BINDING_PATH` - pre-built FFI bindings to skip V8's broken bindgen for Android
+- `V8_FROM_SOURCE` - no prebuilt V8 for Android, must compile from source
 
 ---
 
-In Cargo.toml uncomment
+## What fix_v8_android.sh Does
 
-[lib]
-path = "src/lib.rs"
+All fixes target `~/.cargo/registry/src/.../v8-147.1.0/`. These get wiped on `cargo update`.
 
-# android
+### Fix 1: Create known-target-triples.txt
+GN build needs this file listing valid Rust targets.
 
-crate-type = ["rlib", "cdylib"]
+### Fix 2: Create missing .pydeps files
+Android BUILD.gn references .pydeps files not included in the crate.
 
-# Build
+### Fix 3: Symlink NDK sysroot
+V8 expects the NDK at `third_party/android_toolchain/ndk/...`.
 
-echo "Building..."
-RUSTFLAGS="-C link-arg=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/19/lib/linux/libclang_rt.builtins-aarch64-android.a" \
-GN_ARGS="use_custom_libcxx=false" \
-BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/c++/v1" \
-V8_FROM_SOURCE=1 \
-cargo apk build --release --lib
+### Fix 3b: Symlink host Linux sysroot
+V8's build.rs forces `use_sysroot=true` for Android. Host build tools need a Debian sysroot.
+Symlinks `/` as `build/linux/debian_bullseye_amd64-sysroot`.
 
-Preferably have a bash script which runs this and syncs all /js files to the local device
+### Fix 4: Download missing Rust crates
+V8's `third_party/rust/` has BUILD.gn files but no source code (~181 crates).
+Auto-downloads from crates.io based on version info in each BUILD.gn.
+
+### Fix 5: Create metadata files
+`.cargo-checksum.json` for downloaded vendor crates.
+
+### Fix 6: V8 source patches
+
+**Patch 6a: simdutf atomic functions**
+`builtins-typed-array.cc` uses `simdutf::atomic_*` functions not available in this build.
+Replace with non-atomic `simdutf::base64_to_binary_safe` / `simdutf::binary_to_base64`.
+
+**Patch 6b: std::atomic_ref -> __atomic builtins (9 files)**
+Android NDK's libc++ doesn't implement `std::atomic_ref` (C++20 library feature).
+All usages replaced with GCC/Clang `__atomic` builtins across:
+- `v8/src/base/atomicops.h` (central atomic operations header - complete rewrite)
+- `v8/src/base/memcopy.h`
+- `v8/src/heap/cppgc/heap-page.h`
+- `v8/src/heap/cppgc/object-start-bitmap.h`
+- `v8/src/heap/cppgc/heap-object-header.h`
+- `v8/src/heap/sweeper.cc`
+- `v8/src/objects/simd.cc`
+
+### Fix 7: Patch allocation.h
+Same `std::atomic_ref` issue but in `v8/include/cppgc/allocation.h` (missed by initial src/ search).
+
+### Fix 8: Patch build.rs to skip bindgen
+V8's bindgen step fails for Android cross-compilation (can't resolve NDK C headers).
+Patches `build.rs` to honor `RUSTY_V8_SRC_BINDING_PATH` in `V8_FROM_SOURCE` mode,
+skipping bindgen entirely when a pre-built binding file is provided.
+
+### Fix 9: Download pre-built binding file
+Downloads `src_binding_release_aarch64-unknown-linux-gnu.rs` from rusty_v8 GitHub releases.
+aarch64 Linux and Android share the same ABI, so the bindings are compatible.
+
+### Fix 10: Patch deno_core errno_location
+`deno_core/uv_compat/tty.rs` only handles macOS and Linux.
+Adds Android case using `__errno()` (Android's errno location function).
+
+---
+
+## Troubleshooting
+
+- **"known-target-triples.txt" not found**: Run fix_v8_android.sh (Fix 1)
+- **"debian_bullseye_amd64-sysroot" missing**: Run fix_v8_android.sh (Fix 3b)
+- **std::atomic_ref errors**: Run fix_v8_android.sh (Fix 6b + 7)
+- **LIBCLANG_PATH not set / FP_NAN undefined**: Ensure LIBCLANG_PATH points to NDK's clang 19 lib
+- **uint32_t undefined in bindgen**: Use RUSTY_V8_SRC_BINDING_PATH instead of fixing bindgen
+- **bits/libc-header-start.h not found**: Set BINDGEN_EXTRA_CLANG_ARGS with --target and --sysroot
+- **errno_location not implemented**: Run fix_v8_android.sh (Fix 10)
+- **All fixes wiped**: `cargo update` re-downloads crates. Re-run fix_v8_android.sh.

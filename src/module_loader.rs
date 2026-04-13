@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use deno_core::{
     ModuleSpecifier, ModuleLoader, ModuleSource, ModuleSourceCode,
-    ModuleType, RequestedModuleType, ResolutionKind, ModuleLoadResponse,
-    ModuleLoadReferrer,
+    ModuleType, ResolutionKind, ModuleLoadResponse,
+    ModuleLoadReferrer, ModuleLoadOptions,
 };
 use deno_error::JsErrorBox;
 use deno_fs::RealFs;
@@ -195,8 +195,7 @@ impl ModuleLoader for ImportMapModuleLoader {
         &self,
         module_specifier: &ModuleSpecifier,
         _maybe_referrer: Option<&ModuleLoadReferrer>,
-        _is_dyn_import: bool,
-        _requested_module_type: RequestedModuleType,
+        _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let specifier = module_specifier.clone();
         
@@ -296,7 +295,8 @@ pub fn create_web_worker_callback(
             shared_array_buffer_store: Some(shared_array_buffer_store),
             compiled_wasm_module_store: Default::default(),
             fs,
-            maybe_inspector_server: None,
+            bundle_provider: Default::default(),
+            main_inspector_session_tx: Default::default(),
         };
 
         let nested_worker_cb: Arc<CreateWebWorkerCb> = Arc::new(|_| {
@@ -329,6 +329,7 @@ pub fn create_web_worker_callback(
             cache_storage_dir: None,
             enable_raw_imports: false,
             maybe_coverage_dir: None,
+            maybe_cpu_prof_config: None,
             worker_type: WorkerThreadType::Module,
         };
 

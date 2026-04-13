@@ -17,5 +17,10 @@ Object.defineProperty(globalThis.navigator, "onLine", {
   writable: true,
   configurable: true,
 });
+Object.defineProperty(globalThis.navigator, "platform", {
+  value: "Linux aarch64",
+  writable: true,
+  configurable: true,
+});
 
 console.log("[shims] setup complete");

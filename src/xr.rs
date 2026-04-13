@@ -203,6 +203,10 @@ pub struct XrState {
     pub right_b_button_action: xr::Action<bool>,
     pub left_hand_path: xr::Path,
     pub right_hand_path: xr::Path,
+
+    // Clip planes (set from JS via updateRenderState)
+    pub depth_near: f32,
+    pub depth_far: f32,
 }
 
 unsafe impl Send for XrState {}
@@ -230,18 +234,95 @@ pub static XR_SWAPCHAIN_TEXTURES: OnceLock<Vec<wgpu::Texture>> = OnceLock::new()
 /// Pre-created during session init to avoid per-frame allocation
 pub static XR_SWAPCHAIN_VIEWS: OnceLock<Vec<[std::sync::Arc<wgpu::TextureView>; 2]>> = OnceLock::new();
 
-// ======================= Async Frame Wait =======================
-// Allows JS to poll for frame readiness instead of blocking
+// ======================= Persistent Frame Wait Worker =======================
+// A single long-lived thread handles the blocking xrWaitFrame call.
+// This avoids spawning a new thread every frame (72 spawns/s on Quest).
 
-struct PendingFrameWait {
-    ready: Arc<AtomicBool>,
-    result: Arc<Mutex<Option<Result<xr::FrameState, String>>>>,
+struct FrameWaitWorker {
+    /// Main→worker: "start a new frame wait"
+    request: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    /// Shutdown flag so the thread exits cleanly
+    shutdown: Arc<AtomicBool>,
 }
 
-static PENDING_FRAME_WAIT: OnceLock<Mutex<Option<PendingFrameWait>>> = OnceLock::new();
+/// Worker→main: result is ready (lock-free poll path)
+static FRAME_WAIT_READY: AtomicBool = AtomicBool::new(false);
 
-fn get_pending_frame_wait() -> &'static Mutex<Option<PendingFrameWait>> {
-    PENDING_FRAME_WAIT.get_or_init(|| Mutex::new(None))
+/// The FrameState result produced by the worker thread
+static FRAME_WAIT_RESULT: OnceLock<Mutex<Option<Result<xr::FrameState, String>>>> = OnceLock::new();
+
+fn get_frame_wait_result() -> &'static Mutex<Option<Result<xr::FrameState, String>>> {
+    FRAME_WAIT_RESULT.get_or_init(|| Mutex::new(None))
+}
+
+static FRAME_WAIT_WORKER: OnceLock<Mutex<Option<FrameWaitWorker>>> = OnceLock::new();
+
+fn get_frame_wait_worker() -> &'static Mutex<Option<FrameWaitWorker>> {
+    FRAME_WAIT_WORKER.get_or_init(|| Mutex::new(None))
+}
+
+/// Lazily spawn the persistent frame-wait worker thread.
+fn ensure_frame_wait_worker() {
+    let mut guard = get_frame_wait_worker().lock().unwrap();
+    if guard.is_some() {
+        return;
+    }
+
+    let request = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let req = request.clone();
+    let shut = shutdown.clone();
+
+    std::thread::Builder::new()
+        .name("xr-frame-wait".into())
+        .spawn(move || {
+            log::info!("Frame-wait worker thread started");
+            loop {
+                // Park until signalled to start or shut down
+                {
+                    let (lock, cvar) = &*req;
+                    let mut requested = lock.lock().unwrap();
+                    while !*requested && !shut.load(Ordering::SeqCst) {
+                        requested = cvar.wait(requested).unwrap();
+                    }
+                    if shut.load(Ordering::SeqCst) {
+                        log::info!("Frame-wait worker shutting down");
+                        return;
+                    }
+                    *requested = false;
+                }
+
+                // Blocking OpenXR wait — this is the whole reason the thread exists
+                let wait_result = {
+                    let mut xr_guard = get_xr_state().lock().unwrap();
+                    match xr_guard.as_mut() {
+                        Some(state) => {
+                            state.frame_waiter.wait()
+                                .map_err(|e| format!("Wait failed: {}", e))
+                        }
+                        None => Err("No XR session".to_string()),
+                    }
+                };
+
+                // Publish result (lock-free ready flag for fast polling)
+                *get_frame_wait_result().lock().unwrap() = Some(wait_result);
+                FRAME_WAIT_READY.store(true, Ordering::SeqCst);
+            }
+        })
+        .expect("Failed to spawn xr-frame-wait thread");
+
+    *guard = Some(FrameWaitWorker { request, shutdown });
+}
+
+/// Shut down the persistent worker (called on session end).
+fn shutdown_frame_wait_worker() {
+    let mut guard = get_frame_wait_worker().lock().unwrap();
+    if let Some(worker) = guard.take() {
+        worker.shutdown.store(true, Ordering::SeqCst);
+        let (_, cvar) = &*worker.request;
+        cvar.notify_one();
+    }
 }
 
 // ======================= Helper Functions =======================
@@ -309,7 +390,7 @@ pub fn get_xr_swapchain_texture(index: u32) -> Option<&'static wgpu::Texture> {
 
 // ======================= OPS =======================
 
-#[op2(async)]
+#[op2]
 pub async fn op_xr_is_supported() -> Result<bool, JsErrorBox> {
     match unsafe { xr::Entry::load() }.ok().and_then(|e| e.enumerate_extensions().ok()) {
         Some(exts) => Ok(exts.khr_vulkan_enable2),
@@ -727,6 +808,8 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         right_b_button_action,
         left_hand_path,
         right_hand_path,
+        depth_near: 0.2,
+        depth_far: 550.0,
     };
     
     *get_xr_state().lock().unwrap() = Some(state);
@@ -776,7 +859,7 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
     })
 }
 
-#[op2(async)]
+#[op2]
 #[serde]
 pub async fn op_xr_request_session() -> Result<XrSessionInfo, JsErrorBox> {
     init_xr_session_internal().await
@@ -803,11 +886,13 @@ pub fn op_xr_poll_events() -> Result<bool, JsErrorBox> {
                     state.session_running = true;
                 }
                 xr::SessionState::STOPPING => {
+                    shutdown_frame_wait_worker();
                     state.session.end()
                         .map_err(|e| JsErrorBox::generic(format!("End failed: {}", e)))?;
                     state.session_running = false;
                 }
                 xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
+                    shutdown_frame_wait_worker();
                     log::info!("XR session exiting, terminating process immediately");
                     std::process::exit(0);
                 }
@@ -844,6 +929,14 @@ pub fn op_xr_wait_frame() -> Result<XrFrameState, JsErrorBox> {
     })
 }
 
+#[op2(fast)]
+pub fn op_xr_set_clip_planes(near: f32, far: f32) -> Result<(), JsErrorBox> {
+    let mut guard = get_xr_state().lock().unwrap();
+    let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
+    state.depth_near = near;
+    state.depth_far = far;
+    Ok(())
+}
 
 #[op2]
 #[serde]
@@ -865,7 +958,7 @@ pub fn op_xr_get_viewer_pose() -> Result<XrViewerPose, JsErrorBox> {
     
     let xr_views: Vec<XrView> = views.iter().enumerate().map(|(i, view)| {
         XrView {
-            projection_matrix: fov_to_projection_matrix(&view.fov, 0.05, 500.0),
+            projection_matrix: fov_to_projection_matrix(&view.fov, state.depth_near, state.depth_far),
             transform: XrPose {
                 position: [view.pose.position.x, view.pose.position.y, view.pose.position.z],
                 orientation: [view.pose.orientation.x, view.pose.orientation.y, view.pose.orientation.z, view.pose.orientation.w],
@@ -1051,7 +1144,7 @@ pub fn op_xr_frame_begin() -> Result<XrFrameBeginResult, JsErrorBox> {
 
     let xr_views: Vec<XrView> = views.iter().enumerate().map(|(i, view)| {
         XrView {
-            projection_matrix: fov_to_projection_matrix(&view.fov, 0.05, 500.0),
+            projection_matrix: fov_to_projection_matrix(&view.fov, state.depth_near, state.depth_far),
             transform: XrPose {
                 position: [view.pose.position.x, view.pose.position.y, view.pose.position.z],
                 orientation: [view.pose.orientation.x, view.pose.orientation.y, view.pose.orientation.z, view.pose.orientation.w],
@@ -1337,7 +1430,7 @@ pub fn op_xr_get_swapchain_texture_view(
     let view = views_for_image.get(view_index as usize)
         .ok_or_else(|| JsErrorBox::generic("Invalid view index (must be 0 or 1)"))?;
 
-    let rid = state.resource_table.add(crate::gfx::GfxTextureView {
+    let rid = crate::gfx::gpu_add(state, crate::gfx::GfxTextureView {
         view: view.clone(),
         width: xr_state.render_width,
         height: xr_state.render_height,
@@ -1348,86 +1441,58 @@ pub fn op_xr_get_swapchain_texture_view(
 
 // ======================= Async Frame Wait Ops =======================
 
-/// Start an async frame wait - spawns a thread to wait for the next frame
-/// Returns true if started successfully, false if session not running or already waiting
+/// Signal the persistent worker thread to start a new frame wait.
+/// Returns true if started successfully, false if session not running or already waiting.
 #[op2(fast)]
 pub fn op_xr_frame_wait_start() -> Result<bool, JsErrorBox> {
-    // Check if already waiting
+    // Check if session is running
     {
-        let pending = get_pending_frame_wait().lock().unwrap();
-        if pending.is_some() {
-            return Ok(false); // Already waiting
+        let guard = get_xr_state().lock().unwrap();
+        match guard.as_ref() {
+            Some(state) if state.session_running => {}
+            _ => return Ok(false),
         }
     }
 
-    // Check if session is running
-    let session_running = {
-        let guard = get_xr_state().lock().unwrap();
-        match guard.as_ref() {
-            Some(state) => state.session_running,
-            None => return Ok(false),
-        }
-    };
-
-    if !session_running {
+    // Previous result not yet consumed
+    if FRAME_WAIT_READY.load(Ordering::SeqCst) {
         return Ok(false);
     }
 
-    // Create pending state
-    let ready = Arc::new(AtomicBool::new(false));
-    let result: Arc<Mutex<Option<Result<xr::FrameState, String>>>> = Arc::new(Mutex::new(None));
+    // Lazily create the worker thread on first call
+    ensure_frame_wait_worker();
 
-    let ready_clone = ready.clone();
-    let result_clone = result.clone();
-
-    // Spawn thread to do the blocking wait
-    std::thread::spawn(move || {
-        let wait_result = {
-            let mut guard = get_xr_state().lock().unwrap();
-            match guard.as_mut() {
-                Some(state) => {
-                    state.frame_waiter.wait()
-                        .map_err(|e| format!("Wait failed: {}", e))
-                }
-                None => Err("No XR session".to_string()),
-            }
-        };
-
-        *result_clone.lock().unwrap() = Some(wait_result);
-        ready_clone.store(true, Ordering::SeqCst);
-    });
-
-    // Store pending state
-    *get_pending_frame_wait().lock().unwrap() = Some(PendingFrameWait {
-        ready,
-        result,
-    });
-
-    Ok(true)
-}
-
-/// Poll for frame wait completion - returns true if ready
-#[op2(fast)]
-pub fn op_xr_frame_wait_poll() -> bool {
-    let pending = get_pending_frame_wait().lock().unwrap();
-    match pending.as_ref() {
-        Some(state) => state.ready.load(Ordering::SeqCst),
-        None => false,
+    // Signal the worker to start a new blocking wait
+    let worker_guard = get_frame_wait_worker().lock().unwrap();
+    if let Some(worker) = worker_guard.as_ref() {
+        let (lock, cvar) = &*worker.request;
+        let mut requested = lock.lock().unwrap();
+        *requested = true;
+        cvar.notify_one();
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
-/// Finish the async frame wait and get the result
-/// This completes the frame_stream.begin() call and returns the frame begin result
+/// Poll for frame wait completion - returns true if ready.
+/// Lock-free: just reads an atomic, no mutex on the hot path.
+#[op2(fast)]
+pub fn op_xr_frame_wait_poll() -> bool {
+    FRAME_WAIT_READY.load(Ordering::SeqCst)
+}
+
+/// Finish the async frame wait and get the result.
+/// This completes the frame_stream.begin() call and returns the frame begin result.
 #[op2]
 #[serde]
 pub fn op_xr_frame_wait_finish() -> Result<XrFrameBeginResult, JsErrorBox> {
-    // Get and clear pending state
-    let pending = get_pending_frame_wait().lock().unwrap().take();
-    let pending = pending.ok_or_else(|| JsErrorBox::generic("No pending frame wait"))?;
-
-    // Get the frame state from the completed wait
-    let frame_state_result = pending.result.lock().unwrap().take()
+    // Take the result produced by the worker thread
+    let frame_state_result = get_frame_wait_result().lock().unwrap().take()
         .ok_or_else(|| JsErrorBox::generic("Frame wait not complete"))?;
+
+    // Reset ready flag so the next frame can start
+    FRAME_WAIT_READY.store(false, Ordering::SeqCst);
 
     let frame_state = frame_state_result
         .map_err(|e| JsErrorBox::generic(e))?;
@@ -1469,7 +1534,7 @@ pub fn op_xr_frame_wait_finish() -> Result<XrFrameBeginResult, JsErrorBox> {
 
     let xr_views: Vec<XrView> = views.iter().enumerate().map(|(i, view)| {
         XrView {
-            projection_matrix: fov_to_projection_matrix(&view.fov, 0.05, 500.0),
+            projection_matrix: fov_to_projection_matrix(&view.fov, state.depth_near, state.depth_far),
             transform: XrPose {
                 position: [view.pose.position.x, view.pose.position.y, view.pose.position.z],
                 orientation: [view.pose.orientation.x, view.pose.orientation.y, view.pose.orientation.z, view.pose.orientation.w],

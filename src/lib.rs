@@ -35,6 +35,7 @@ use module_loader::{ImportMapModuleLoader, create_web_worker_callback};
 use deno_runtime::BootstrapOptions;
 
 mod sqlite;
+mod audio;
 use tokio::runtime::Handle;
 
 use deno_core::SharedArrayBufferStore;
@@ -108,6 +109,7 @@ extension!(
         gfx::op_gfx_decode_image_store,
         gfx::op_gfx_upload_decoded_image_to_texture,
         gfx::op_gfx_decoded_image_drop,
+        gfx::op_gfx_resize_decoded_image,
         gfx::op_gfx_multi_draw_indexed_indirect,
         gfx::op_gfx_queue_submit_empty,
 
@@ -129,6 +131,9 @@ extension!(
         gfx::op_gfx_render_depth_only,
 
         gfx::op_gfx_resource_drop,
+        gfx::op_gfx_texture_drop,
+        gfx::op_gfx_buffer_drop,
+        gfx::op_gfx_bind_group_drop,
         gfx::op_gfx_flush_commands,
         gfx::op_gfx_render_xr_frame,
 
@@ -147,6 +152,7 @@ extension!(
         gfx::op_gfx_timestamp_batch,
         gfx::op_gfx_buffer_map_async,
         gfx::op_gfx_buffer_map_poll,
+        gfx::op_gfx_buffer_map_wait,
         gfx::op_gfx_buffer_map_finish,
         gfx::op_gfx_buffer_get_mapped_range,
         gfx::op_gfx_buffer_unmap,
@@ -157,6 +163,7 @@ extension!(
         xr::op_xr_request_session,
         xr::op_xr_poll_events,
         xr::op_xr_wait_frame,
+        xr::op_xr_set_clip_planes,
         xr::op_xr_get_viewer_pose,
         xr::op_xr_acquire_swapchain_image,
         xr::op_xr_release_swapchain_image,
@@ -169,12 +176,52 @@ extension!(
         xr::op_xr_frame_wait_poll,
         xr::op_xr_frame_wait_finish,
 
+        // Audio ops
+        audio::op_audio_create_context,
+        audio::op_audio_context_current_time,
+        audio::op_audio_context_close,
+        audio::op_audio_create_gain,
+        audio::op_audio_create_buffer_source,
+        audio::op_audio_create_oscillator,
+        audio::op_audio_create_panner,
+        audio::op_audio_create_biquad_filter,
+        audio::op_audio_create_stereo_panner,
+        audio::op_audio_create_delay,
+        audio::op_audio_create_dynamics_compressor,
+        audio::op_audio_create_analyser,
+        audio::op_audio_connect,
+        audio::op_audio_disconnect,
+        audio::op_audio_param_set_value,
+        audio::op_audio_param_set_value_at_time,
+        audio::op_audio_param_set_target_at_time,
+        audio::op_audio_param_linear_ramp,
+        audio::op_audio_param_exponential_ramp,
+        audio::op_audio_decode_audio_data,
+        audio::op_audio_buffer_drop,
+        audio::op_audio_buffer_source_set_buffer,
+        audio::op_audio_buffer_source_start,
+        audio::op_audio_buffer_source_stop,
+        audio::op_audio_buffer_source_set_loop,
+        audio::op_audio_buffer_source_set_loop_start,
+        audio::op_audio_buffer_source_set_loop_end,
+        audio::op_audio_oscillator_set_type,
+        audio::op_audio_oscillator_start,
+        audio::op_audio_oscillator_stop,
+        audio::op_audio_panner_configure,
+        audio::op_audio_biquad_set_type,
+        audio::op_audio_listener_set_position,
+        audio::op_audio_listener_set_orientation,
+        audio::op_audio_node_drop,
+
         // event loop
         op_yield_to_runtime
-       
+
     ],
     esm_entry_point = "ext:gfx_host/bootstrap.js",
     esm = [dir "src", "bootstrap.js"],
+    state = |state| {
+        state.put(gfx::GpuIdMap::new());
+    },
     customizer = |ext: &mut deno_core::Extension| {
         ext.needs_lazy_init = false;
     }
@@ -194,16 +241,12 @@ struct GpuState {
     window: Arc<Window>,
     ctx: &'static GfxContext,
     config: wgpu::SurfaceConfiguration,
-    msaa_texture: wgpu::Texture,      
-    msaa_view: wgpu::TextureView,     
-    sample_count: u32,                 
 }
 
 #[cfg(not(target_os = "android"))]
 impl GpuState {
     async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
-        let sample_count = 4u32; 
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -277,22 +320,6 @@ impl GpuState {
 
         surface.configure(&device, &config);
 
-        let msaa_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MSAA Texture"),
-            size: wgpu::Extent3d {
-                width: size.width.max(1),
-                height: size.height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
         let gfx_box = Box::new(GfxContext {
             device,
             queue,
@@ -317,9 +344,6 @@ impl GpuState {
                 config.height = size.height.max(1);
                 config
             },
-            msaa_texture,   
-            msaa_view,      
-            sample_count,   
         }
     }
 
@@ -330,22 +354,6 @@ impl GpuState {
         self.config.width = w;
         self.config.height = h;
         self.ctx.surface.as_ref().unwrap().configure(&self.ctx.device, &self.config);
-        
-        self.msaa_texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MSAA Texture"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: self.sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        self.msaa_view = self.msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
     }
 }
 
@@ -423,7 +431,6 @@ async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpec
         seed: None,
         create_web_worker_cb,
         format_js_error_fn: None,
-        maybe_inspector_server: None,
         should_break_on_first_statement: false,
         should_wait_for_inspector_session: false,
         trace_ops: None,
@@ -446,11 +453,19 @@ async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpec
     #[cfg(not(target_os = "android"))]
     let xr_enabled = std::env::args().any(|a| a == "--xr");
 
+    let script_dir_str = script_dir.to_string_lossy().replace('\\', "/");
+    let script_dir_slash = if script_dir_str.ends_with('/') {
+        script_dir_str.to_string()
+    } else {
+        format!("{}/", script_dir_str)
+    };
+
     worker.js_runtime.execute_script(
         "<native_flags>",
         deno_core::ModuleCodeString::from(format!(
-            "globalThis.__isNative__ = true; globalThis.__nativeXR__ = {};",
-            xr_enabled
+            "globalThis.__isNative__ = true; globalThis.__nativeXR__ = {}; globalThis.__scriptDir__ = '{}';",
+            xr_enabled,
+            script_dir_slash
         )),
     )?;
 
@@ -515,7 +530,6 @@ impl ApplicationHandler for App {
                         biased;
                         result = worker.js_runtime.run_event_loop(deno_core::PollEventLoopOptions {
                             wait_for_inspector: false,
-                            pump_v8_message_loop: true,
                         }) => {
                             if let Err(e) = result {
                                 log::error!("Event loop error: {:?}", e);
@@ -651,7 +665,6 @@ impl ApplicationHandler for App {
                     biased;
                     result = worker.js_runtime.run_event_loop(deno_core::PollEventLoopOptions {
                         wait_for_inspector: false,
-                        pump_v8_message_loop: true,
                     }) => {
                         if let Err(e) = result {
                             log::error!("Event loop error: {:?}", e);
@@ -685,11 +698,27 @@ impl ApplicationHandler for App {
 
 // ======================= XR Mode =======================
 
-#[deno_core::op2(async)]
+#[deno_core::op2]
 pub async fn op_yield_to_runtime() -> Result<(), deno_error::JsErrorBox> {
     tokio::task::yield_now().await;
     Ok(())
 }
+
+/// Drain pending Android input events to prevent ANR.
+/// Android's InputDispatcher triggers ANR if events aren't acknowledged within 5s.
+/// We just consume and acknowledge them — VR input comes from OpenXR, not here.
+#[cfg(target_os = "android")]
+fn drain_android_events() {
+    if let Some(queue) = ndk_glue::input_queue() {
+        while let Ok(Some(event)) = queue.get_event() {
+            // Acknowledge immediately, not handled by us (VR uses OpenXR input)
+            queue.finish_event(event, false);
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn drain_android_events() {}
 
 fn run_xr_mode(script_path: &str) -> Result<(), AnyError> {
     info!("Starting XR mode...");
@@ -728,12 +757,14 @@ fn run_xr_mode(script_path: &str) -> Result<(), AnyError> {
                 break;
             }
 
+            // Drain Android looper events (input queue + lifecycle) to prevent ANR
+            drain_android_events();
+
             // Drain all currently-ready async work without blocking.
             tokio::select! {
                 biased;
                 result = worker.js_runtime.run_event_loop(deno_core::PollEventLoopOptions {
                     wait_for_inspector: false,
-                    pump_v8_message_loop: true,
                 }) => {
                     if let Err(e) = result {
                         error!("Event loop error: {:?}", e);

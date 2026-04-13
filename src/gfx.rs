@@ -57,6 +57,7 @@ fn get_decoded_image_store() -> &'static Mutex<HashMap<u32, GfxDecodedImage>> {
     DECODED_IMAGE_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Clone)]
 pub struct GfxDecodedImage {
     pub width: u32,
     pub height: u32,
@@ -120,6 +121,60 @@ pub struct GfxQuerySet {
     pub count: u32,
 }
 impl Resource for GfxQuerySet {}
+
+// ======================= GPU Resource ID Registry =======================
+// Monotonically increasing IDs prevent stale-reference bugs caused by
+// Deno's ResourceTable recycling integer IDs after drop.  JS only sees
+// the monotonic ID; the internal ResourceTable ID is an implementation detail.
+
+pub struct GpuIdMap {
+    next_id: u32,
+    map: HashMap<u32, u32>, // monotonic_id -> resource_table_id
+}
+
+impl GpuIdMap {
+    pub fn new() -> Self {
+        Self {
+            next_id: 1,
+            map: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, resource_table_rid: ResourceId) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.map.insert(id, u32::from(resource_table_rid));
+        id
+    }
+
+    fn resolve(&self, monotonic_id: u32) -> Option<ResourceId> {
+        self.map.get(&monotonic_id).map(|&rid| ResourceId::from(rid))
+    }
+
+    fn remove(&mut self, monotonic_id: u32) -> Option<ResourceId> {
+        self.map.remove(&monotonic_id).map(|rid| ResourceId::from(rid))
+    }
+}
+
+pub fn gpu_add<T: Resource>(state: &mut OpState, resource: T) -> ResourceId {
+    let internal_rid = state.resource_table.add(resource);
+    let monotonic_id = state.borrow_mut::<GpuIdMap>().insert(internal_rid);
+    ResourceId::from(monotonic_id)
+}
+
+fn gpu_get<T: Resource>(state: &OpState, rid: u32) -> Result<std::rc::Rc<T>, JsErrorBox> {
+    let internal_rid = state.borrow::<GpuIdMap>()
+        .resolve(rid)
+        .ok_or_else(|| JsErrorBox::generic(format!("GPU resource {} not found (stale or invalid ID)", rid)))?;
+    state.resource_table.get::<T>(internal_rid)
+        .map_err(|e| JsErrorBox::generic(e.to_string()))
+}
+
+fn gpu_take<T: Resource>(state: &mut OpState, rid: u32) {
+    if let Some(internal_rid) = state.borrow_mut::<GpuIdMap>().remove(rid) {
+        let _ = state.resource_table.take::<T>(internal_rid);
+    }
+}
 
 // ======================= Mapping helpers =======================
 
@@ -460,17 +515,100 @@ pub struct DecodeImageOptions {
 }
 
 
+/// Decode WebP using libwebp (SIMD-accelerated, with decode-time scaling).
+fn decode_webp_native(
+    data: &[u8],
+    options: Option<&DecodeImageOptions>,
+) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    use libwebp_sys::*;
+    use std::os::raw::c_int;
+
+    unsafe {
+        let mut config: WebPDecoderConfig = std::mem::zeroed();
+        if !WebPInitDecoderConfig(&mut config) {
+            return Err("Failed to init WebP decoder config".into());
+        }
+
+        // Get image dimensions
+        if WebPGetFeatures(data.as_ptr(), data.len(), &mut config.input) != VP8StatusCode::VP8_STATUS_OK {
+            return Err("Failed to read WebP features".into());
+        }
+
+        let orig_w = config.input.width as u32;
+        let orig_h = config.input.height as u32;
+
+        // Configure decode-time scaling if resize requested
+        if let Some(opts) = options {
+            if let (Some(w), Some(h)) = (opts.resize_width, opts.resize_height) {
+                if w > 0 && h > 0 && (w != orig_w || h != orig_h) {
+                    config.options.use_scaling = 1;
+                    config.options.scaled_width = w as c_int;
+                    config.options.scaled_height = h as c_int;
+                }
+            }
+            if opts.image_orientation.as_deref() == Some("flipY") {
+                config.options.flip = 1;
+            }
+        }
+
+        // Request RGBA output
+        config.output.colorspace = WEBP_CSP_MODE::MODE_RGBA;
+
+        // Decode
+        let status = WebPDecode(data.as_ptr(), data.len(), &mut config);
+        if status != VP8StatusCode::VP8_STATUS_OK {
+            WebPFreeDecBuffer(&mut config.output);
+            return Err(format!("WebP decode failed: {:?}", status).into());
+        }
+
+        let width = if config.options.use_scaling != 0 {
+            config.options.scaled_width as u32
+        } else {
+            orig_w
+        };
+        let height = if config.options.use_scaling != 0 {
+            config.options.scaled_height as u32
+        } else {
+            orig_h
+        };
+
+        // Copy pixels out of libwebp's buffer into our own Vec
+        let rgba = &config.output.u.RGBA;
+        let stride = rgba.stride as usize;
+        let row_bytes = (width as usize) * 4;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+
+        for y in 0..height as usize {
+            let row_start = y * stride;
+            let row = std::slice::from_raw_parts(rgba.rgba.add(row_start), row_bytes);
+            pixels.extend_from_slice(row);
+        }
+
+        WebPFreeDecBuffer(&mut config.output);
+
+        Ok((width, height, pixels))
+    }
+}
+
 fn decode_image_internal(
-    data: &[u8], 
+    data: &[u8],
     format: &str,
     options: Option<DecodeImageOptions>,
 ) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    // Use libwebp for WebP (SIMD-accelerated, decode-time scaling)
+    if format == "webp" {
+        return decode_webp_native(data, options.as_ref());
+    }
+    // Also try libwebp for auto-detect if data starts with RIFF..WEBP
+    if format == "auto" && data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return decode_webp_native(data, options.as_ref());
+    }
+
     use image::{ImageFormat, imageops::FilterType};
-    
+
     let mut img: DynamicImage = match format {
         "png" => image::load_from_memory_with_format(data, ImageFormat::Png)?,
         "jpeg" | "jpg" => image::load_from_memory_with_format(data, ImageFormat::Jpeg)?,
-        "webp" => image::load_from_memory_with_format(data, ImageFormat::WebP)?,
         _ => image::load_from_memory(data)?,
     };
 
@@ -573,6 +711,8 @@ pub struct TextureCreateDesc {
     pub dimension: String,
     pub format: String,
     pub usage: u32,
+    #[serde(default)]
+    pub view_formats: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -586,6 +726,7 @@ pub struct TextureViewCreateDesc {
     pub label: Option<String>,
     pub format: Option<String>,
     pub dimension: Option<String>,
+    pub usage: Option<u32>,
     pub base_mip_level: Option<u32>,
     pub mip_level_count: Option<u32>,
     pub base_array_layer: Option<u32>,
@@ -1047,49 +1188,31 @@ pub fn op_gfx_multi_draw_indexed_indirect(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let pipeline = state
-        .resource_table
-        .get::<GfxPipeline>(ResourceId::from(args.pipeline_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let pipeline = gpu_get::<GfxPipeline>(state, args.pipeline_rid)?;
 
     let mut vbufs: Vec<Arc<wgpu::Buffer>> = Vec::new();
     for rid in args.vertex_buffer_rids.iter() {
-        let buf = state
-            .resource_table
-            .get::<GfxBuffer>(ResourceId::from(*rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let buf = gpu_get::<GfxBuffer>(state, *rid)?;
         vbufs.push(buf.buffer.clone());
     }
 
     let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
     for rid_opt in args.bind_group_rids.iter() {
         if let Some(rid) = rid_opt {
-            let bg = state
-                .resource_table
-                .get::<GfxBindGroup>(ResourceId::from(*rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            let bg = gpu_get::<GfxBindGroup>(state, *rid)?;
             bgs.push(Some(bg.group.clone()));
         } else {
             bgs.push(None);
         }
     }
 
-    let index_buf = state
-        .resource_table
-        .get::<GfxBuffer>(ResourceId::from(args.index_buffer_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let index_buf = gpu_get::<GfxBuffer>(state, args.index_buffer_rid)?;
 
-    let indirect_buf = state
-        .resource_table
-        .get::<GfxBuffer>(ResourceId::from(args.indirect_buffer_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let indirect_buf = gpu_get::<GfxBuffer>(state, args.indirect_buffer_rid)?;
 
     let depth_view = if let Some(rid) = args.depth_view_rid {
         Some(
-            state
-                .resource_table
-                .get::<GfxTextureView>(ResourceId::from(rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?,
+            gpu_get::<GfxTextureView>(state, rid)?,
         )
     } else {
         None
@@ -1097,10 +1220,7 @@ pub fn op_gfx_multi_draw_indexed_indirect(
 
     let target_view = if let Some(rid) = args.target_view_rid {
         Some(
-            state
-                .resource_table
-                .get::<GfxTextureView>(ResourceId::from(rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?,
+            gpu_get::<GfxTextureView>(state, rid)?,
         )
     } else {
         None
@@ -1197,40 +1317,88 @@ pub struct DecodeImageStoreArgs {
 
 #[op2]
 #[serde]
-pub fn op_gfx_decode_image_store(
-    _state: &mut OpState, 
+pub async fn op_gfx_decode_image_store(
     #[buffer] data: JsBuffer,
     #[serde] args: DecodeImageStoreArgs,
 ) -> Result<DecodeImageStoreResult, JsErrorBox> {
-    let slice: &[u8] = &data;
-    
-    let options = Some(DecodeImageOptions {
-        resize_width: args.resize_width,
-        resize_height: args.resize_height,
-        resize_quality: args.resize_quality,
-        image_orientation: args.image_orientation,
-    });
-    
-    let (width, height, pixels) = decode_image_internal(slice, &args.format, options)
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let owned_data: Vec<u8> = data.to_vec();
 
-    let img = GfxDecodedImage {
-        width,
-        height,
-        pixels,
+    let result = tokio::task::spawn_blocking(move || {
+        let options = Some(DecodeImageOptions {
+            resize_width: args.resize_width,
+            resize_height: args.resize_height,
+            resize_quality: args.resize_quality,
+            image_orientation: args.image_orientation,
+        });
+
+        let (width, height, pixels) = decode_image_internal(&owned_data, &args.format, options)
+            .map_err(|e| e.to_string())?;
+
+        let img = GfxDecodedImage { width, height, pixels };
+        let rid = DECODED_IMAGE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut store = get_decoded_image_store()
+                .lock()
+                .map_err(|e| format!("Failed to lock image store: {}", e))?;
+            store.insert(rid, img);
+        }
+
+        Ok::<_, String>((rid, width, height))
+    })
+    .await
+    .map_err(|e| JsErrorBox::generic(format!("Decode task panicked: {}", e)))?
+    .map_err(|e| JsErrorBox::generic(e))?;
+
+    Ok(DecodeImageStoreResult { rid: result.0.into(), width: result.1, height: result.2 })
+}
+
+#[derive(Deserialize)]
+pub struct ResizeDecodedImageArgs {
+    pub source_rid: u32,
+    pub width: u32,
+    pub height: u32,
+    pub quality: Option<String>,
+}
+
+#[op2]
+#[serde]
+pub fn op_gfx_resize_decoded_image(
+    _state: &mut OpState,
+    #[serde] args: ResizeDecodedImageArgs,
+) -> Result<DecodeImageStoreResult, JsErrorBox> {
+    use image::{RgbaImage, imageops::FilterType};
+
+    let (src_w, src_h, src_pixels) = {
+        let store = get_decoded_image_store()
+            .lock()
+            .map_err(|e| JsErrorBox::generic(format!("Failed to lock image store: {}", e)))?;
+        let img = store.get(&args.source_rid)
+            .ok_or_else(|| JsErrorBox::generic(format!("Decoded image {} not found", args.source_rid)))?;
+        (img.width, img.height, img.pixels.clone())
     };
 
-    // Store in global storage instead of per-isolate resource table
+    let src_img = RgbaImage::from_raw(src_w, src_h, src_pixels)
+        .ok_or_else(|| JsErrorBox::generic("Failed to create image from stored pixels"))?;
+
+    let filter = match args.quality.as_deref() {
+        Some("pixelated") | Some("low") => FilterType::Nearest,
+        Some("medium") => FilterType::Triangle,
+        _ => FilterType::Lanczos3,
+    };
+
+    let resized = image::imageops::resize(&src_img, args.width, args.height, filter);
+    let (w, h) = resized.dimensions();
+    let pixels = resized.into_raw();
+
     let rid = DECODED_IMAGE_COUNTER.fetch_add(1, Ordering::SeqCst);
-    
     {
         let mut store = get_decoded_image_store()
             .lock()
             .map_err(|e| JsErrorBox::generic(format!("Failed to lock image store: {}", e)))?;
-        store.insert(rid, img);
+        store.insert(rid, GfxDecodedImage { width: w, height: h, pixels });
     }
-    
-    Ok(DecodeImageStoreResult { rid: rid.into(), width, height })
+
+    Ok(DecodeImageStoreResult { rid: rid.into(), width: w, height: h })
 }
 
 static MIPMAP_RESOURCES: OnceLock<MipmapResources> = OnceLock::new();
@@ -1445,19 +1613,18 @@ pub fn op_gfx_upload_decoded_image_to_texture(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    // Get image from GLOBAL storage
-    let store = get_decoded_image_store()
-        .lock()
-        .map_err(|e| JsErrorBox::generic(format!("Failed to lock image store: {}", e)))?;
-    
-    let img = store
-        .get(&image_rid)
-        .ok_or_else(|| JsErrorBox::generic(format!("Failed to get decoded image: Bad resource ID {}", image_rid)))?;
+    // Borrow image from GLOBAL storage (kept alive until ImageBitmap.close() calls drop)
+    let img = {
+        let store = get_decoded_image_store()
+            .lock()
+            .map_err(|e| JsErrorBox::generic(format!("Failed to lock image store: {}", e)))?;
+        store.get(&image_rid)
+            .ok_or_else(|| JsErrorBox::generic(format!("Failed to get decoded image: Bad resource ID {}", image_rid)))?
+            .clone()
+    };
 
     // Get texture from per-isolate resource table (textures ARE per-isolate, that's fine)
-    let texture = state
-        .resource_table
-        .get::<GfxTexture>(ResourceId::from(texture_rid))
+    let texture = gpu_get::<GfxTexture>(state, texture_rid)
         .map_err(|e| JsErrorBox::generic(format!("Failed to get texture: {}", e)))?;
 
     
@@ -1526,14 +1693,8 @@ pub fn op_gfx_upload_decoded_image_to_texture(
         },
     );
 
-    // Generate mipmaps natively if texture has multiple mip levels.
-    // This must happen on the Rust side because the JS shim's render pipeline
-    // hardcodes alpha blending, which corrupts mipmap data for transparent textures.
-    // No flush needed: queue.write_texture() above is ordered before subsequent submits.
-    // generate_mipmaps uses queue_command_buffer (deferred) to avoid per-image sync points.
-    if texture.texture.mip_level_count() > 1 {
-        generate_mipmaps(&ctx.device, &ctx.queue, &texture.texture, img.width, img.height, origin_z);
-    }
+    // Mipmap generation is now handled by JS compute shaders (generateMipmapsCompute)
+    // which avoids per-mip render pass overhead on tile-based GPUs (Quest 3).
 
     Ok(())
 }
@@ -1550,6 +1711,7 @@ pub fn op_gfx_decoded_image_drop(
     store.remove(&image_rid);
     Ok(())
 }
+
 
 #[op2]
 #[string]
@@ -1589,7 +1751,7 @@ pub fn op_gfx_device_create_shader(
         source: wgpu::ShaderSource::Wgsl(final_code.into()),
     });
 
-    let rid = state.resource_table.add(GfxShader { module });
+    let rid = gpu_add(state, GfxShader { module });
     Ok(JsGfxShader { rid })
 }
 
@@ -1617,7 +1779,7 @@ pub fn op_gfx_device_create_buffer_init(
         });
 
     let buffer = Arc::new(raw);
-    let rid = state.resource_table.add(GfxBuffer { buffer });
+    let rid = gpu_add(state, GfxBuffer { buffer });
     Ok(JsGfxBuffer { rid })
 }
 
@@ -1639,7 +1801,7 @@ pub fn op_gfx_device_create_buffer(
     });
 
     let buffer = Arc::new(raw);
-    let rid = state.resource_table.add(GfxBuffer { buffer });
+    let rid = gpu_add(state, GfxBuffer { buffer });
     Ok(JsGfxBuffer { rid })
 }
 
@@ -1652,10 +1814,7 @@ pub fn op_gfx_queue_write_buffer(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let buffer = state
-        .resource_table
-        .get::<GfxBuffer>(ResourceId::from(buffer_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let buffer = gpu_get::<GfxBuffer>(state, buffer_rid)?;
 
     let bytes: &[u8] = &data;
     
@@ -1686,10 +1845,7 @@ pub fn op_gfx_clear_buffer(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let buffer = state
-        .resource_table
-        .get::<GfxBuffer>(ResourceId::from(args.buffer_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let buffer = gpu_get::<GfxBuffer>(state, args.buffer_rid)?;
 
     let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("clear_buffer_encoder"),
@@ -1713,6 +1869,10 @@ pub fn op_gfx_device_create_texture(
         .ok_or_else(|| JsErrorBox::generic("invalid texture usage flags"))?;
 
     let format = map_texture_format(&desc.format);
+    let mapped_view_formats: Vec<wgpu::TextureFormat> = desc.view_formats
+        .iter()
+        .map(|f| map_texture_format(f))
+        .collect();
     let error_guard = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
         label: desc.label.as_deref(),
@@ -1726,7 +1886,7 @@ pub fn op_gfx_device_create_texture(
         dimension: map_texture_dimension(&desc.dimension),
         format,
         usage,
-        view_formats: &[],
+        view_formats: &mapped_view_formats,
     });
     let maybe_err = pollster::block_on(error_guard.pop());
     if let Some(err) = maybe_err {
@@ -1735,7 +1895,7 @@ pub fn op_gfx_device_create_texture(
             format, usage, desc.mip_level_count, desc.sample_count, err);
     }
 
-    let rid = state.resource_table.add(GfxTexture { texture });
+    let rid = gpu_add(state, GfxTexture { texture });
     Ok(JsGfxTexture { rid })
 }
 
@@ -1745,10 +1905,7 @@ pub fn op_gfx_texture_create_view(
     state: &mut OpState,
     #[serde] desc: TextureViewCreateDesc,
 ) -> Result<JsGfxTextureView, JsErrorBox> {
-    let tex = state
-        .resource_table
-        .get::<GfxTexture>(ResourceId::from(desc.texture_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let tex = gpu_get::<GfxTexture>(state, desc.texture_rid)?;
 
     let tex_size = tex.texture.size();
     let base_mip = desc.base_mip_level.unwrap_or(0);
@@ -1764,14 +1921,13 @@ pub fn op_gfx_texture_create_view(
         mip_level_count: desc.mip_level_count,
         base_array_layer: desc.base_array_layer.unwrap_or(0),
         array_layer_count: desc.array_layer_count,
-        usage: None, 
+        usage: desc.usage
+            .and_then(|u| wgpu::TextureUsages::from_bits(u)),
     };
 
     let view = tex.texture.create_view(&view_desc);
 
-    let rid = state
-        .resource_table
-        .add(GfxTextureView { 
+    let rid = gpu_add(state, GfxTextureView { 
             view: Arc::new(view),
             width,
             height,
@@ -1813,9 +1969,7 @@ pub fn op_gfx_device_create_sampler(
         ..Default::default()
     });
 
-    let rid = state
-        .resource_table
-        .add(GfxSampler { sampler: Arc::new(sampler) });
+    let rid = gpu_add(state, GfxSampler { sampler: Arc::new(sampler) });
     Ok(JsGfxSampler { rid })
 }
 
@@ -1879,9 +2033,7 @@ pub fn op_gfx_device_create_bind_group_layout(
         entries: &entries,
     });
 
-    let rid = state
-        .resource_table
-        .add(GfxBindGroupLayout { layout: Arc::new(layout) });
+    let rid = gpu_add(state, GfxBindGroupLayout { layout: Arc::new(layout) });
     Ok(JsGfxBindGroupLayout { rid })
 }
 
@@ -1895,10 +2047,7 @@ pub fn op_gfx_device_create_pipeline_layout(
 
     let mut layout_arcs: Vec<Arc<wgpu::BindGroupLayout>> = Vec::new();
     for rid in desc.layout_rids.iter() {
-        let l = state
-            .resource_table
-            .get::<GfxBindGroupLayout>(ResourceId::from(*rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let l = gpu_get::<GfxBindGroupLayout>(state, *rid)?;
         layout_arcs.push(l.layout.clone());
     }
 
@@ -1913,9 +2062,7 @@ pub fn op_gfx_device_create_pipeline_layout(
                 immediate_size: 0,
             });
 
-    let rid = state
-        .resource_table
-        .add(GfxPipelineLayout { layout: pipeline_layout });
+    let rid = gpu_add(state, GfxPipelineLayout { layout: pipeline_layout });
     Ok(JsGfxPipelineLayout { rid })
 }
 
@@ -1927,10 +2074,7 @@ pub fn op_gfx_device_create_bind_group(
 ) -> Result<JsGfxBindGroup, JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let layout = state
-        .resource_table
-        .get::<GfxBindGroupLayout>(ResourceId::from(desc.layout_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let layout = gpu_get::<GfxBindGroupLayout>(state, desc.layout_rid)?;
 
     let mut buffers: Vec<Arc<wgpu::Buffer>> = Vec::new();
     let mut samplers: Vec<Arc<wgpu::Sampler>> = Vec::new();
@@ -1954,10 +2098,7 @@ pub fn op_gfx_device_create_bind_group(
 
     for e in desc.entries.iter() {
         if let Some(buf_rid) = e.buffer_rid {
-            let buf_res = state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(buf_rid))
-                .map_err(|err| JsErrorBox::generic(err.to_string()))?;
+            let buf_res = gpu_get::<GfxBuffer>(state, buf_rid)?;
             let idx = buffers.len();
             buffers.push(buf_res.buffer.clone());
 
@@ -1972,19 +2113,13 @@ pub fn op_gfx_device_create_bind_group(
                 },
             ));
         } else if let Some(sam_rid) = e.sampler_rid {
-            let s_res = state
-                .resource_table
-                .get::<GfxSampler>(ResourceId::from(sam_rid))
-                .map_err(|err| JsErrorBox::generic(err.to_string()))?;
+            let s_res = gpu_get::<GfxSampler>(state, sam_rid)?;
             let idx = samplers.len();
             samplers.push(s_res.sampler.clone());
 
             plans.push((e.binding, EntryKind::Sampler { idx }));
         } else if let Some(view_rid) = e.texture_view_rid {
-            let v_res = state
-                .resource_table
-                .get::<GfxTextureView>(ResourceId::from(view_rid))
-                .map_err(|err| JsErrorBox::generic(err.to_string()))?;
+            let v_res = gpu_get::<GfxTextureView>(state, view_rid)?;
             let idx = views.len();
             views.push(v_res.view.clone());
 
@@ -2058,9 +2193,7 @@ pub fn op_gfx_device_create_bind_group(
         eprintln!("[BG-DIAG] ERROR creating {}: {}", auto_label, err);
     }
 
-    let rid = state
-        .resource_table
-        .add(GfxBindGroup { group: Arc::new(group) });
+    let rid = gpu_add(state, GfxBindGroup { group: Arc::new(group) });
     Ok(JsGfxBindGroup { rid })
 }
 
@@ -2073,18 +2206,12 @@ pub fn op_gfx_device_create_pipeline(
 ) -> Result<JsGfxPipeline, JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let v_mod = state
-        .resource_table
-        .get::<GfxShader>(ResourceId::from(desc.vertex_module_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let v_mod = gpu_get::<GfxShader>(state, desc.vertex_module_rid)?;
 
     // Fragment shader is optional for depth-only passes
     let f_mod = if let Some(frag_rid) = desc.fragment_module_rid {
         Some(
-            state
-                .resource_table
-                .get::<GfxShader>(ResourceId::from(frag_rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?,
+            gpu_get::<GfxShader>(state, frag_rid)?,
         )
     } else {
         None
@@ -2208,10 +2335,7 @@ pub fn op_gfx_device_create_pipeline(
     };
 
     let pipeline = if let Some(layout_rid) = desc.pipeline_layout_rid {
-        let pl = state
-            .resource_table
-            .get::<GfxPipelineLayout>(ResourceId::from(layout_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let pl = gpu_get::<GfxPipelineLayout>(state, layout_rid)?;
 
         ctx.device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2250,7 +2374,7 @@ pub fn op_gfx_device_create_pipeline(
             })
     };
 
-    let rid = state.resource_table.add(GfxPipeline { pipeline });
+    let rid = gpu_add(state, GfxPipeline { pipeline });
     Ok(JsGfxPipeline { rid })
 }
 #[op2]
@@ -2265,9 +2389,7 @@ pub fn op_gfx_surface_draw(
     }
 
     for (call_idx, dc) in args.draw_calls.iter().enumerate() {
-        if state
-            .resource_table
-            .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
+        if gpu_get::<GfxPipeline>(state, dc.pipeline_rid)
             .is_err()
         {
             log::error!(
@@ -2279,9 +2401,7 @@ pub fn op_gfx_surface_draw(
         }
 
         for (slot, rid) in dc.vertex_buffer_rids.iter().enumerate() {
-            if state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(*rid))
+            if gpu_get::<GfxBuffer>(state, *rid)
                 .is_err()
             {
                 log::error!(
@@ -2296,9 +2416,7 @@ pub fn op_gfx_surface_draw(
 
         for (idx, rid_opt) in dc.bind_group_rids.iter().enumerate() {
             if let Some(rid) = rid_opt {
-                if state
-                    .resource_table
-                    .get::<GfxBindGroup>(ResourceId::from(*rid))
+                if gpu_get::<GfxBindGroup>(state, *rid)
                     .is_err()
                 {
                     log::error!(
@@ -2313,9 +2431,7 @@ pub fn op_gfx_surface_draw(
         }
 
         if let Some(idx_rid) = dc.index_buffer_rid {
-            if state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(idx_rid))
+            if gpu_get::<GfxBuffer>(state, idx_rid)
                 .is_err()
             {
                 log::error!(
@@ -2328,9 +2444,7 @@ pub fn op_gfx_surface_draw(
         }
 
         if let Some(view_rid) = dc.depth_view_rid {
-            if state
-                .resource_table
-                .get::<GfxTextureView>(ResourceId::from(view_rid))
+            if gpu_get::<GfxTextureView>(state, view_rid)
                 .is_err()
             {
                 log::error!(
@@ -2345,9 +2459,7 @@ pub fn op_gfx_surface_draw(
         // Validate indirect buffer if multi-draw
         if dc.is_multi_draw.unwrap_or(false) || dc.is_indirect.unwrap_or(false) {
             if let Some(indirect_rid) = dc.indirect_buffer_rid {
-                if state
-                    .resource_table
-                    .get::<GfxBuffer>(ResourceId::from(indirect_rid))
+                if gpu_get::<GfxBuffer>(state, indirect_rid)
                     .is_err()
                 {
                     log::error!(
@@ -2405,9 +2517,7 @@ pub fn op_gfx_surface_draw(
     // Validate depth views match surface size
     for (i, dc) in args.draw_calls.iter().enumerate() {
         if let Some(view_rid) = dc.depth_view_rid {
-            let v_res = state
-                .resource_table
-                .get::<GfxTextureView>(ResourceId::from(view_rid))
+            let v_res = gpu_get::<GfxTextureView>(state, view_rid)
                 .map_err(|e| {
                     JsErrorBox::generic(format!(
                         "Draw call {}: failed to get depth view: {}",
@@ -2434,10 +2544,7 @@ pub fn op_gfx_surface_draw(
     for dc in args.draw_calls.iter() {
         if depth_view.is_none() {
             if let Some(view_rid) = dc.depth_view_rid {
-                let v_res = state
-                    .resource_table
-                    .get::<GfxTextureView>(ResourceId::from(view_rid))
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+                let v_res = gpu_get::<GfxTextureView>(state, view_rid)?;
                 depth_view = Some(v_res.view.clone());
 
                 let clear = dc.depth_clear_value.unwrap_or(1.0);
@@ -2507,9 +2614,7 @@ pub fn op_gfx_surface_draw(
 
     for (call_idx, dc) in args.draw_calls.iter().enumerate() {
         // Validate pipeline exists
-        let _ = state
-            .resource_table
-            .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
+        let _ = gpu_get::<GfxPipeline>(state, dc.pipeline_rid)
             .map_err(|e| {
                 JsErrorBox::generic(format!(
                     "Draw call {}: invalid pipeline rid {}: {}",
@@ -2519,9 +2624,7 @@ pub fn op_gfx_surface_draw(
 
         let mut vbufs: Vec<Arc<wgpu::Buffer>> = Vec::new();
         for (slot, rid) in dc.vertex_buffer_rids.iter().enumerate() {
-            let buf_res = state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(*rid))
+            let buf_res = gpu_get::<GfxBuffer>(state, *rid)
                 .map_err(|e| {
                     JsErrorBox::generic(format!(
                         "Draw call {}: invalid vertex buffer at slot {}: {}",
@@ -2534,9 +2637,7 @@ pub fn op_gfx_surface_draw(
         let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
         for (idx, rid_opt) in dc.bind_group_rids.iter().enumerate() {
             if let Some(rid) = rid_opt {
-                let bg_res = state
-                    .resource_table
-                    .get::<GfxBindGroup>(ResourceId::from(*rid))
+                let bg_res = gpu_get::<GfxBindGroup>(state, *rid)
                     .map_err(|e| {
                         JsErrorBox::generic(format!(
                             "Draw call {}: invalid bind group at index {}: {}",
@@ -2550,9 +2651,7 @@ pub fn op_gfx_surface_draw(
         }
 
         let index_buf: Option<Arc<wgpu::Buffer>> = if let Some(rid) = dc.index_buffer_rid {
-            let buf_res = state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(rid))
+            let buf_res = gpu_get::<GfxBuffer>(state, rid)
                 .map_err(|e| {
                     JsErrorBox::generic(format!(
                         "Draw call {}: invalid index buffer: {}",
@@ -2569,9 +2668,7 @@ pub fn op_gfx_surface_draw(
 
         let indirect_buf: Option<Arc<wgpu::Buffer>> = if is_multi_draw || is_indirect {
             if let Some(rid) = dc.indirect_buffer_rid {
-                let buf_res = state
-                    .resource_table
-                    .get::<GfxBuffer>(ResourceId::from(rid))
+                let buf_res = gpu_get::<GfxBuffer>(state, rid)
                     .map_err(|e| {
                         JsErrorBox::generic(format!(
                             "Draw call {}: invalid indirect buffer: {}",
@@ -2619,7 +2716,7 @@ pub fn op_gfx_surface_draw(
 
     // Get query set for timestamp writes if provided
     let qs_ref = args.timestamp_writes.as_ref().and_then(|tw| {
-        state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+        gpu_get::<GfxQuerySet>(state, tw.query_set_rid).ok()
     });
 
     // Write START timestamp BEFORE any work (compute or render) at encoder level
@@ -2636,17 +2733,17 @@ pub fn op_gfx_surface_draw(
             match cmd.cmd.as_str() {
                 "clear_buffer" => {
                     if let Some(buf_rid) = cmd.buffer_rid {
-                        if let Ok(buf) = state.resource_table.get::<GfxBuffer>(ResourceId::from(buf_rid)) {
+                        if let Ok(buf) = gpu_get::<GfxBuffer>(state, buf_rid) {
                             encoder.clear_buffer(&buf.buffer, cmd.offset.unwrap_or(0), Some(cmd.size.unwrap_or(0)));
                         }
                     }
                 }
                 "dispatch" => {
                     if let Some(p_rid) = cmd.pipeline_rid {
-                        if let Ok(pipeline) = state.resource_table.get::<GfxComputePipeline>(ResourceId::from(p_rid)) {
+                        if let Ok(pipeline) = gpu_get::<GfxComputePipeline>(state, p_rid) {
                             // Get query set if timestamp writes provided for this compute pass
                             let compute_qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
-                                state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+                                gpu_get::<GfxQuerySet>(state, tw.query_set_rid).ok()
                             });
                             let compute_ts_writes = match (&cmd.timestamp_writes, &compute_qs_ref) {
                                 (Some(tw), Some(qs)) => Some(wgpu::ComputePassTimestampWrites {
@@ -2665,7 +2762,7 @@ pub fn op_gfx_surface_draw(
                             if let Some(ref rids) = cmd.bind_group_rids {
                                 for (idx, rid_opt) in rids.iter().enumerate() {
                                     if let Some(rid) = rid_opt {
-                                        if let Ok(bg) = state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid)) {
+                                        if let Ok(bg) = gpu_get::<GfxBindGroup>(state, *rid) {
                                             pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
                                         }
                                     }
@@ -2682,11 +2779,11 @@ pub fn op_gfx_surface_draw(
                 "dispatch_indirect" => {
                     if let (Some(p_rid), Some(ib_rid)) = (cmd.pipeline_rid, cmd.indirect_buffer_rid) {
                         if let (Ok(pipeline), Ok(indirect_buf)) = (
-                            state.resource_table.get::<GfxComputePipeline>(ResourceId::from(p_rid)),
-                            state.resource_table.get::<GfxBuffer>(ResourceId::from(ib_rid))
+                            gpu_get::<GfxComputePipeline>(state, p_rid),
+                            gpu_get::<GfxBuffer>(state, ib_rid)
                         ) {
                             let compute_qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
-                                state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+                                gpu_get::<GfxQuerySet>(state, tw.query_set_rid).ok()
                             });
                             let compute_ts_writes = match (&cmd.timestamp_writes, &compute_qs_ref) {
                                 (Some(tw), Some(qs)) => Some(wgpu::ComputePassTimestampWrites {
@@ -2705,7 +2802,7 @@ pub fn op_gfx_surface_draw(
                             if let Some(ref rids) = cmd.bind_group_rids {
                                 for (idx, rid_opt) in rids.iter().enumerate() {
                                     if let Some(rid) = rid_opt {
-                                        if let Ok(bg) = state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid)) {
+                                        if let Ok(bg) = gpu_get::<GfxBindGroup>(state, *rid) {
                                             pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
                                         }
                                     }
@@ -2718,8 +2815,8 @@ pub fn op_gfx_surface_draw(
                 "copy_buffer_to_texture" => {
                     if let (Some(buf_rid), Some(tex_rid)) = (cmd.src_buffer_rid, cmd.texture_rid) {
                         if let (Ok(buf), Ok(tex)) = (
-                            state.resource_table.get::<GfxBuffer>(ResourceId::from(buf_rid)),
-                            state.resource_table.get::<GfxTexture>(ResourceId::from(tex_rid))
+                            gpu_get::<GfxBuffer>(state, buf_rid),
+                            gpu_get::<GfxTexture>(state, tex_rid)
                         ) {
                             encoder.copy_buffer_to_texture(
                                 wgpu::TexelCopyBufferInfo {
@@ -2752,8 +2849,8 @@ pub fn op_gfx_surface_draw(
                 "copy_texture_to_texture" => {
                     if let (Some(src_rid), Some(dst_rid)) = (cmd.src_texture_rid, cmd.texture_rid) {
                         if let (Ok(src_tex), Ok(dst_tex)) = (
-                            state.resource_table.get::<GfxTexture>(ResourceId::from(src_rid)),
-                            state.resource_table.get::<GfxTexture>(ResourceId::from(dst_rid))
+                            gpu_get::<GfxTexture>(state, src_rid),
+                            gpu_get::<GfxTexture>(state, dst_rid)
                         ) {
                             encoder.copy_texture_to_texture(
                                 wgpu::TexelCopyTextureInfo {
@@ -2822,9 +2919,7 @@ pub fn op_gfx_surface_draw(
 
         // Issue all draw calls within the single pass
         for data in draw_data_list.iter() {
-            let pipeline_res = state
-                .resource_table
-                .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
+            let pipeline_res = gpu_get::<GfxPipeline>(state, data.pipeline_rid)
                 .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
@@ -2878,8 +2973,8 @@ pub fn op_gfx_surface_draw(
     // Resolve query sets after render pass
     if let Some(ref resolve_ops) = args.resolve_query_sets {
         for op in resolve_ops {
-            if let Ok(qs) = state.resource_table.get::<GfxQuerySet>(ResourceId::from(op.query_set_rid)) {
-                if let Ok(dst) = state.resource_table.get::<GfxBuffer>(ResourceId::from(op.destination_rid)) {
+            if let Ok(qs) = gpu_get::<GfxQuerySet>(state, op.query_set_rid) {
+                if let Ok(dst) = gpu_get::<GfxBuffer>(state, op.destination_rid) {
                     encoder.resolve_query_set(
                         &qs.query_set,
                         op.first_query..op.first_query + op.query_count,
@@ -2894,8 +2989,8 @@ pub fn op_gfx_surface_draw(
     // Copy buffers after resolve
     if let Some(ref copy_ops) = args.copy_buffers {
         for op in copy_ops {
-            if let Ok(src) = state.resource_table.get::<GfxBuffer>(ResourceId::from(op.src_rid)) {
-                if let Ok(dst) = state.resource_table.get::<GfxBuffer>(ResourceId::from(op.dst_rid)) {
+            if let Ok(src) = gpu_get::<GfxBuffer>(state, op.src_rid) {
+                if let Ok(dst) = gpu_get::<GfxBuffer>(state, op.dst_rid) {
                     encoder.copy_buffer_to_buffer(
                         &src.buffer,
                         op.src_offset,
@@ -2956,9 +3051,7 @@ pub fn op_gfx_write_texture_image(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let texture = state
-        .resource_table
-        .get::<GfxTexture>(ResourceId::from(texture_rid))
+    let texture = gpu_get::<GfxTexture>(state, texture_rid)
         .map_err(|e| JsErrorBox::generic(format!("Failed to get texture: {}", e)))?;
 
     // Validate dimensions
@@ -3037,16 +3130,11 @@ pub fn op_gfx_pipeline_get_bind_group_layout(
     state: &mut OpState,
     #[serde] args: GetBindGroupLayoutArgs,
 ) -> Result<JsGfxBindGroupLayout, JsErrorBox> {
-    let pipeline = state
-        .resource_table
-        .get::<GfxPipeline>(ResourceId::from(args.pipeline_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let pipeline = gpu_get::<GfxPipeline>(state, args.pipeline_rid)?;
 
     let layout = pipeline.pipeline.get_bind_group_layout(args.index);
 
-    let rid = state
-        .resource_table
-        .add(GfxBindGroupLayout { layout: Arc::new(layout) });
+    let rid = gpu_add(state, GfxBindGroupLayout { layout: Arc::new(layout) });
     Ok(JsGfxBindGroupLayout { rid })
 }
 
@@ -3096,21 +3184,15 @@ pub fn op_gfx_render_xr_frame(
         return Ok(());
     }
 
-    let msaa_view = state
-        .resource_table
-        .get::<GfxTextureView>(ResourceId::from(args.msaa_view_rid))
+    let msaa_view = gpu_get::<GfxTextureView>(state, args.msaa_view_rid)
         .map_err(|e| JsErrorBox::generic(format!("Failed to get MSAA view: {}", e)))?;
 
-    let resolve_view = state
-        .resource_table
-        .get::<GfxTextureView>(ResourceId::from(args.resolve_view_rid))
+    let resolve_view = gpu_get::<GfxTextureView>(state, args.resolve_view_rid)
         .map_err(|e| JsErrorBox::generic(format!("Failed to get resolve view: {}", e)))?;
 
     let depth_view = if let Some(rid) = args.depth_view_rid {
         Some(
-            state
-                .resource_table
-                .get::<GfxTextureView>(ResourceId::from(rid))
+            gpu_get::<GfxTextureView>(state, rid)
                 .map_err(|e| JsErrorBox::generic(format!("Failed to get depth view: {}", e)))?,
         )
     } else {
@@ -3122,27 +3204,18 @@ pub fn op_gfx_render_xr_frame(
     let mut draw_data_list: Vec<XrDrawData> = Vec::with_capacity(args.draw_calls.len());
 
     for dc in args.draw_calls.iter() {
-        let _ = state
-            .resource_table
-            .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let _ = gpu_get::<GfxPipeline>(state, dc.pipeline_rid)?;
 
         let mut vbufs: Vec<Arc<wgpu::Buffer>> = Vec::new();
         for rid in dc.vertex_buffer_rids.iter() {
-            let buf_res = state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(*rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            let buf_res = gpu_get::<GfxBuffer>(state, *rid)?;
             vbufs.push(buf_res.buffer.clone());
         }
 
         let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
         for rid_opt in dc.bind_group_rids.iter() {
             if let Some(rid) = rid_opt {
-                let bg_res = state
-                    .resource_table
-                    .get::<GfxBindGroup>(ResourceId::from(*rid))
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+                let bg_res = gpu_get::<GfxBindGroup>(state, *rid)?;
                 bgs.push(Some(bg_res.group.clone()));
             } else {
                 bgs.push(None);
@@ -3150,10 +3223,7 @@ pub fn op_gfx_render_xr_frame(
         }
 
         let index_buf: Option<Arc<wgpu::Buffer>> = if let Some(rid) = dc.index_buffer_rid {
-            let buf_res = state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            let buf_res = gpu_get::<GfxBuffer>(state, rid)?;
             Some(buf_res.buffer.clone())
         } else {
             None
@@ -3164,10 +3234,7 @@ pub fn op_gfx_render_xr_frame(
 
         let indirect_buf: Option<Arc<wgpu::Buffer>> = if is_multi_draw || is_indirect {
             if let Some(rid) = dc.indirect_buffer_rid {
-                let buf_res = state
-                    .resource_table
-                    .get::<GfxBuffer>(ResourceId::from(rid))
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+                let buf_res = gpu_get::<GfxBuffer>(state, rid)?;
                 Some(buf_res.buffer.clone())
             } else {
                 None
@@ -3280,9 +3347,7 @@ pub fn op_gfx_render_xr_frame(
         // Issue all draw calls within the single pass
         for data in draw_data_list.iter() {
             // Get pipeline reference
-            let pipeline_res = state
-                .resource_table
-                .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
+            let pipeline_res = gpu_get::<GfxPipeline>(state, data.pipeline_rid)
                 .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
@@ -3333,10 +3398,10 @@ pub fn op_gfx_render_xr_frame(
         }
     }
 
-    // Queue this command buffer and flush all pending commands
-    // XR frame is the final pass, so we submit everything together
+    // Queue this command buffer for deferred submission.
+    // All XR eye passes + prior compute/shadow work get flushed together
+    // in a single queue.submit via op_gfx_queue_submit_empty at end of frame.
     queue_command_buffer(encoder.finish());
-    flush_pending_commands(&ctx.queue);
     Ok(())
 }
 
@@ -3351,10 +3416,7 @@ pub fn op_gfx_render_to_texture(
         return Ok(());
     }
 
-    let target_view = state
-        .resource_table
-        .get::<GfxTextureView>(ResourceId::from(args.target_view_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let target_view = gpu_get::<GfxTextureView>(state, args.target_view_rid)?;
 
     // Pre-collect depth view, depth ops, and stencil ops from first draw call that has depth
     let mut depth_view: Option<Arc<wgpu::TextureView>> = None;
@@ -3364,10 +3426,7 @@ pub fn op_gfx_render_to_texture(
     for dc in args.draw_calls.iter() {
         if depth_view.is_none() {
             if let Some(view_rid) = dc.depth_view_rid {
-                let v_res = state
-                    .resource_table
-                    .get::<GfxTextureView>(ResourceId::from(view_rid))
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+                let v_res = gpu_get::<GfxTextureView>(state, view_rid)?;
                 depth_view = Some(v_res.view.clone());
 
                 let clear = dc.depth_clear_value.unwrap_or(1.0);
@@ -3433,27 +3492,18 @@ pub fn op_gfx_render_to_texture(
 
     for dc in args.draw_calls.iter() {
         // Validate pipeline exists
-        let _ = state
-            .resource_table
-            .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let _ = gpu_get::<GfxPipeline>(state, dc.pipeline_rid)?;
 
         let mut vbufs: Vec<Arc<wgpu::Buffer>> = Vec::new();
         for rid in dc.vertex_buffer_rids.iter() {
-            let buf_res = state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(*rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            let buf_res = gpu_get::<GfxBuffer>(state, *rid)?;
             vbufs.push(buf_res.buffer.clone());
         }
 
         let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
         for rid_opt in dc.bind_group_rids.iter() {
             if let Some(rid) = rid_opt {
-                let bg_res = state
-                    .resource_table
-                    .get::<GfxBindGroup>(ResourceId::from(*rid))
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+                let bg_res = gpu_get::<GfxBindGroup>(state, *rid)?;
                 bgs.push(Some(bg_res.group.clone()));
             } else {
                 bgs.push(None);
@@ -3461,10 +3511,7 @@ pub fn op_gfx_render_to_texture(
         }
 
         let index_buf: Option<Arc<wgpu::Buffer>> = if let Some(rid) = dc.index_buffer_rid {
-            let buf_res = state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            let buf_res = gpu_get::<GfxBuffer>(state, rid)?;
             Some(buf_res.buffer.clone())
         } else {
             None
@@ -3526,9 +3573,7 @@ pub fn op_gfx_render_to_texture(
 
         // Issue all draw calls within the single pass
         for data in draw_data_list.iter() {
-            let pipeline_res = state
-                .resource_table
-                .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
+            let pipeline_res = gpu_get::<GfxPipeline>(state, data.pipeline_rid)
                 .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
@@ -3579,15 +3624,9 @@ pub fn op_gfx_copy_texture_to_texture(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let src_tex = state
-        .resource_table
-        .get::<GfxTexture>(ResourceId::from(args.src_texture_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let src_tex = gpu_get::<GfxTexture>(state, args.src_texture_rid)?;
 
-    let dst_tex = state
-        .resource_table
-        .get::<GfxTexture>(ResourceId::from(args.dst_texture_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let dst_tex = gpu_get::<GfxTexture>(state, args.dst_texture_rid)?;
 
     let mut encoder =
         ctx.device
@@ -3635,15 +3674,9 @@ pub fn op_gfx_copy_buffer_to_texture(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let buffer = state
-        .resource_table
-        .get::<GfxBuffer>(ResourceId::from(args.buffer_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let buffer = gpu_get::<GfxBuffer>(state, args.buffer_rid)?;
 
-    let texture = state
-        .resource_table
-        .get::<GfxTexture>(ResourceId::from(args.texture_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let texture = gpu_get::<GfxTexture>(state, args.texture_rid)?;
 
     let mut encoder =
         ctx.device
@@ -3702,10 +3735,7 @@ pub fn op_gfx_render_depth_only(
         return Ok(());
     }
 
-    let depth_view = state
-        .resource_table
-        .get::<GfxTextureView>(ResourceId::from(args.depth_view_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let depth_view = gpu_get::<GfxTextureView>(state, args.depth_view_rid)?;
 
     // Get depth clear value from first draw call
     let depth_clear_value = args.draw_calls.first()
@@ -3733,27 +3763,18 @@ pub fn op_gfx_render_depth_only(
 
     for dc in args.draw_calls.iter() {
         // Validate pipeline exists
-        let _ = state
-            .resource_table
-            .get::<GfxPipeline>(ResourceId::from(dc.pipeline_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let _ = gpu_get::<GfxPipeline>(state, dc.pipeline_rid)?;
 
         let mut vbufs: Vec<Arc<wgpu::Buffer>> = Vec::new();
         for rid in dc.vertex_buffer_rids.iter() {
-            let buf_res = state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(*rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            let buf_res = gpu_get::<GfxBuffer>(state, *rid)?;
             vbufs.push(buf_res.buffer.clone());
         }
 
         let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
         for rid_opt in dc.bind_group_rids.iter() {
             if let Some(rid) = rid_opt {
-                let bg_res = state
-                    .resource_table
-                    .get::<GfxBindGroup>(ResourceId::from(*rid))
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+                let bg_res = gpu_get::<GfxBindGroup>(state, *rid)?;
                 bgs.push(Some(bg_res.group.clone()));
             } else {
                 bgs.push(None);
@@ -3761,10 +3782,7 @@ pub fn op_gfx_render_depth_only(
         }
 
         let index_buf: Option<Arc<wgpu::Buffer>> = if let Some(rid) = dc.index_buffer_rid {
-            let buf_res = state
-                .resource_table
-                .get::<GfxBuffer>(ResourceId::from(rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            let buf_res = gpu_get::<GfxBuffer>(state, rid)?;
             Some(buf_res.buffer.clone())
         } else {
             None
@@ -3815,9 +3833,7 @@ pub fn op_gfx_render_depth_only(
 
         // Issue all draw calls within the single pass
         for data in draw_data_list.iter() {
-            let pipeline_res = state
-                .resource_table
-                .get::<GfxPipeline>(ResourceId::from(data.pipeline_rid))
+            let pipeline_res = gpu_get::<GfxPipeline>(state, data.pipeline_rid)
                 .unwrap();
 
             pass.set_pipeline(&pipeline_res.pipeline);
@@ -3861,7 +3877,34 @@ pub fn op_gfx_resource_drop(
     state: &mut OpState,
     rid: u32,
 ) -> Result<(), JsErrorBox> {
-    let _ = state.resource_table.take::<GfxTextureView>(ResourceId::from(rid));
+    gpu_take::<GfxTextureView>(state, rid);
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_texture_drop(
+    state: &mut OpState,
+    rid: u32,
+) -> Result<(), JsErrorBox> {
+    gpu_take::<GfxTexture>(state, rid);
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_buffer_drop(
+    state: &mut OpState,
+    rid: u32,
+) -> Result<(), JsErrorBox> {
+    gpu_take::<GfxBuffer>(state, rid);
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_bind_group_drop(
+    state: &mut OpState,
+    rid: u32,
+) -> Result<(), JsErrorBox> {
+    gpu_take::<GfxBindGroup>(state, rid);
     Ok(())
 }
 
@@ -3885,16 +3928,10 @@ pub fn op_gfx_device_create_compute_pipeline(
 ) -> Result<JsGfxComputePipeline, JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let shader = state
-        .resource_table
-        .get::<GfxShader>(ResourceId::from(desc.shader_module_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let shader = gpu_get::<GfxShader>(state, desc.shader_module_rid)?;
 
     let pipeline = if let Some(layout_rid) = desc.pipeline_layout_rid {
-        let pl = state
-            .resource_table
-            .get::<GfxPipelineLayout>(ResourceId::from(layout_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let pl = gpu_get::<GfxPipelineLayout>(state, layout_rid)?;
 
         ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("GFX Compute Pipeline"),
@@ -3915,7 +3952,7 @@ pub fn op_gfx_device_create_compute_pipeline(
         })
     };
 
-    let rid = state.resource_table.add(GfxComputePipeline { pipeline });
+    let rid = gpu_add(state, GfxComputePipeline { pipeline });
     Ok(JsGfxComputePipeline { rid })
 }
 
@@ -3925,16 +3962,11 @@ pub fn op_gfx_compute_pipeline_get_bind_group_layout(
     state: &mut OpState,
     #[serde] args: GetBindGroupLayoutArgs,
 ) -> Result<JsGfxBindGroupLayout, JsErrorBox> {
-    let pipeline = state
-        .resource_table
-        .get::<GfxComputePipeline>(ResourceId::from(args.pipeline_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let pipeline = gpu_get::<GfxComputePipeline>(state, args.pipeline_rid)?;
 
     let layout = pipeline.pipeline.get_bind_group_layout(args.index);
 
-    let rid = state
-        .resource_table
-        .add(GfxBindGroupLayout { layout: Arc::new(layout) });
+    let rid = gpu_add(state, GfxBindGroupLayout { layout: Arc::new(layout) });
     Ok(JsGfxBindGroupLayout { rid })
 }
 
@@ -3945,18 +3977,12 @@ pub fn op_gfx_compute_dispatch(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let pipeline = state
-        .resource_table
-        .get::<GfxComputePipeline>(ResourceId::from(args.pipeline_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let pipeline = gpu_get::<GfxComputePipeline>(state, args.pipeline_rid)?;
 
     let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
     for rid_opt in args.bind_group_rids.iter() {
         if let Some(rid) = rid_opt {
-            let bg = state
-                .resource_table
-                .get::<GfxBindGroup>(ResourceId::from(*rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            let bg = gpu_get::<GfxBindGroup>(state, *rid)?;
             bgs.push(Some(bg.group.clone()));
         } else {
             bgs.push(None);
@@ -4000,23 +4026,14 @@ pub fn op_gfx_compute_dispatch_indirect(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let pipeline = state
-        .resource_table
-        .get::<GfxComputePipeline>(ResourceId::from(args.pipeline_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let pipeline = gpu_get::<GfxComputePipeline>(state, args.pipeline_rid)?;
 
-    let indirect_buf = state
-        .resource_table
-        .get::<GfxBuffer>(ResourceId::from(args.indirect_buffer_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let indirect_buf = gpu_get::<GfxBuffer>(state, args.indirect_buffer_rid)?;
 
     let mut bgs: Vec<Option<Arc<wgpu::BindGroup>>> = Vec::new();
     for rid_opt in args.bind_group_rids.iter() {
         if let Some(rid) = rid_opt {
-            let bg = state
-                .resource_table
-                .get::<GfxBindGroup>(ResourceId::from(*rid))
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            let bg = gpu_get::<GfxBindGroup>(state, *rid)?;
             bgs.push(Some(bg.group.clone()));
         } else {
             bgs.push(None);
@@ -4061,17 +4078,17 @@ pub fn op_gfx_compute_batch(
         match cmd.cmd.as_str() {
             "clear_buffer" => {
                 let buf_rid = cmd.buffer_rid.ok_or_else(|| JsErrorBox::generic("clear_buffer: missing buffer_rid"))?;
-                state.resource_table.get::<GfxBuffer>(ResourceId::from(buf_rid))
+                gpu_get::<GfxBuffer>(state, buf_rid)
                     .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
             }
             "dispatch" => {
                 let p_rid = cmd.pipeline_rid.ok_or_else(|| JsErrorBox::generic("dispatch: missing pipeline_rid"))?;
-                state.resource_table.get::<GfxComputePipeline>(ResourceId::from(p_rid))
+                gpu_get::<GfxComputePipeline>(state, p_rid)
                     .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
                 if let Some(ref rids) = cmd.bind_group_rids {
                     for rid_opt in rids.iter() {
                         if let Some(rid) = rid_opt {
-                            state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid))
+                            gpu_get::<GfxBindGroup>(state, *rid)
                                 .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
                         }
                     }
@@ -4079,15 +4096,15 @@ pub fn op_gfx_compute_batch(
             }
             "dispatch_indirect" => {
                 let p_rid = cmd.pipeline_rid.ok_or_else(|| JsErrorBox::generic("dispatch_indirect: missing pipeline_rid"))?;
-                state.resource_table.get::<GfxComputePipeline>(ResourceId::from(p_rid))
+                gpu_get::<GfxComputePipeline>(state, p_rid)
                     .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
                 let ib_rid = cmd.indirect_buffer_rid.ok_or_else(|| JsErrorBox::generic("dispatch_indirect: missing indirect_buffer_rid"))?;
-                state.resource_table.get::<GfxBuffer>(ResourceId::from(ib_rid))
+                gpu_get::<GfxBuffer>(state, ib_rid)
                     .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
                 if let Some(ref rids) = cmd.bind_group_rids {
                     for rid_opt in rids.iter() {
                         if let Some(rid) = rid_opt {
-                            state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid))
+                            gpu_get::<GfxBindGroup>(state, *rid)
                                 .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
                         }
                     }
@@ -4095,18 +4112,18 @@ pub fn op_gfx_compute_batch(
             }
             "copy_buffer_to_texture" => {
                 let buf_rid = cmd.src_buffer_rid.ok_or_else(|| JsErrorBox::generic("copy: missing src_buffer_rid"))?;
-                state.resource_table.get::<GfxBuffer>(ResourceId::from(buf_rid))
+                gpu_get::<GfxBuffer>(state, buf_rid)
                     .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
                 let tex_rid = cmd.texture_rid.ok_or_else(|| JsErrorBox::generic("copy: missing texture_rid"))?;
-                state.resource_table.get::<GfxTexture>(ResourceId::from(tex_rid))
+                gpu_get::<GfxTexture>(state, tex_rid)
                     .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
             }
             "copy_texture_to_texture" => {
                 let src_rid = cmd.src_texture_rid.ok_or_else(|| JsErrorBox::generic("copy_t2t: missing src_texture_rid"))?;
-                state.resource_table.get::<GfxTexture>(ResourceId::from(src_rid))
+                gpu_get::<GfxTexture>(state, src_rid)
                     .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
                 let dst_rid = cmd.texture_rid.ok_or_else(|| JsErrorBox::generic("copy_t2t: missing texture_rid"))?;
-                state.resource_table.get::<GfxTexture>(ResourceId::from(dst_rid))
+                gpu_get::<GfxTexture>(state, dst_rid)
                     .map_err(|e| JsErrorBox::generic(format!("batch cmd {}: {}", i, e)))?;
             }
             other => {
@@ -4123,15 +4140,15 @@ pub fn op_gfx_compute_batch(
     for cmd in args.commands.iter() {
         match cmd.cmd.as_str() {
             "clear_buffer" => {
-                let buf = state.resource_table.get::<GfxBuffer>(ResourceId::from(cmd.buffer_rid.unwrap())).unwrap();
+                let buf = gpu_get::<GfxBuffer>(state, cmd.buffer_rid.unwrap()).unwrap();
                 encoder.clear_buffer(&buf.buffer, cmd.offset.unwrap_or(0), Some(cmd.size.unwrap()));
             }
             "dispatch" => {
-                let pipeline = state.resource_table.get::<GfxComputePipeline>(ResourceId::from(cmd.pipeline_rid.unwrap())).unwrap();
+                let pipeline = gpu_get::<GfxComputePipeline>(state, cmd.pipeline_rid.unwrap()).unwrap();
 
                 // Get query set if timestamp writes provided
                 let qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
-                    state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+                    gpu_get::<GfxQuerySet>(state, tw.query_set_rid).ok()
                 });
 
                 // Build timestamp writes descriptor
@@ -4152,7 +4169,7 @@ pub fn op_gfx_compute_batch(
                 if let Some(ref rids) = cmd.bind_group_rids {
                     for (idx, rid_opt) in rids.iter().enumerate() {
                         if let Some(rid) = rid_opt {
-                            let bg = state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid)).unwrap();
+                            let bg = gpu_get::<GfxBindGroup>(state, *rid).unwrap();
                             pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
                         }
                     }
@@ -4164,12 +4181,12 @@ pub fn op_gfx_compute_batch(
                 );
             }
             "dispatch_indirect" => {
-                let pipeline = state.resource_table.get::<GfxComputePipeline>(ResourceId::from(cmd.pipeline_rid.unwrap())).unwrap();
-                let indirect_buf = state.resource_table.get::<GfxBuffer>(ResourceId::from(cmd.indirect_buffer_rid.unwrap())).unwrap();
+                let pipeline = gpu_get::<GfxComputePipeline>(state, cmd.pipeline_rid.unwrap()).unwrap();
+                let indirect_buf = gpu_get::<GfxBuffer>(state, cmd.indirect_buffer_rid.unwrap()).unwrap();
 
                 // Get query set if timestamp writes provided
                 let qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
-                    state.resource_table.get::<GfxQuerySet>(ResourceId::from(tw.query_set_rid)).ok()
+                    gpu_get::<GfxQuerySet>(state, tw.query_set_rid).ok()
                 });
 
                 // Build timestamp writes descriptor
@@ -4190,7 +4207,7 @@ pub fn op_gfx_compute_batch(
                 if let Some(ref rids) = cmd.bind_group_rids {
                     for (idx, rid_opt) in rids.iter().enumerate() {
                         if let Some(rid) = rid_opt {
-                            let bg = state.resource_table.get::<GfxBindGroup>(ResourceId::from(*rid)).unwrap();
+                            let bg = gpu_get::<GfxBindGroup>(state, *rid).unwrap();
                             pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
                         }
                     }
@@ -4198,8 +4215,8 @@ pub fn op_gfx_compute_batch(
                 pass.dispatch_workgroups_indirect(&indirect_buf.buffer, cmd.indirect_offset.unwrap_or(0));
             }
             "copy_buffer_to_texture" => {
-                let buf = state.resource_table.get::<GfxBuffer>(ResourceId::from(cmd.src_buffer_rid.unwrap())).unwrap();
-                let tex = state.resource_table.get::<GfxTexture>(ResourceId::from(cmd.texture_rid.unwrap())).unwrap();
+                let buf = gpu_get::<GfxBuffer>(state, cmd.src_buffer_rid.unwrap()).unwrap();
+                let tex = gpu_get::<GfxTexture>(state, cmd.texture_rid.unwrap()).unwrap();
                 encoder.copy_buffer_to_texture(
                     wgpu::TexelCopyBufferInfo {
                         buffer: &buf.buffer,
@@ -4227,8 +4244,8 @@ pub fn op_gfx_compute_batch(
                 );
             }
             "copy_texture_to_texture" => {
-                let src_tex = state.resource_table.get::<GfxTexture>(ResourceId::from(cmd.src_texture_rid.unwrap())).unwrap();
-                let dst_tex = state.resource_table.get::<GfxTexture>(ResourceId::from(cmd.texture_rid.unwrap())).unwrap();
+                let src_tex = gpu_get::<GfxTexture>(state, cmd.src_texture_rid.unwrap()).unwrap();
+                let dst_tex = gpu_get::<GfxTexture>(state, cmd.texture_rid.unwrap()).unwrap();
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &src_tex.texture,
@@ -4299,7 +4316,7 @@ pub fn op_gfx_device_create_query_set(
         count: desc.count,
     });
 
-    let rid = state.resource_table.add(GfxQuerySet {
+    let rid = gpu_add(state, GfxQuerySet {
         query_set,
         count: desc.count,
     });
@@ -4312,9 +4329,7 @@ pub fn op_gfx_query_set_destroy(
     state: &mut OpState,
     #[smi] query_set_rid: u32,
 ) -> Result<(), JsErrorBox> {
-    state.resource_table
-        .take::<GfxQuerySet>(ResourceId::from(query_set_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    gpu_take::<GfxQuerySet>(state, query_set_rid);
     Ok(())
 }
 
@@ -4364,20 +4379,14 @@ pub fn op_gfx_timestamp_batch(
 
     // Write timestamps
     for ts in &args.write_timestamps {
-        let qs = state.resource_table
-            .get::<GfxQuerySet>(ResourceId::from(ts.query_set_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let qs = gpu_get::<GfxQuerySet>(state, ts.query_set_rid)?;
         encoder.write_timestamp(&qs.query_set, ts.query_index);
     }
 
     // Resolve query sets to buffers
     for rq in &args.resolve_query_sets {
-        let qs = state.resource_table
-            .get::<GfxQuerySet>(ResourceId::from(rq.query_set_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-        let dest_buf = state.resource_table
-            .get::<GfxBuffer>(ResourceId::from(rq.destination_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let qs = gpu_get::<GfxQuerySet>(state, rq.query_set_rid)?;
+        let dest_buf = gpu_get::<GfxBuffer>(state, rq.destination_rid)?;
         encoder.resolve_query_set(
             &qs.query_set,
             rq.first_query..rq.first_query + rq.query_count,
@@ -4388,12 +4397,8 @@ pub fn op_gfx_timestamp_batch(
 
     // Copy buffers
     for cb in &args.copy_buffers {
-        let src_buf = state.resource_table
-            .get::<GfxBuffer>(ResourceId::from(cb.src_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-        let dst_buf = state.resource_table
-            .get::<GfxBuffer>(ResourceId::from(cb.dst_rid))
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        let src_buf = gpu_get::<GfxBuffer>(state, cb.src_rid)?;
+        let dst_buf = gpu_get::<GfxBuffer>(state, cb.dst_rid)?;
         encoder.copy_buffer_to_buffer(
             &src_buf.buffer,
             cb.src_offset,
@@ -4431,9 +4436,7 @@ pub fn op_gfx_buffer_map_async(
     #[bigint] offset: u64,
     #[bigint] size: u64,
 ) -> Result<(), JsErrorBox> {
-    let buffer = state.resource_table
-        .get::<GfxBuffer>(ResourceId::from(buffer_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?
+    let buffer = gpu_get::<GfxBuffer>(state, buffer_rid)?
         .buffer
         .clone();
 
@@ -4498,6 +4501,48 @@ pub fn op_gfx_buffer_map_poll(
     Ok(false)
 }
 
+/// Block until buffer map completes. Calls device.poll(Wait) to avoid spinning.
+#[op2(fast)]
+pub fn op_gfx_buffer_map_wait(
+    #[smi] buffer_rid: u32,
+) -> Result<(), JsErrorBox> {
+    let ctx = gfx_ctx()?;
+
+    // Check if already ready (fast path)
+    {
+        let pending = get_pending_maps().lock().unwrap();
+        if let Some(state) = pending.get(&buffer_rid) {
+            if state.ready.load(Ordering::SeqCst) {
+                let result = state.result.lock().unwrap();
+                if let Some(ref r) = *result {
+                    if r.is_err() {
+                        return Err(JsErrorBox::generic("Buffer map failed"));
+                    }
+                }
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+    }
+
+    // Block until GPU work completes
+    let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+
+    // Verify completion
+    let pending = get_pending_maps().lock().unwrap();
+    if let Some(state) = pending.get(&buffer_rid) {
+        let result = state.result.lock().unwrap();
+        if let Some(ref r) = *result {
+            if r.is_err() {
+                return Err(JsErrorBox::generic("Buffer map failed"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Finish buffer mapping - call after map_poll returns true
 #[op2(fast)]
 pub fn op_gfx_buffer_map_finish(
@@ -4517,9 +4562,7 @@ pub fn op_gfx_buffer_get_mapped_range(
     #[bigint] offset: u64,
     #[bigint] size: u64,
 ) -> Result<Vec<u8>, JsErrorBox> {
-    let buffer = state.resource_table
-        .get::<GfxBuffer>(ResourceId::from(buffer_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let buffer = gpu_get::<GfxBuffer>(state, buffer_rid)?;
 
     let slice = buffer.buffer.slice(offset..offset + size);
     let view = slice.get_mapped_range();
@@ -4534,9 +4577,7 @@ pub fn op_gfx_buffer_unmap(
     state: &mut OpState,
     #[smi] buffer_rid: u32,
 ) -> Result<(), JsErrorBox> {
-    let buffer = state.resource_table
-        .get::<GfxBuffer>(ResourceId::from(buffer_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let buffer = gpu_get::<GfxBuffer>(state, buffer_rid)?;
 
     buffer.buffer.unmap();
     Ok(())
@@ -4555,9 +4596,7 @@ pub fn op_gfx_write_timestamp(
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
 
-    let qs = state.resource_table
-        .get::<GfxQuerySet>(ResourceId::from(query_set_rid))
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let qs = gpu_get::<GfxQuerySet>(state, query_set_rid)?;
 
     let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Timestamp Write Encoder"),

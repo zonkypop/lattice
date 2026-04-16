@@ -38,7 +38,7 @@ mod sqlite;
 mod audio;
 use tokio::runtime::Handle;
 
-use deno_core::SharedArrayBufferStore;
+use deno_core::{SharedArrayBufferStore, CompiledWasmModuleStore};
 
 use input::{get_input_queue, op_input_poll_events, op_input_get_window_size, 
     op_input_request_pointer_lock, op_input_exit_pointer_lock, 
@@ -66,6 +66,36 @@ pub fn get_runtime_mode() -> RuntimeMode {
 
 pub fn set_runtime_mode(mode: RuntimeMode) {
     let _ = RUNTIME_MODE.set(mode);
+}
+
+/// Drain all currently-ready async work from the JS event loop.
+///
+/// Polls `poll_event_loop` directly (single-tick, safe to call repeatedly)
+/// with yields between ticks so tokio tasks can make progress. This allows
+/// multi-step promise chains involving async ops (e.g. fetch→parse→process)
+/// to fully resolve within a single frame rather than one step per frame.
+///
+/// Pure microtask chains (.then/.catch) resolve in a single poll. The extra
+/// iterations only matter when promises depend on async op completions.
+/// Max 8 poll-yield cycles. Stops early if the event loop reports Ready
+/// (all work done, though `device.lost = new Promise(()=>{})` keeps it Pending).
+async fn drain_event_loop(runtime: &mut deno_core::JsRuntime) {
+    let opts = deno_core::PollEventLoopOptions { wait_for_inspector: false };
+    for _ in 0..8 {
+        let done = std::future::poll_fn(|cx| {
+            match runtime.poll_event_loop(cx, opts) {
+                std::task::Poll::Ready(result) => {
+                    if let Err(e) = result {
+                        log::error!("Event loop error: {:?}", e);
+                    }
+                    std::task::Poll::Ready(true)
+                }
+                std::task::Poll::Pending => std::task::Poll::Ready(false),
+            }
+        }).await;
+        if done { break; }
+        tokio::task::yield_now().await;
+    }
 }
 
 // ======================= XR Exit Flag =======================
@@ -378,11 +408,13 @@ async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpec
     )?;
 
     let shared_array_buffer_store = SharedArrayBufferStore::default();
+    let compiled_wasm_module_store = CompiledWasmModuleStore::default();
 
     let create_web_worker_cb = create_web_worker_callback(
         module_loader.clone(),
         fs_arc.clone(),
         shared_array_buffer_store.clone(),
+        compiled_wasm_module_store.clone(),
         Handle::current(),
     );
 
@@ -409,7 +441,7 @@ async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpec
         root_cert_store_provider: Default::default(),
         fetch_dns_resolver: Default::default(),
         shared_array_buffer_store: Some(shared_array_buffer_store.clone()),
-        compiled_wasm_module_store: Default::default(),
+        compiled_wasm_module_store: Some(compiled_wasm_module_store.clone()),
         v8_code_cache: Default::default(),
         fs: fs_arc,
         bundle_provider: Default::default(),
@@ -525,19 +557,7 @@ impl ApplicationHandler for App {
                     info!("JS main executed");
                 }
                 
-                self.tokio_rt.block_on(async {
-                    tokio::select! {
-                        biased;
-                        result = worker.js_runtime.run_event_loop(deno_core::PollEventLoopOptions {
-                            wait_for_inspector: false,
-                        }) => {
-                            if let Err(e) = result {
-                                log::error!("Event loop error: {:?}", e);
-                            }
-                        }
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
-                    }
-                });
+                self.tokio_rt.block_on(drain_event_loop(&mut worker.js_runtime));
                 
             } else {
                 error!("MainWorker missing in App");
@@ -660,22 +680,7 @@ impl ApplicationHandler for App {
         }
 
         if let Some(ref mut worker) = self.worker {
-            self.tokio_rt.block_on(async {
-                tokio::select! {
-                    biased;
-                    result = worker.js_runtime.run_event_loop(deno_core::PollEventLoopOptions {
-                        wait_for_inspector: false,
-                    }) => {
-                        if let Err(e) = result {
-                            log::error!("Event loop error: {:?}", e);
-                        }
-                    }
-                    // Drain all currently-ready async work (resolved promises, completed ops)
-                    // without waiting for anything that isn't ready yet.
-                    // This matches browser behavior: process microtask checkpoint, then RAF.
-                    _ = tokio::task::yield_now() => {}
-                }
-            });
+            self.tokio_rt.block_on(drain_event_loop(&mut worker.js_runtime));
             
             let _guard = self.tokio_rt.enter();
             let result = worker.js_runtime.execute_script(
@@ -760,20 +765,9 @@ fn run_xr_mode(script_path: &str) -> Result<(), AnyError> {
             // Drain Android looper events (input queue + lifecycle) to prevent ANR
             drain_android_events();
 
-            // Drain all currently-ready async work without blocking.
-            tokio::select! {
-                biased;
-                result = worker.js_runtime.run_event_loop(deno_core::PollEventLoopOptions {
-                    wait_for_inspector: false,
-                }) => {
-                    if let Err(e) = result {
-                        error!("Event loop error: {:?}", e);
-                    }
-                }
-                _ = tokio::task::yield_now() => {}
-            }
+            drain_event_loop(&mut worker.js_runtime).await;
         }
-        
+
         Ok::<(), AnyError>(())
     })
 }

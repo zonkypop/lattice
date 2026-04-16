@@ -1,5 +1,33 @@
 // 00-globals.js - Bootstrap globals FIRST, no imports
 
+// Truncate large console output to avoid flooding the terminal
+{
+  const MAX_ARG_LENGTH = 100;
+  const TRUNCATE_SUFFIX = "\n  ... [truncated]";
+  const originalConsole = { log: console.log, warn: console.warn, error: console.error, info: console.info, debug: console.debug };
+
+  function truncateArg(arg) {
+    if (typeof arg === "string") {
+      return arg.length > MAX_ARG_LENGTH ? arg.slice(0, MAX_ARG_LENGTH) + TRUNCATE_SUFFIX : arg;
+    }
+    if (arg && typeof arg === "object") {
+      try {
+        const s = JSON.stringify(arg, null, 2);
+        if (s && s.length > MAX_ARG_LENGTH) {
+          return s.slice(0, MAX_ARG_LENGTH) + TRUNCATE_SUFFIX;
+        }
+      } catch { /* circular or non-serializable, let Deno handle it */ }
+    }
+    return arg;
+  }
+
+  for (const method of ["log", "warn", "error", "info", "debug"]) {
+    const orig = originalConsole[method];
+    if (!orig) continue;
+    console[method] = (...args) => orig.call(console, ...args.map(truncateArg));
+  }
+}
+
 // Minimal event target (inline to avoid import order issues)
 class SimpleEventTarget {
   constructor() {

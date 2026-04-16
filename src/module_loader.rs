@@ -17,7 +17,7 @@ use deno_runtime::web_worker::{WebWorker, WebWorkerOptions, WebWorkerServiceOpti
 use deno_runtime::ops::worker_host::CreateWebWorkerCb;
 use import_map::ImportMap;
 
-use deno_core::SharedArrayBufferStore;
+use deno_core::{SharedArrayBufferStore, CompiledWasmModuleStore};
 
 use tokio::runtime::Handle;
 use deno_runtime::deno_permissions::PermissionsContainer;
@@ -264,12 +264,14 @@ pub fn create_web_worker_callback(
     module_loader: ImportMapModuleLoader,
     fs: Arc<RealFs>,
     shared_array_buffer_store: SharedArrayBufferStore,
+    compiled_wasm_module_store: CompiledWasmModuleStore,
     runtime_handle: Handle,
 ) -> Arc<CreateWebWorkerCb> {
     Arc::new(move |args| {
         let module_loader = module_loader.clone();
         let fs = fs.clone();
         let shared_array_buffer_store = shared_array_buffer_store.clone();
+        let compiled_wasm_module_store = compiled_wasm_module_store.clone();
         let handle = runtime_handle.clone();
 
         let _guard = handle.enter();
@@ -293,7 +295,7 @@ pub fn create_web_worker_callback(
             npm_process_state_provider: Default::default(),
             root_cert_store_provider: Default::default(),
             shared_array_buffer_store: Some(shared_array_buffer_store),
-            compiled_wasm_module_store: Default::default(),
+            compiled_wasm_module_store: Some(compiled_wasm_module_store),
             fs,
             bundle_provider: Default::default(),
             main_inspector_session_tx: Default::default(),

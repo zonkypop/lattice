@@ -6,38 +6,157 @@ if (!ops) {
 } else {
   const defer = (fn) => Promise.resolve().then(fn);
 
-  // Serialization
-  async function serializeValue(value) {
+  // Binary-safe recursive serialization.
+  // Walks the value tree, extracts binary data into a separate blob list,
+  // and replaces them with placeholder references in a JSON-safe structure.
+  // Final layout: [4-byte LE blob count] [4-byte LE JSON length] [JSON] [blob0] [blob1] ...
+  // Each blob entry in the binary section: [4-byte LE mime length] [mime] [4-byte LE data length] [data]
+  // JSON placeholders: { "__blob__": index } or { "__binary__": index }
+
+  async function serializeValue(value, blobs) {
+    if (value instanceof Blob) {
+      const idx = blobs.length;
+      const buf = await value.arrayBuffer();
+      blobs.push({ mime: value.type || "", data: new Uint8Array(buf) });
+      return { __blob__: idx };
+    }
     if (value instanceof ArrayBuffer) {
-      return { type: "arraybuffer", data: [...new Uint8Array(value)] };
+      const idx = blobs.length;
+      blobs.push({ mime: "", data: new Uint8Array(value) });
+      return { __binary__: idx };
     }
     if (value instanceof Uint8Array) {
-      return { type: "uint8array", data: [...value] };
+      const idx = blobs.length;
+      blobs.push({ mime: "", data: value });
+      return { __binary__: idx };
     }
-    if (value instanceof Blob) {
-      const buf = await value.arrayBuffer();
-      return {
-        type: "blob",
-        data: [...new Uint8Array(buf)],
-        blobType: value.type,
-      };
+    if (ArrayBuffer.isView(value)) {
+      const idx = blobs.length;
+      blobs.push({ mime: "", data: new Uint8Array(value.buffer, value.byteOffset, value.byteLength) });
+      return { __binary__: idx };
     }
     if (Array.isArray(value)) {
-      return {
-        type: "array",
-        data: await Promise.all(value.map(serializeValue)),
-      };
+      const out = [];
+      for (let i = 0; i < value.length; i++) out.push(await serializeValue(value[i], blobs));
+      return out;
     }
     if (value && typeof value === "object") {
-      const data = {};
-      for (const k of Object.keys(value))
-        data[k] = await serializeValue(value[k]);
-      return { type: "object", data };
+      const out = {};
+      for (const k of Object.keys(value)) out[k] = await serializeValue(value[k], blobs);
+      return out;
     }
-    return { type: "json", data: value };
+    return value; // primitives pass through to JSON
   }
 
-  function deserializeValue(w) {
+  async function toBytes(value) {
+    const blobs = [];
+    const jsonVal = await serializeValue(value, blobs);
+    const jsonBytes = new TextEncoder().encode(JSON.stringify(jsonVal));
+
+    // Calculate total size
+    let blobsSize = 0;
+    for (const b of blobs) {
+      const mimeBytes = new TextEncoder().encode(b.mime);
+      blobsSize += 4 + mimeBytes.byteLength + 4 + b.data.byteLength;
+      b._mimeBytes = mimeBytes; // cache for writing
+    }
+
+    const out = new Uint8Array(4 + 4 + jsonBytes.byteLength + blobsSize);
+    const view = new DataView(out.buffer);
+    let offset = 0;
+
+    view.setUint32(offset, blobs.length, true); offset += 4;
+    view.setUint32(offset, jsonBytes.byteLength, true); offset += 4;
+    out.set(jsonBytes, offset); offset += jsonBytes.byteLength;
+
+    for (const b of blobs) {
+      view.setUint32(offset, b._mimeBytes.byteLength, true); offset += 4;
+      out.set(b._mimeBytes, offset); offset += b._mimeBytes.byteLength;
+      view.setUint32(offset, b.data.byteLength, true); offset += 4;
+      out.set(b.data, offset); offset += b.data.byteLength;
+    }
+
+    return out;
+  }
+
+  function fromBytes(bytes) {
+    if (!bytes || bytes.length < 8) return undefined;
+
+    // Check for legacy format: old format started with JSON (first byte is '{' or '[' or a digit etc.)
+    // New format starts with a 4-byte LE uint32 blob count. If byte[4..8] is a plausible JSON length
+    // and byte[0] looks like a small number, it's new format. Otherwise try legacy.
+    const firstByte = bytes[0];
+    if (firstByte === 0x7b || firstByte === 0x5b || firstByte === 0x22 ||
+        (firstByte >= 0x30 && firstByte <= 0x39) || firstByte === 0x74 ||
+        firstByte === 0x66 || firstByte === 0x6e) {
+      // Starts with { [ " 0-9 t f n — likely raw JSON (legacy)
+      return fromBytesLegacy(bytes);
+    }
+
+    try {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      let offset = 0;
+
+      const blobCount = view.getUint32(offset, true); offset += 4;
+      const jsonLen = view.getUint32(offset, true); offset += 4;
+
+      // Sanity check
+      if (offset + jsonLen > bytes.byteLength) return fromBytesLegacy(bytes);
+
+      const jsonStr = new TextDecoder().decode(bytes.subarray(offset, offset + jsonLen));
+      offset += jsonLen;
+
+      // Read blobs
+      const blobs = [];
+      for (let i = 0; i < blobCount; i++) {
+        const mimeLen = view.getUint32(offset, true); offset += 4;
+        const mime = new TextDecoder().decode(bytes.subarray(offset, offset + mimeLen));
+        offset += mimeLen;
+        const dataLen = view.getUint32(offset, true); offset += 4;
+        const data = bytes.subarray(offset, offset + dataLen);
+        offset += dataLen;
+        blobs.push({ mime, data });
+      }
+
+      const jsonVal = JSON.parse(jsonStr);
+      return deserializeValue(jsonVal, blobs);
+    } catch {
+      return fromBytesLegacy(bytes);
+    }
+  }
+
+  function deserializeValue(val, blobs) {
+    if (val === null || val === undefined) return val;
+    if (typeof val !== "object") return val;
+    if (val.__blob__ !== undefined) {
+      const b = blobs[val.__blob__];
+      return new Blob([b.data], { type: b.mime });
+    }
+    if (val.__binary__ !== undefined) {
+      const b = blobs[val.__binary__];
+      return b.data.buffer.slice(b.data.byteOffset, b.data.byteOffset + b.data.byteLength);
+    }
+    if (Array.isArray(val)) {
+      for (let i = 0; i < val.length; i++) val[i] = deserializeValue(val[i], blobs);
+      return val;
+    }
+    for (const k of Object.keys(val)) val[k] = deserializeValue(val[k], blobs);
+    return val;
+  }
+
+  function fromBytesLegacy(bytes) {
+    try {
+      const parsed = JSON.parse(new TextDecoder().decode(bytes));
+      if (parsed && parsed.type && typeof parsed.data !== "undefined") {
+        return deserializeLegacy(parsed);
+      }
+      return parsed;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function deserializeLegacy(w) {
     if (!w) return undefined;
     switch (w.type) {
       case "arraybuffer":
@@ -47,26 +166,15 @@ if (!ops) {
       case "blob":
         return new Blob([new Uint8Array(w.data)], { type: w.blobType || "" });
       case "array":
-        return w.data.map(deserializeValue);
+        return w.data.map(deserializeLegacy);
       case "object": {
         const r = {};
-        for (const k of Object.keys(w.data)) r[k] = deserializeValue(w.data[k]);
+        for (const k of Object.keys(w.data)) r[k] = deserializeLegacy(w.data[k]);
         return r;
       }
       default:
         return w.data;
     }
-  }
-
-  async function toBytes(value) {
-    return new TextEncoder().encode(
-      JSON.stringify(await serializeValue(value))
-    );
-  }
-
-  function fromBytes(bytes) {
-    if (!bytes?.length) return undefined;
-    return deserializeValue(JSON.parse(new TextDecoder().decode(bytes)));
   }
 
   // Request classes

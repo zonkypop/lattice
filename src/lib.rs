@@ -130,7 +130,6 @@ extension!(
         gfx::op_gfx_device_create_bind_group,
         gfx::op_gfx_device_create_pipeline,
         gfx::op_gfx_surface_draw,
-        gfx::op_gfx_decode_image,
         gfx::op_gfx_write_texture_image,
         gfx::op_gfx_pipeline_get_bind_group_layout,
         gfx::op_gfx_render_to_texture,
@@ -139,6 +138,9 @@ extension!(
         gfx::op_gfx_decode_image_store,
         gfx::op_gfx_upload_decoded_image_to_texture,
         gfx::op_gfx_decoded_image_drop,
+        gfx::op_gfx_decoded_image_stats,
+        gfx::op_gfx_decoded_image_stats_detailed,
+        gfx::op_gfx_resource_stats,
         gfx::op_gfx_resize_decoded_image,
         gfx::op_gfx_multi_draw_indexed_indirect,
         gfx::op_gfx_queue_submit_empty,
@@ -164,6 +166,12 @@ extension!(
         gfx::op_gfx_texture_drop,
         gfx::op_gfx_buffer_drop,
         gfx::op_gfx_bind_group_drop,
+        gfx::op_gfx_shader_drop,
+        gfx::op_gfx_sampler_drop,
+        gfx::op_gfx_bind_group_layout_drop,
+        gfx::op_gfx_pipeline_layout_drop,
+        gfx::op_gfx_pipeline_drop,
+        gfx::op_gfx_compute_pipeline_drop,
         gfx::op_gfx_flush_commands,
         gfx::op_gfx_render_xr_frame,
 
@@ -178,6 +186,7 @@ extension!(
         gfx::op_gfx_device_create_query_set,
         gfx::op_gfx_query_set_destroy,
         gfx::op_gfx_has_timestamp_query,
+        gfx::op_gfx_has_feature,
         gfx::op_gfx_get_timestamp_period,
         gfx::op_gfx_timestamp_batch,
         gfx::op_gfx_buffer_map_async,
@@ -310,6 +319,15 @@ impl GpuState {
         if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
             features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
             info!("Enabling TIMESTAMP_QUERY_INSIDE_ENCODERS feature");
+        }
+        // Compressed texture formats (BC7 for desktop, ASTC for mobile/Apple Silicon)
+        if adapter_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
+            features |= wgpu::Features::TEXTURE_COMPRESSION_BC;
+            info!("Enabling TEXTURE_COMPRESSION_BC feature");
+        }
+        if adapter_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) {
+            features |= wgpu::Features::TEXTURE_COMPRESSION_ASTC;
+            info!("Enabling TEXTURE_COMPRESSION_ASTC feature");
         }
 
         let (device, queue) = adapter
@@ -458,7 +476,10 @@ async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpec
         ],
         skip_op_registration: false,
         startup_snapshot: None,
-        create_params: None,
+        create_params: Some(
+            deno_core::v8::CreateParams::default()
+                .heap_limits(0, 4 * 1024 * 1024 * 1024) // 4GB max heap (matches browser)
+        ),
         unsafely_ignore_certificate_errors: None,
         seed: None,
         create_web_worker_cb,
@@ -777,14 +798,26 @@ fn run_xr_mode(script_path: &str) -> Result<(), AnyError> {
 #[cfg(not(target_os = "android"))]
 pub fn main() -> Result<(), AnyError> {
     env_logger::init();
-    
+
+    // Set V8 heap limit before any isolate is created
+    deno_core::v8::V8::set_flags_from_string("--max-old-space-size=4096");
+
     // Parse command line args
     let args: Vec<String> = std::env::args().collect();
     let xr_mode = args.iter().any(|a| a == "--xr");
+    let clear_db = args.iter().any(|a| a == "--clear-db");
     let script_path = args.iter()
         .find(|a| !a.starts_with('-') && *a != &args[0])
         .map(|s| s.as_str())
         .unwrap_or("js/entry.js");
+
+    if clear_db {
+        let db_dir = std::env::current_dir().unwrap_or_default().join("data").join("indexeddb");
+        if db_dir.exists() {
+            info!("Clearing IndexedDB at {:?}", db_dir);
+            std::fs::remove_dir_all(&db_dir).ok();
+        }
+    }
     
     rustls::crypto::ring::default_provider()
         .install_default()

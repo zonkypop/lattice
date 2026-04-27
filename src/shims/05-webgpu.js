@@ -4,39 +4,36 @@ const gfx = globalThis.__gfx;
 if (!gfx) {
   console.log("[shims] WebGPU skipped (no native ops)");
 } else {
-  // Op timing profiler (disabled by default, enable via globalThis.__opTiming.enabled = true)
-  const opTiming = {
-    enabled: false,
-    times: {},
-    counts: {},
-    frameCount: 0,
-    LOG_INTERVAL: 200,
-    track(name, fn) {
-      if (!this.enabled) return fn();
-      const t0 = performance.now();
-      const result = fn();
-      const elapsed = performance.now() - t0;
-      this.times[name] = (this.times[name] || 0) + elapsed;
-      this.counts[name] = (this.counts[name] || 0) + 1;
-      return result;
-    },
-    endFrame() {
-      if (!this.enabled) return;
-      this.frameCount++;
-      if (this.frameCount >= this.LOG_INTERVAL) {
-        const entries = Object.entries(this.times)
-          .map(([name, total]) => ({ name, total, count: this.counts[name], avg: total / this.frameCount }))
-          .sort((a, b) => b.total - a.total)
-          .slice(0, 5);
-        const summary = entries.map(e => `${e.name}: ${e.avg.toFixed(2)}ms (${e.count}x)`).join(', ');
-        console.log(`[OpTiming] ${summary}`);
-        this.times = {};
-        this.counts = {};
-        this.frameCount = 0;
-      }
+  // GC-attached cleanup for GPU resources that lack explicit destroy() in the WebGPU spec.
+  // When JS drops all references to a resource wrapper, the FinalizationRegistry
+  // callback fires and releases the Rust-side resource from the ResourceTable.
+  // The held value is { rid, dropFn } — no reference to the original object,
+  // so the weak ref in FinalizationRegistry can actually be collected.
+  const _gpuRegistry = new FinalizationRegistry(({ rid, dropFn }) => {
+    try {
+      dropFn(rid);
+    } catch (_) {
+      /* resource may already be gone */
     }
-  };
-  globalThis.__opTiming = opTiming;
+  });
+
+  // Helper: register a plain { __rid } object for GC-based cleanup.
+  // If the caller also calls destroy() explicitly, we unregister to avoid
+  // a double-drop when GC eventually fires.
+  function _trackGpuResource(obj, dropFn) {
+    const rid = obj.__rid;
+    _gpuRegistry.register(obj, { rid, dropFn }, obj);
+    // Attach a destroy() so explicit cleanup is still possible
+    obj.destroy = function () {
+      if (this.__rid != null) {
+        _gpuRegistry.unregister(this);
+        dropFn(this.__rid);
+        this.__rid = null;
+      }
+    };
+    return obj;
+  }
+
   // Enums
   globalThis.GPUBufferUsage = {
     MAP_READ: 1,
@@ -187,7 +184,12 @@ if (!gfx) {
       this._pendingDrawCalls.push(...calls);
     }
 
-    __submitFrame(timestampWrites, resolveQueries, copyBuffers, computeCommands) {
+    __submitFrame(
+      timestampWrites,
+      resolveQueries,
+      copyBuffers,
+      computeCommands
+    ) {
       if (this._frameSubmitted || globalThis.__xrMode) {
         this._pendingDrawCalls = [];
         this._frameSubmitted = true;
@@ -278,15 +280,7 @@ if (!gfx) {
         base_array_layer: viewDesc.baseArrayLayer ?? null,
         array_layer_count: viewDesc.arrayLayerCount ?? null,
       });
-      return {
-        __rid: v.rid,
-        destroy() {
-          if (this.__rid != null) {
-            gfx.op_gfx_resource_drop(this.__rid);
-            this.__rid = null;
-          }
-        },
-      };
+      return _trackGpuResource({ __rid: v.rid }, gfx.op_gfx_resource_drop);
     }
 
     destroy() {
@@ -443,9 +437,13 @@ if (!gfx) {
     }
 
     setViewport() {}
-    setScissorRect(x, y, w, h) { this._scissorRect = [x >>> 0, y >>> 0, w >>> 0, h >>> 0]; }
+    setScissorRect(x, y, w, h) {
+      this._scissorRect = [x >>> 0, y >>> 0, w >>> 0, h >>> 0];
+    }
     setBlendConstant() {}
-    setStencilReference(ref) { this._stencilReference = ref; }
+    setStencilReference(ref) {
+      this._stencilReference = ref;
+    }
     beginOcclusionQuery() {}
     endOcclusionQuery() {}
 
@@ -820,7 +818,13 @@ if (!gfx) {
       }
     }
 
-    resolveQuerySet(querySet, firstQuery, queryCount, destination, destinationOffset) {
+    resolveQuerySet(
+      querySet,
+      firstQuery,
+      queryCount,
+      destination,
+      destinationOffset
+    ) {
       if (!querySet?.__rid || !destination?.__rid) return;
       this._resolveQueries.push({
         query_set_rid: querySet.__rid,
@@ -831,7 +835,13 @@ if (!gfx) {
       });
     }
 
-    copyBufferToBuffer(source, sourceOffset, destination, destinationOffset, size) {
+    copyBufferToBuffer(
+      source,
+      sourceOffset,
+      destination,
+      destinationOffset,
+      size
+    ) {
       if (!source?.__rid || !destination?.__rid) return;
       this._copyBuffers.push({
         src_rid: source.__rid,
@@ -938,15 +948,20 @@ if (!gfx) {
             copy_buffers: this._copyBuffers,
           });
         }
-        opTiming.endFrame();
       } else if (hasRenderFrame) {
         // Build render pass timestamp writes from encoder-level writeTimestamp calls.
         // These get passed to the native render pass for accurate GPU execution timing.
         let renderTimestampWrites = null;
         if (this._timestampWrites.length >= 2) {
-          const startTs = this._timestampWrites.find((t) => t.query_index === 0);
+          const startTs = this._timestampWrites.find(
+            (t) => t.query_index === 0
+          );
           const endTs = this._timestampWrites.find((t) => t.query_index === 1);
-          if (startTs && endTs && startTs.query_set_rid === endTs.query_set_rid) {
+          if (
+            startTs &&
+            endTs &&
+            startTs.query_set_rid === endTs.query_set_rid
+          ) {
             renderTimestampWrites = {
               query_set_rid: startTs.query_set_rid,
               beginning_of_pass_write_index: 0,
@@ -1038,7 +1053,7 @@ if (!gfx) {
       if (this._mapState !== "unmapped") {
         throw new Error("Buffer already mapped or mapping pending");
       }
-      const mapSize = size ?? (this.byteLength - offset);
+      const mapSize = size ?? this.byteLength - offset;
       this._mapState = "pending";
       try {
         // Start the async map operation (non-blocking)
@@ -1066,7 +1081,7 @@ if (!gfx) {
         throw new Error("Buffer is not mapped");
       }
       const actualOffset = this._mappedOffset + offset;
-      const actualSize = size ?? (this._mappedSize - offset);
+      const actualSize = size ?? this._mappedSize - offset;
       // Get the data from native
       const data = gfx.op_gfx_buffer_get_mapped_range(
         this.__rid,
@@ -1135,6 +1150,15 @@ if (!gfx) {
           timestampPeriod = gfx.op_gfx_get_timestamp_period();
           console.log("[shims] Timestamp period (ns/tick):", timestampPeriod);
         }
+        // Compressed texture features
+        if (gfx.op_gfx_has_feature("texture-compression-bc")) {
+          availableFeatures.push("texture-compression-bc");
+          console.log("[shims] texture-compression-bc available");
+        }
+        if (gfx.op_gfx_has_feature("texture-compression-astc")) {
+          availableFeatures.push("texture-compression-astc");
+          console.log("[shims] texture-compression-astc available");
+        }
       } catch (e) {
         console.log("[shims] Feature check error:", e.message);
         // Feature check not available yet (before gfx context init)
@@ -1168,12 +1192,11 @@ if (!gfx) {
             lost: new Promise(() => {}),
 
             createShaderModule(desc) {
-              return {
-                __rid: gfx.op_gfx_device_create_shader({
-                  code: desc.code,
-                  label: desc.label ?? null,
-                }).rid,
-              };
+              const rid = gfx.op_gfx_device_create_shader({
+                code: desc.code,
+                label: desc.label ?? null,
+              }).rid;
+              return _trackGpuResource({ __rid: rid }, gfx.op_gfx_shader_drop);
             },
 
             createRenderPipeline(desc) {
@@ -1210,31 +1233,41 @@ if (!gfx) {
                 stencil_front_compare: depth?.stencilFront?.compare ?? null,
                 stencil_front_pass_op: depth?.stencilFront?.passOp ?? null,
                 stencil_front_fail_op: depth?.stencilFront?.failOp ?? null,
-                stencil_front_depth_fail_op: depth?.stencilFront?.depthFailOp ?? null,
+                stencil_front_depth_fail_op:
+                  depth?.stencilFront?.depthFailOp ?? null,
                 stencil_back_compare: depth?.stencilBack?.compare ?? null,
                 stencil_back_pass_op: depth?.stencilBack?.passOp ?? null,
                 stencil_back_fail_op: depth?.stencilBack?.failOp ?? null,
-                stencil_back_depth_fail_op: depth?.stencilBack?.depthFailOp ?? null,
+                stencil_back_depth_fail_op:
+                  depth?.stencilBack?.depthFailOp ?? null,
                 stencil_read_mask: depth?.stencilReadMask ?? null,
                 stencil_write_mask: depth?.stencilWriteMask ?? null,
                 color_format: desc.fragment?.targets?.[0]?.format ?? null,
-                color_write_mask: desc.fragment?.targets?.[0]?.writeMask ?? null,
+                color_write_mask:
+                  desc.fragment?.targets?.[0]?.writeMask ?? null,
                 sample_count: desc.multisample?.count ?? 1,
                 alpha_to_coverage_enabled:
                   desc.multisample?.alphaToCoverageEnabled ?? false,
               }).rid;
 
-              return {
-                __rid: rid,
-                getBindGroupLayout(index) {
-                  return {
-                    __rid: gfx.op_gfx_pipeline_get_bind_group_layout({
-                      pipeline_rid: rid,
-                      index: index >>> 0,
-                    }).rid,
-                  };
+              return _trackGpuResource(
+                {
+                  __rid: rid,
+                  getBindGroupLayout(index) {
+                    const layoutRid = gfx.op_gfx_pipeline_get_bind_group_layout(
+                      {
+                        pipeline_rid: rid,
+                        index: index >>> 0,
+                      }
+                    ).rid;
+                    return _trackGpuResource(
+                      { __rid: layoutRid },
+                      gfx.op_gfx_bind_group_layout_drop
+                    );
+                  },
                 },
-              };
+                gfx.op_gfx_pipeline_drop
+              );
             },
 
             createComputePipeline(desc) {
@@ -1245,18 +1278,24 @@ if (!gfx) {
                   desc.layout === "auto" ? null : desc.layout?.__rid ?? null,
               }).rid;
 
-              return {
-                __rid: rid,
-                __isComputePipeline: true,
-                getBindGroupLayout(index) {
-                  return {
-                    __rid: gfx.op_gfx_compute_pipeline_get_bind_group_layout({
-                      pipeline_rid: rid,
-                      index: index >>> 0,
-                    }).rid,
-                  };
+              return _trackGpuResource(
+                {
+                  __rid: rid,
+                  __isComputePipeline: true,
+                  getBindGroupLayout(index) {
+                    const layoutRid =
+                      gfx.op_gfx_compute_pipeline_get_bind_group_layout({
+                        pipeline_rid: rid,
+                        index: index >>> 0,
+                      }).rid;
+                    return _trackGpuResource(
+                      { __rid: layoutRid },
+                      gfx.op_gfx_bind_group_layout_drop
+                    );
+                  },
                 },
-              };
+                gfx.op_gfx_compute_pipeline_drop
+              );
             },
 
             async createComputePipelineAsync(desc) {
@@ -1275,7 +1314,10 @@ if (!gfx) {
                 label: options.label ?? null,
               }).rid;
               // Use MappableBuffer for buffers with MAP_READ or MAP_WRITE usage
-              if (usage & (GPUBufferUsage.MAP_READ | GPUBufferUsage.MAP_WRITE)) {
+              if (
+                usage &
+                (GPUBufferUsage.MAP_READ | GPUBufferUsage.MAP_WRITE)
+              ) {
                 return new MappableBuffer(rid, size, usage);
               }
               return {
@@ -1295,10 +1337,19 @@ if (!gfx) {
             // avoiding the EmulatedBuffer double-copy (JS alloc + set + unmap).
             createBufferWithData(data, usage) {
               const u = usage >>> 0;
-              const bytes = data instanceof Uint8Array
-                ? data
-                : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-              const rid = gfx.op_gfx_device_create_buffer_init(u, null, bytes).rid;
+              const bytes =
+                data instanceof Uint8Array
+                  ? data
+                  : new Uint8Array(
+                      data.buffer,
+                      data.byteOffset,
+                      data.byteLength
+                    );
+              const rid = gfx.op_gfx_device_create_buffer_init(
+                u,
+                null,
+                bytes
+              ).rid;
               return {
                 __rid: rid,
                 byteLength: bytes.byteLength,
@@ -1326,7 +1377,7 @@ if (!gfx) {
                 sample_count: (desc.sampleCount ?? 1) >>> 0,
                 dimension: desc.dimension || "2d",
                 format: desc.format,
-                usage: (desc.usage >>> 0),
+                usage: desc.usage >>> 0,
                 view_formats: desc.viewFormats || [],
               };
               return new EmulatedTexture(
@@ -1336,19 +1387,20 @@ if (!gfx) {
             },
 
             createSampler(desc = {}) {
-              return {
-                __rid: gfx.op_gfx_device_create_sampler({
-                  label: desc.label ?? null,
-                  mag_filter: desc.magFilter || null,
-                  min_filter: desc.minFilter || null,
-                  mipmap_filter: desc.mipmapFilter || null,
-                  address_mode_u: desc.addressModeU || null,
-                  address_mode_v: desc.addressModeV || null,
-                  address_mode_w: desc.addressModeW || null,
-                  compare: desc.compare || null,
-                }).rid,
-                __isSampler: true,
-              };
+              const rid = gfx.op_gfx_device_create_sampler({
+                label: desc.label ?? null,
+                mag_filter: desc.magFilter || null,
+                min_filter: desc.minFilter || null,
+                mipmap_filter: desc.mipmapFilter || null,
+                address_mode_u: desc.addressModeU || null,
+                address_mode_v: desc.addressModeV || null,
+                address_mode_w: desc.addressModeW || null,
+                compare: desc.compare || null,
+              }).rid;
+              return _trackGpuResource(
+                { __rid: rid, __isSampler: true },
+                gfx.op_gfx_sampler_drop
+              );
             },
 
             createBindGroupLayout(desc) {
@@ -1378,24 +1430,28 @@ if (!gfx) {
                     }
                   : null,
               }));
-              return {
-                __rid: gfx.op_gfx_device_create_bind_group_layout({
-                  label: desc.label ?? null,
-                  entries,
-                }).rid,
-              };
+              const rid = gfx.op_gfx_device_create_bind_group_layout({
+                label: desc.label ?? null,
+                entries,
+              }).rid;
+              return _trackGpuResource(
+                { __rid: rid },
+                gfx.op_gfx_bind_group_layout_drop
+              );
             },
 
             createPipelineLayout(desc) {
               const layoutRids = (desc.bindGroupLayouts || []).map(
                 (l) => l.__rid
               );
-              return {
-                __rid: gfx.op_gfx_device_create_pipeline_layout({
-                  label: desc.label ?? null,
-                  layout_rids: layoutRids,
-                }).rid,
-              };
+              const rid = gfx.op_gfx_device_create_pipeline_layout({
+                label: desc.label ?? null,
+                layout_rids: layoutRids,
+              }).rid;
+              return _trackGpuResource(
+                { __rid: rid },
+                gfx.op_gfx_pipeline_layout_drop
+              );
             },
 
             createBindGroup(desc) {
@@ -1425,19 +1481,14 @@ if (!gfx) {
                 };
               });
               const rid = gfx.op_gfx_device_create_bind_group({
-                  label: desc.label ?? null,
-                  layout_rid: desc.layout.__rid,
-                  entries,
-                }).rid;
-              return {
-                __rid: rid,
-                destroy() {
-                  if (this.__rid != null) {
-                    gfx.op_gfx_bind_group_drop(this.__rid);
-                    this.__rid = null;
-                  }
-                },
-              };
+                label: desc.label ?? null,
+                layout_rid: desc.layout.__rid,
+                entries,
+              }).rid;
+              return _trackGpuResource(
+                { __rid: rid },
+                gfx.op_gfx_bind_group_drop
+              );
             },
 
             createQuerySet(desc) {
@@ -1448,7 +1499,11 @@ if (!gfx) {
                     query_type: desc.type,
                     count: desc.count >>> 0,
                   });
-                  return new EmulatedQuerySet(result.rid, desc.type, desc.count);
+                  return new EmulatedQuerySet(
+                    result.rid,
+                    desc.type,
+                    desc.count
+                  );
                 } catch (e) {
                   console.warn("Failed to create timestamp query set:", e);
                   // Fall back to stub
@@ -1539,25 +1594,35 @@ if (!gfx) {
                 const dst = dstOffset >>> 0;
 
                 // Fast path: Uint8Array with no sub-range, pass directly
-                if (data instanceof Uint8Array && dataOffset === 0 && size == null) {
+                if (
+                  data instanceof Uint8Array &&
+                  dataOffset === 0 &&
+                  size == null
+                ) {
                   gfx.op_gfx_queue_write_buffer(rid, dst, data);
                   return;
                 }
 
                 let bytes;
-                if (data instanceof ArrayBuffer || data instanceof SharedArrayBuffer) {
+                if (
+                  data instanceof ArrayBuffer ||
+                  data instanceof SharedArrayBuffer
+                ) {
                   const off = dataOffset >>> 0;
-                  const len = size != null
-                    ? size >>> 0
-                    : data.byteLength - off;
+                  const len = size != null ? size >>> 0 : data.byteLength - off;
                   bytes = new Uint8Array(data, off, len);
                 } else if (ArrayBuffer.isView(data)) {
                   const elemSize = data.BYTES_PER_ELEMENT || 1;
                   const off = (dataOffset >>> 0) * elemSize;
-                  const len = size != null
-                    ? (size >>> 0) * elemSize
-                    : data.byteLength - off;
-                  bytes = new Uint8Array(data.buffer, data.byteOffset + off, len);
+                  const len =
+                    size != null
+                      ? (size >>> 0) * elemSize
+                      : data.byteLength - off;
+                  bytes = new Uint8Array(
+                    data.buffer,
+                    data.byteOffset + off,
+                    len
+                  );
                 } else {
                   throw new Error(`writeBuffer: unsupported data type`);
                 }
@@ -1595,6 +1660,8 @@ if (!gfx) {
                   dest.origin?.y ?? dest.origin?.[1] ?? 0,
                   dest.origin?.z ?? dest.origin?.[2] ?? 0,
                   dest.mipLevel ?? 0,
+                  layout?.bytesPerRow ?? 0,
+                  layout?.rowsPerImage ?? 0,
                   bytes
                 );
               },

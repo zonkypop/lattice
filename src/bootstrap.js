@@ -19,7 +19,6 @@ import {
   op_gfx_device_create_bind_group,
   op_gfx_device_create_pipeline,
   op_gfx_surface_draw,
-  op_gfx_decode_image,
   op_gfx_write_texture_image,
   op_gfx_pipeline_get_bind_group_layout,
   op_gfx_render_to_texture,
@@ -28,6 +27,9 @@ import {
   op_gfx_decode_image_store,
   op_gfx_upload_decoded_image_to_texture,
   op_gfx_decoded_image_drop,
+  op_gfx_decoded_image_stats,
+  op_gfx_decoded_image_stats_detailed,
+  op_gfx_resource_stats,
   op_gfx_resize_decoded_image,
   op_gfx_render_depth_only,
   op_gfx_resource_drop,
@@ -59,6 +61,7 @@ import {
   op_gfx_buffer_get_mapped_range,
   op_gfx_buffer_unmap,
   op_gfx_write_timestamp,
+  op_gfx_has_feature,
 
   // Input ops
   op_input_poll_events,
@@ -182,7 +185,6 @@ globalThis.__gfx = {
   op_gfx_device_create_bind_group,
   op_gfx_device_create_pipeline,
   op_gfx_surface_draw,
-  op_gfx_decode_image,
   op_gfx_write_texture_image,
   op_gfx_pipeline_get_bind_group_layout,
   op_gfx_render_to_texture,
@@ -191,6 +193,9 @@ globalThis.__gfx = {
   op_gfx_decode_image_store,
   op_gfx_upload_decoded_image_to_texture,
   op_gfx_decoded_image_drop,
+  op_gfx_decoded_image_stats,
+  op_gfx_decoded_image_stats_detailed,
+  op_gfx_resource_stats,
   op_gfx_resize_decoded_image,
   op_gfx_render_depth_only,
   op_gfx_resource_drop,
@@ -222,6 +227,7 @@ globalThis.__gfx = {
   op_gfx_buffer_get_mapped_range,
   op_gfx_buffer_unmap,
   op_gfx_write_timestamp,
+  op_gfx_has_feature,
 };
 
 // Expose audio ops to globalThis

@@ -1,32 +1,5 @@
 // 00-globals.js - Bootstrap globals FIRST, no imports
 
-// Truncate large console output to avoid flooding the terminal
-{
-  const MAX_ARG_LENGTH = 100;
-  const TRUNCATE_SUFFIX = "\n  ... [truncated]";
-  const originalConsole = { log: console.log, warn: console.warn, error: console.error, info: console.info, debug: console.debug };
-
-  function truncateArg(arg) {
-    if (typeof arg === "string") {
-      return arg.length > MAX_ARG_LENGTH ? arg.slice(0, MAX_ARG_LENGTH) + TRUNCATE_SUFFIX : arg;
-    }
-    if (arg && typeof arg === "object") {
-      try {
-        const s = JSON.stringify(arg, null, 2);
-        if (s && s.length > MAX_ARG_LENGTH) {
-          return s.slice(0, MAX_ARG_LENGTH) + TRUNCATE_SUFFIX;
-        }
-      } catch { /* circular or non-serializable, let Deno handle it */ }
-    }
-    return arg;
-  }
-
-  for (const method of ["log", "warn", "error", "info", "debug"]) {
-    const orig = originalConsole[method];
-    if (!orig) continue;
-    console[method] = (...args) => orig.call(console, ...args.map(truncateArg));
-  }
-}
 
 // Minimal event target (inline to avoid import order issues)
 class SimpleEventTarget {
@@ -90,6 +63,24 @@ globalThis.window = new Proxy(windowTarget, {
 
 globalThis.self ??= globalThis;
 globalThis.devicePixelRatio = 1;
+
+// ImageData polyfill (used by texture workers for RGBA pixel buffers)
+if (typeof ImageData === "undefined") {
+  globalThis.ImageData = class ImageData {
+    constructor(dataOrWidth, widthOrHeight, heightOrUndefined) {
+      if (dataOrWidth instanceof Uint8ClampedArray) {
+        this.data = dataOrWidth;
+        this.width = widthOrHeight;
+        this.height =
+          heightOrUndefined ?? (dataOrWidth.length / 4 / widthOrHeight) | 0;
+      } else {
+        this.width = dataOrWidth;
+        this.height = widthOrHeight;
+        this.data = new Uint8ClampedArray(this.width * this.height * 4);
+      }
+    }
+  };
+}
 globalThis.performance ??= { now: () => Date.now() };
 
 // RAF system

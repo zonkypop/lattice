@@ -5,7 +5,7 @@ use deno_error::JsErrorBox;
 use image::{GenericImageView, DynamicImage};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
-use std::{iter};
+
 use wgpu::util::DeviceExt;
 
 use std::sync::Mutex;
@@ -130,6 +130,8 @@ impl Resource for GfxQuerySet {}
 pub struct GpuIdMap {
     next_id: u32,
     map: HashMap<u32, u32>, // monotonic_id -> resource_table_id
+    created_total: u32,
+    dropped_total: u32,
 }
 
 impl GpuIdMap {
@@ -137,6 +139,8 @@ impl GpuIdMap {
         Self {
             next_id: 1,
             map: HashMap::new(),
+            created_total: 0,
+            dropped_total: 0,
         }
     }
 
@@ -144,6 +148,7 @@ impl GpuIdMap {
         let id = self.next_id;
         self.next_id += 1;
         self.map.insert(id, u32::from(resource_table_rid));
+        self.created_total += 1;
         id
     }
 
@@ -152,7 +157,16 @@ impl GpuIdMap {
     }
 
     fn remove(&mut self, monotonic_id: u32) -> Option<ResourceId> {
+        self.dropped_total += 1;
         self.map.remove(&monotonic_id).map(|rid| ResourceId::from(rid))
+    }
+
+    pub fn alive_count(&self) -> u32 {
+        self.map.len() as u32
+    }
+
+    pub fn stats(&self) -> (u32, u32, u32) {
+        (self.alive_count(), self.created_total, self.dropped_total)
     }
 }
 
@@ -213,11 +227,6 @@ fn bytes_per_pixel(format: wgpu::TextureFormat) -> Option<u32> {
         // Compressed formats - can't use write_texture with raw pixels
         _ => None,
     }
-}
-
-/// Get the texture format from a GfxTexture resource
-fn get_texture_format(texture: &wgpu::Texture) -> wgpu::TextureFormat {
-    texture.format()
 }
 
 fn map_shader_visibility(mask: u32) -> wgpu::ShaderStages {
@@ -307,7 +316,50 @@ pub fn map_texture_format(fmt: &str) -> wgpu::TextureFormat {
         "depth24plus" => wgpu::TextureFormat::Depth24Plus,
         "depth24plus-stencil8" => wgpu::TextureFormat::Depth24PlusStencil8,
         "depth32float" => wgpu::TextureFormat::Depth32Float,
+        // BC compressed formats
+        "bc1-rgba-unorm" => wgpu::TextureFormat::Bc1RgbaUnorm,
+        "bc1-rgba-unorm-srgb" => wgpu::TextureFormat::Bc1RgbaUnormSrgb,
+        "bc2-rgba-unorm" => wgpu::TextureFormat::Bc2RgbaUnorm,
+        "bc2-rgba-unorm-srgb" => wgpu::TextureFormat::Bc2RgbaUnormSrgb,
+        "bc3-rgba-unorm" => wgpu::TextureFormat::Bc3RgbaUnorm,
+        "bc3-rgba-unorm-srgb" => wgpu::TextureFormat::Bc3RgbaUnormSrgb,
+        "bc4-r-unorm" => wgpu::TextureFormat::Bc4RUnorm,
+        "bc4-r-snorm" => wgpu::TextureFormat::Bc4RSnorm,
+        "bc5-rg-unorm" => wgpu::TextureFormat::Bc5RgUnorm,
+        "bc5-rg-snorm" => wgpu::TextureFormat::Bc5RgSnorm,
+        "bc6h-rgb-ufloat" => wgpu::TextureFormat::Bc6hRgbUfloat,
+        "bc6h-rgb-float" => wgpu::TextureFormat::Bc6hRgbFloat,
+        "bc7-rgba-unorm" => wgpu::TextureFormat::Bc7RgbaUnorm,
+        "bc7-rgba-unorm-srgb" => wgpu::TextureFormat::Bc7RgbaUnormSrgb,
+        // ASTC compressed formats (4x4 block)
+        "astc-4x4-unorm" => wgpu::TextureFormat::Astc { block: wgpu::AstcBlock::B4x4, channel: wgpu::AstcChannel::Unorm },
+        "astc-4x4-unorm-srgb" => wgpu::TextureFormat::Astc { block: wgpu::AstcBlock::B4x4, channel: wgpu::AstcChannel::UnormSrgb },
         _ => wgpu::TextureFormat::Rgba8Unorm,
+    }
+}
+
+/// Block dimensions and bytes-per-block for compressed texture formats.
+fn compressed_block_info(format: wgpu::TextureFormat) -> Option<(u32, u32, u32)> {
+    use wgpu::TextureFormat::*;
+    match format {
+        Bc1RgbaUnorm | Bc1RgbaUnormSrgb | Bc4RUnorm | Bc4RSnorm => Some((4, 4, 8)),
+        Bc2RgbaUnorm | Bc2RgbaUnormSrgb |
+        Bc3RgbaUnorm | Bc3RgbaUnormSrgb |
+        Bc5RgUnorm | Bc5RgSnorm |
+        Bc6hRgbUfloat | Bc6hRgbFloat |
+        Bc7RgbaUnorm | Bc7RgbaUnormSrgb => Some((4, 4, 16)),
+        Astc { block, .. } => {
+            use wgpu::AstcBlock::*;
+            let (bw, bh) = match block {
+                B4x4 => (4, 4), B5x4 => (5, 4), B5x5 => (5, 5),
+                B6x5 => (6, 5), B6x6 => (6, 6), B8x5 => (8, 5),
+                B8x6 => (8, 6), B8x8 => (8, 8), B10x5 => (10, 5),
+                B10x6 => (10, 6), B10x8 => (10, 8), B10x10 => (10, 10),
+                B12x10 => (12, 10), B12x12 => (12, 12),
+            };
+            Some((bw, bh, 16))
+        }
+        _ => None,
     }
 }
 
@@ -1045,14 +1097,6 @@ pub struct CopyBufferDesc {
     pub size: u64,
 }
 
-#[derive(Serialize)]
-pub struct DecodeImageResult {
-    pub width: u32,
-    pub height: u32,
-    pub data: Vec<u8>,
-    pub error: Option<String>,
-}
-
 #[derive(Deserialize)]
 pub struct GetBindGroupLayoutArgs {
     pub pipeline_rid: u32,
@@ -1712,6 +1756,77 @@ pub fn op_gfx_decoded_image_drop(
     Ok(())
 }
 
+#[derive(Serialize)]
+pub struct DecodedImageStats {
+    pub count: u32,
+    pub total_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct DecodedImageEntry {
+    pub rid: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct DecodedImageDetailedStats {
+    pub count: u32,
+    pub total_bytes: u64,
+    pub images: Vec<DecodedImageEntry>,
+}
+
+#[op2]
+#[serde]
+pub fn op_gfx_decoded_image_stats() -> Result<DecodedImageStats, JsErrorBox> {
+    let store = get_decoded_image_store()
+        .lock()
+        .map_err(|e| JsErrorBox::generic(format!("Failed to lock image store: {}", e)))?;
+
+    let count = store.len() as u32;
+    let total_bytes: u64 = store.values().map(|img| img.pixels.len() as u64).sum();
+
+    Ok(DecodedImageStats { count, total_bytes })
+}
+
+#[op2]
+#[serde]
+pub fn op_gfx_decoded_image_stats_detailed() -> Result<DecodedImageDetailedStats, JsErrorBox> {
+    let store = get_decoded_image_store()
+        .lock()
+        .map_err(|e| JsErrorBox::generic(format!("Failed to lock image store: {}", e)))?;
+
+    let count = store.len() as u32;
+    let total_bytes: u64 = store.values().map(|img| img.pixels.len() as u64).sum();
+
+    let mut images: Vec<DecodedImageEntry> = store.iter().map(|(&rid, img)| {
+        DecodedImageEntry {
+            rid,
+            width: img.width,
+            height: img.height,
+            bytes: img.pixels.len() as u64,
+        }
+    }).collect();
+    // Sort largest first
+    images.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+
+    Ok(DecodedImageDetailedStats { count, total_bytes, images })
+}
+
+#[derive(Serialize)]
+pub struct GpuResourceStats {
+    pub alive: u32,
+    pub created_total: u32,
+    pub dropped_total: u32,
+}
+
+#[op2]
+#[serde]
+pub fn op_gfx_resource_stats(state: &mut OpState) -> GpuResourceStats {
+    let (alive, created, dropped) = state.borrow::<GpuIdMap>().stats();
+    GpuResourceStats { alive, created_total: created, dropped_total: dropped }
+}
 
 #[op2]
 #[string]
@@ -1817,13 +1932,6 @@ pub fn op_gfx_queue_write_buffer(
     let buffer = gpu_get::<GfxBuffer>(state, buffer_rid)?;
 
     let bytes: &[u8] = &data;
-    
-    // Debug: log first 16 floats if buffer is large enough
-    if bytes.len() >= 64 {
-        let floats: &[f32] = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, 16.min(bytes.len() / 4))
-        };
-    }
 
     ctx.queue
         .write_buffer(&buffer.buffer, dst_offset as u64, bytes);
@@ -1873,7 +1981,6 @@ pub fn op_gfx_device_create_texture(
         .iter()
         .map(|f| map_texture_format(f))
         .collect();
-    let error_guard = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
         label: desc.label.as_deref(),
         size: wgpu::Extent3d {
@@ -1888,12 +1995,6 @@ pub fn op_gfx_device_create_texture(
         usage,
         view_formats: &mapped_view_formats,
     });
-    let maybe_err = pollster::block_on(error_guard.pop());
-    if let Some(err) = maybe_err {
-        eprintln!("[TEX-DIAG] ERROR creating texture label={:?} size={}x{}x{} format={:?} usage={:?} mips={} samples={}: {}",
-            desc.label, desc.size.width, desc.size.height, desc.size.depth_or_array_layers,
-            format, usage, desc.mip_level_count, desc.sample_count, err);
-    }
 
     let rid = gpu_add(state, GfxTexture { texture });
     Ok(JsGfxTexture { rid })
@@ -2157,41 +2258,11 @@ pub fn op_gfx_device_create_bind_group(
         }
     }
 
-    // Auto-label bind groups for debugging (so we can identify which one is invalid)
-    static BG_COUNTER: AtomicU32 = AtomicU32::new(0);
-    let bg_id = BG_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let auto_label = if let Some(ref l) = desc.label {
-        format!("BG#{} {}", bg_id, l)
-    } else {
-        format!("BG#{} layout_rid={} entries={}", bg_id, desc.layout_rid, desc.entries.len())
-    };
-
-    // Log detailed entry info for large bind groups (targeting the problematic 20-entry one)
-    if desc.entries.len() >= 15 {
-        eprintln!("[BG-DIAG] Creating {} with layout_rid={}", auto_label, desc.layout_rid);
-        for e in desc.entries.iter() {
-            if let Some(buf_rid) = e.buffer_rid {
-                eprintln!("  binding={} -> buffer_rid={} offset={} size={:?}", e.binding, buf_rid, e.offset, e.size);
-            } else if let Some(sam_rid) = e.sampler_rid {
-                eprintln!("  binding={} -> sampler_rid={}", e.binding, sam_rid);
-            } else if let Some(view_rid) = e.texture_view_rid {
-                eprintln!("  binding={} -> texture_view_rid={}", e.binding, view_rid);
-            } else {
-                eprintln!("  binding={} -> NO RESOURCE!", e.binding);
-            }
-        }
-    }
-
-    let error_guard = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(&auto_label),
+        label: desc.label.as_deref(),
         layout: &layout.layout,
         entries: &entries,
     });
-    let maybe_err = pollster::block_on(error_guard.pop());
-    if let Some(err) = maybe_err {
-        eprintln!("[BG-DIAG] ERROR creating {}: {}", auto_label, err);
-    }
 
     let rid = gpu_add(state, GfxBindGroup { group: Arc::new(group) });
     Ok(JsGfxBindGroup { rid })
@@ -3006,34 +3077,10 @@ pub fn op_gfx_surface_draw(
     // Flush any pending command buffers before submitting the main frame
     flush_pending_commands(&ctx.queue);
 
-    ctx.queue.submit(iter::once(encoder.finish()));
+    ctx.queue.submit(std::iter::once(encoder.finish()));
     output.present();
 
     Ok(())
-}
-
-#[op2]
-#[serde]
-pub fn op_gfx_decode_image(
-    #[buffer] data: JsBuffer,
-    #[string] format: String,
-) -> DecodeImageResult {
-    let slice: &[u8] = &data;
-    let result = decode_image_internal(slice, &format, None);
-    match result {
-        Ok((width, height, pixels)) => DecodeImageResult {
-            width,
-            height,
-            data: pixels,
-            error: None,
-        },
-        Err(e) => DecodeImageResult {
-            width: 0,
-            height: 0,
-            data: vec![],
-            error: Some(e.to_string()),
-        },
-    }
 }
 
 #[op2]
@@ -3047,6 +3094,8 @@ pub fn op_gfx_write_texture_image(
     origin_y: u32,
     origin_z: u32,
     mip_level: u32,
+    bytes_per_row_hint: u32,
+    rows_per_image_hint: u32,
     #[buffer] data: JsBuffer,
 ) -> Result<(), JsErrorBox> {
     let ctx = gfx_ctx()?;
@@ -3054,50 +3103,57 @@ pub fn op_gfx_write_texture_image(
     let texture = gpu_get::<GfxTexture>(state, texture_rid)
         .map_err(|e| JsErrorBox::generic(format!("Failed to get texture: {}", e)))?;
 
-    // Validate dimensions
     if width == 0 || height == 0 {
         return Err(JsErrorBox::generic("write_texture: width and height must be > 0"));
     }
 
     let depth_layers = if depth == 0 { 1 } else { depth };
-
-    // Get the texture format and calculate bytes per pixel
     let format = texture.texture.format();
-    let bpp = bytes_per_pixel(format).ok_or_else(|| {
-        JsErrorBox::generic(format!(
-            "write_texture: unsupported texture format {:?} for direct pixel writes",
-            format
-        ))
-    })?;
 
-    // Calculate expected data size
-    let bytes_per_row = bpp * width;
-    let expected_size = (bytes_per_row * height * depth_layers) as usize;
+    // Determine bytes_per_row and rows_per_image:
+    // - If JS provides explicit layout (compressed textures), use those values
+    // - Otherwise auto-calculate from format
+    let (final_bytes_per_row, final_rows_per_image) = if bytes_per_row_hint > 0 {
+        (bytes_per_row_hint, if rows_per_image_hint > 0 { rows_per_image_hint } else { height })
+    } else if let Some((bw, bh, block_bytes)) = compressed_block_info(format) {
+        let blocks_wide = (width + bw - 1) / bw;
+        let blocks_high = (height + bh - 1) / bh;
+        (blocks_wide * block_bytes, blocks_high)
+    } else {
+        let bpp = bytes_per_pixel(format).ok_or_else(|| {
+            JsErrorBox::generic(format!(
+                "write_texture: unsupported texture format {:?} for direct pixel writes",
+                format
+            ))
+        })?;
+        (bpp * width, height)
+    };
 
     let bytes: &[u8] = &data;
 
-    // Validate data size
-    if bytes.len() < expected_size {
-        return Err(JsErrorBox::generic(format!(
-            "write_texture: data buffer too small. Expected at least {} bytes for {}x{}x{} {:?} texture, got {} bytes",
-            expected_size, width, height, depth_layers, format, bytes.len()
-        )));
-    }
+    // Validate data size for uncompressed formats (compressed validation left to wgpu)
+    if bytes_per_row_hint == 0 && compressed_block_info(format).is_none() {
+        let expected_size = (final_bytes_per_row * final_rows_per_image * depth_layers) as usize;
+        if bytes.len() < expected_size {
+            return Err(JsErrorBox::generic(format!(
+                "write_texture: data buffer too small. Expected at least {} bytes for {}x{}x{} {:?} texture, got {} bytes",
+                expected_size, width, height, depth_layers, format, bytes.len()
+            )));
+        }
 
-    // Validate that the write region fits within the texture at the given mip level
-    let tex_size = texture.texture.size();
-    let mip_width = (tex_size.width >> mip_level).max(1);
-    let mip_height = (tex_size.height >> mip_level).max(1);
-
-    if origin_x + width > mip_width || origin_y + height > mip_height {
-        return Err(JsErrorBox::generic(format!(
-            "write_texture: write region (origin: ({}, {}), size: {}x{}) exceeds texture bounds ({}x{}) at mip level {}",
-            origin_x, origin_y, width, height, mip_width, mip_height, mip_level
-        )));
+        let tex_size = texture.texture.size();
+        let mip_width = (tex_size.width >> mip_level).max(1);
+        let mip_height = (tex_size.height >> mip_level).max(1);
+        if origin_x + width > mip_width || origin_y + height > mip_height {
+            return Err(JsErrorBox::generic(format!(
+                "write_texture: write region (origin: ({}, {}), size: {}x{}) exceeds texture bounds ({}x{}) at mip level {}",
+                origin_x, origin_y, width, height, mip_width, mip_height, mip_level
+            )));
+        }
     }
 
     ctx.queue.write_texture(
-        wgpu::TexelCopyTextureInfo  {
+        wgpu::TexelCopyTextureInfo {
             texture: &texture.texture,
             mip_level,
             origin: wgpu::Origin3d {
@@ -3110,8 +3166,8 @@ pub fn op_gfx_write_texture_image(
         bytes,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(bytes_per_row),
-            rows_per_image: Some(height),
+            bytes_per_row: Some(final_bytes_per_row),
+            rows_per_image: Some(final_rows_per_image),
         },
         wgpu::Extent3d {
             width,
@@ -3908,6 +3964,60 @@ pub fn op_gfx_bind_group_drop(
     Ok(())
 }
 
+#[op2(fast)]
+pub fn op_gfx_shader_drop(
+    state: &mut OpState,
+    rid: u32,
+) -> Result<(), JsErrorBox> {
+    gpu_take::<GfxShader>(state, rid);
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_sampler_drop(
+    state: &mut OpState,
+    rid: u32,
+) -> Result<(), JsErrorBox> {
+    gpu_take::<GfxSampler>(state, rid);
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_bind_group_layout_drop(
+    state: &mut OpState,
+    rid: u32,
+) -> Result<(), JsErrorBox> {
+    gpu_take::<GfxBindGroupLayout>(state, rid);
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_pipeline_layout_drop(
+    state: &mut OpState,
+    rid: u32,
+) -> Result<(), JsErrorBox> {
+    gpu_take::<GfxPipelineLayout>(state, rid);
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_pipeline_drop(
+    state: &mut OpState,
+    rid: u32,
+) -> Result<(), JsErrorBox> {
+    gpu_take::<GfxPipeline>(state, rid);
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_gfx_compute_pipeline_drop(
+    state: &mut OpState,
+    rid: u32,
+) -> Result<(), JsErrorBox> {
+    gpu_take::<GfxComputePipeline>(state, rid);
+    Ok(())
+}
+
 /// Flush all pending command buffers to the GPU.
 /// Call this when you need to ensure all prior render commands are submitted,
 /// e.g., before a buffer readback or at end of frame.
@@ -4338,6 +4448,22 @@ pub fn op_gfx_query_set_destroy(
 pub fn op_gfx_has_timestamp_query() -> Result<bool, JsErrorBox> {
     let ctx = gfx_ctx()?;
     Ok(ctx.device.features().contains(wgpu::Features::TIMESTAMP_QUERY))
+}
+
+/// Check if a named GPU feature is available on the device.
+#[op2(fast)]
+pub fn op_gfx_has_feature(#[string] feature: &str) -> Result<bool, JsErrorBox> {
+    let ctx = gfx_ctx()?;
+    let wgpu_feature = match feature {
+        "texture-compression-bc" => Some(wgpu::Features::TEXTURE_COMPRESSION_BC),
+        "texture-compression-astc" => Some(wgpu::Features::TEXTURE_COMPRESSION_ASTC),
+        "timestamp-query" => Some(wgpu::Features::TIMESTAMP_QUERY),
+        _ => None,
+    };
+    match wgpu_feature {
+        Some(f) => Ok(ctx.device.features().contains(f)),
+        None => Ok(false),
+    }
 }
 
 /// Get the timestamp period in nanoseconds per tick.

@@ -177,7 +177,16 @@ if (!gfx) {
 
     getCurrentTexture() {
       this._frameSubmitted = false;
-      return { createView: () => ({ __surfaceView: true }) };
+      const w = globalThis.__windowInnerWidth ?? 800;
+      const h = globalThis.__windowInnerHeight ?? 600;
+      const fmt = this.config?.format ?? "bgra8unorm";
+      return {
+        width: w,
+        height: h,
+        format: fmt,
+        depthOrArrayLayers: 1,
+        createView: () => ({ __surfaceView: true }),
+      };
     }
 
     __queueDrawCalls(calls) {
@@ -188,18 +197,25 @@ if (!gfx) {
       timestampWrites,
       resolveQueries,
       copyBuffers,
-      computeCommands
+      computeCommands,
+      extraTimestampWrites
     ) {
       if (this._frameSubmitted || globalThis.__xrMode) {
         this._pendingDrawCalls = [];
         this._frameSubmitted = true;
         return;
       }
-      if (this._pendingDrawCalls.length) {
+
+      const hasDraw = this._pendingDrawCalls.length > 0;
+      const hasClear = this._frameClearColor != null;
+      const hasCompute = computeCommands && computeCommands.length > 0;
+      const hasTimestampOps = (resolveQueries && resolveQueries.length > 0) || (copyBuffers && copyBuffers.length > 0);
+
+      if (hasDraw || hasClear || hasCompute || hasTimestampOps) {
         const args = { draw_calls: this._pendingDrawCalls };
 
         // Add compute commands to execute BEFORE render pass (all in one submission)
-        if (computeCommands && computeCommands.length > 0) {
+        if (hasCompute) {
           args.compute_commands = computeCommands;
         }
 
@@ -216,8 +232,26 @@ if (!gfx) {
           args.copy_buffers = copyBuffers;
         }
 
+        // Pass clear color for clear-only frames (no draw calls)
+        if (!hasDraw && hasClear) {
+          args.clear_color = this._frameClearColor;
+          if (this._frameDepthViewRid != null) {
+            args.depth_view_rid = this._frameDepthViewRid;
+            args.depth_clear_value = this._frameDepthClearValue;
+          }
+        }
+
+        // Pass extra encoder-level timestamp writes (forwarded from render pass)
+        if (extraTimestampWrites && extraTimestampWrites.length > 0) {
+          args.extra_timestamp_writes = extraTimestampWrites;
+        }
+
         gfx.op_gfx_surface_draw(args);
         this._pendingDrawCalls = [];
+        this._frameClearColor = null;
+        this._frameDepthViewRid = null;
+        this._frameDepthClearValue = null;
+        this._frameRequested = false;
         this._frameSubmitted = true;
       }
     }
@@ -228,6 +262,7 @@ if (!gfx) {
   // Emulated buffer
   class EmulatedBuffer {
     constructor(size, usage) {
+      this.size = size >>> 0;
       this.byteLength = size >>> 0;
       this.usage = usage >>> 0;
       this._mapped = new ArrayBuffer(this.byteLength);
@@ -347,6 +382,19 @@ if (!gfx) {
               stencilReadOnly: !!da.stencilReadOnly,
             }
           : null;
+
+      // Capture render pass timestampWrites so they can be forwarded to the encoder
+      this._timestampWrites = null;
+      if (desc?.timestampWrites) {
+        const tw = desc.timestampWrites;
+        if (tw.querySet?.__rid != null) {
+          this._timestampWrites = {
+            query_set_rid: tw.querySet.__rid,
+            beginning_of_pass_write_index: tw.beginningOfPassWriteIndex ?? null,
+            end_of_pass_write_index: tw.endOfPassWriteIndex ?? null,
+          };
+        }
+      }
     }
 
     multiDrawIndexedIndirect(indirectBuffer, indirectOffset, drawCount) {
@@ -357,7 +405,11 @@ if (!gfx) {
         throw new Error("multiDrawIndexedIndirect: no index buffer set");
 
       const vRids = [];
-      for (const [slot, rid] of this._vertexBuffers) vRids[slot] = rid;
+      const vOffsets = [];
+      for (const [slot, info] of this._vertexBuffers) {
+        vRids[slot] = info.rid;
+        vOffsets[slot] = info.offset || 0;
+      }
 
       const bgRids = [];
       for (const [idx, rid] of this._bindGroups) bgRids[idx] = rid;
@@ -367,6 +419,7 @@ if (!gfx) {
       this._drawCalls.push({
         pipeline_rid: this._pipelineRid,
         vertex_buffer_rids: vRids,
+        vertex_buffer_offsets: vOffsets,
         bind_group_rids: bgRids,
         clear_color: isFirst ? this._clearColor : null,
         vertex_count: 0,
@@ -374,6 +427,7 @@ if (!gfx) {
         first_vertex: 0,
         first_instance: 0,
         index_buffer_rid: this._indexBuffer.__rid,
+        index_buffer_offset: this._indexBufferOffset || 0,
         index_format: this._indexFormat || "uint32",
         index_count: 0,
         first_index: 0,
@@ -417,19 +471,20 @@ if (!gfx) {
       this._pipelineRid = p.__rid;
     }
 
-    setVertexBuffer(slot, buf) {
+    setVertexBuffer(slot, buf, offset = 0) {
       if (!buf) throw new Error("setVertexBuffer: null buffer");
       if (buf.__rid == null && buf.unmap) buf.unmap();
       if (buf.__rid == null) throw new Error("setVertexBuffer: no __rid");
-      this._vertexBuffers.set(slot >>> 0, buf.__rid);
+      this._vertexBuffers.set(slot >>> 0, { rid: buf.__rid, offset: offset >>> 0 });
     }
 
-    setIndexBuffer(buffer, format) {
+    setIndexBuffer(buffer, format, offset = 0) {
       if (!buffer) throw new Error("setIndexBuffer: null buffer");
       if (buffer.__rid == null && buffer.unmap) buffer.unmap();
       if (buffer.__rid == null) throw new Error("setIndexBuffer: no __rid");
       this._indexBuffer = buffer;
       this._indexFormat = format || "uint32";
+      this._indexBufferOffset = offset >>> 0;
     }
 
     setBindGroup(index, bg) {
@@ -451,7 +506,11 @@ if (!gfx) {
       if (this._pipelineRid == null) return;
 
       const vRids = [];
-      for (const [slot, rid] of this._vertexBuffers) vRids[slot] = rid;
+      const vOffsets = [];
+      for (const [slot, info] of this._vertexBuffers) {
+        vRids[slot] = info.rid;
+        vOffsets[slot] = info.offset || 0;
+      }
 
       const bgRids = [];
       for (const [idx, rid] of this._bindGroups) bgRids[idx] = rid;
@@ -470,6 +529,7 @@ if (!gfx) {
       this._drawCalls.push({
         pipeline_rid: this._pipelineRid,
         vertex_buffer_rids: vRids,
+        vertex_buffer_offsets: vOffsets,
         bind_group_rids: bgRids,
         clear_color: isFirst ? this._clearColor : null,
         vertex_count: params.indexed ? 0 : params.vertexCount ?? 0,
@@ -477,6 +537,7 @@ if (!gfx) {
         first_vertex: params.indexed ? 0 : params.firstVertex ?? 0,
         first_instance: params.firstInstance ?? 0,
         index_buffer_rid: params.indexed ? indexRid : null,
+        index_buffer_offset: params.indexed ? (this._indexBufferOffset || 0) : null,
         index_format: params.indexed ? indexFormat : null,
         index_count: params.indexed ? params.indexCount ?? 0 : 0,
         first_index: params.indexed ? params.firstIndex ?? 0 : 0,
@@ -548,7 +609,11 @@ if (!gfx) {
         throw new Error("drawIndexedIndirect: no index buffer set");
 
       const vRids = [];
-      for (const [slot, rid] of this._vertexBuffers) vRids[slot] = rid;
+      const vOffsets = [];
+      for (const [slot, info] of this._vertexBuffers) {
+        vRids[slot] = info.rid;
+        vOffsets[slot] = info.offset || 0;
+      }
 
       const bgRids = [];
       for (const [idx, rid] of this._bindGroups) bgRids[idx] = rid;
@@ -558,6 +623,7 @@ if (!gfx) {
       this._drawCalls.push({
         pipeline_rid: this._pipelineRid,
         vertex_buffer_rids: vRids,
+        vertex_buffer_offsets: vOffsets,
         bind_group_rids: bgRids,
         clear_color: isFirst ? this._clearColor : null,
         vertex_count: 0,
@@ -565,6 +631,7 @@ if (!gfx) {
         first_vertex: 0,
         first_instance: 0,
         index_buffer_rid: this._indexBuffer.__rid,
+        index_buffer_offset: this._indexBufferOffset || 0,
         index_format: this._indexFormat || "uint32",
         index_count: 0,
         first_index: 0,
@@ -611,7 +678,7 @@ if (!gfx) {
             this._vertexBuffers.clear();
             for (const [slot, info] of cmd.vertexBuffers) {
               if (info.buffer?.__rid != null)
-                this._vertexBuffers.set(slot, info.buffer.__rid);
+                this._vertexBuffers.set(slot, { rid: info.buffer.__rid, offset: info.offset || 0 });
             }
             this._bindGroups.clear();
             for (const [idx, bg] of cmd.bindGroups) {
@@ -628,7 +695,7 @@ if (!gfx) {
             this._vertexBuffers.clear();
             for (const [slot, info] of cmd.vertexBuffers) {
               if (info.buffer?.__rid != null)
-                this._vertexBuffers.set(slot, info.buffer.__rid);
+                this._vertexBuffers.set(slot, { rid: info.buffer.__rid, offset: info.offset || 0 });
             }
             this._bindGroups.clear();
             for (const [idx, bg] of cmd.bindGroups) {
@@ -637,6 +704,7 @@ if (!gfx) {
             if (cmd.indexBuffer) {
               this._indexBuffer = cmd.indexBuffer;
               this._indexFormat = cmd.indexFormat || "uint32";
+              this._indexBufferOffset = cmd.indexBufferOffset || 0;
             }
             this.drawIndexed(
               cmd.indexCount,
@@ -662,9 +730,8 @@ if (!gfx) {
     }
 
     end() {
-      if (!this._drawCalls.length) return;
-
       if (this._isDepthOnlyPass && this._depthAttachment?.viewRid != null) {
+        if (!this._drawCalls.length) return;
         this._flushEncoderCompute();
         gfx.op_gfx_render_depth_only({
           depth_view_rid: this._depthAttachment.viewRid,
@@ -675,6 +742,7 @@ if (!gfx) {
 
       const resolve = this._resolveTarget;
       if (resolve?._isXRSwapchain && resolve.__rid != null) {
+        if (!this._drawCalls.length) return;
         const msaaViewRid = this._colorTargetView?.__rid;
         if (msaaViewRid != null) {
           this._flushEncoderCompute();
@@ -693,6 +761,7 @@ if (!gfx) {
       }
 
       if (this._isRenderToTexture && this._colorTargetView?.__rid != null) {
+        if (!this._drawCalls.length) return;
         this._flushEncoderCompute();
         gfx.op_gfx_render_to_texture({
           target_view_rid: this._colorTargetView.__rid,
@@ -701,7 +770,30 @@ if (!gfx) {
         return;
       }
 
+      // Surface path: always queue (even if empty) so clear+present works
       this._context?.__queueDrawCalls?.(this._drawCalls);
+      // Pass clear/depth metadata for clear-only frames
+      if (this._context && !this._drawCalls.length) {
+        this._context._frameClearColor = this._clearColor;
+        this._context._frameDepthViewRid = this._depthAttachment?.viewRid ?? null;
+        this._context._frameDepthClearValue = this._depthAttachment?.depthClearValue ?? 1.0;
+      }
+      // Forward render pass timestamp writes to the encoder for encoder-level writing
+      if (this._timestampWrites && this._encoder) {
+        const tw = this._timestampWrites;
+        if (tw.beginning_of_pass_write_index != null) {
+          this._encoder._timestampWrites.push({
+            query_set_rid: tw.query_set_rid,
+            query_index: tw.beginning_of_pass_write_index,
+          });
+        }
+        if (tw.end_of_pass_write_index != null) {
+          this._encoder._timestampWrites.push({
+            query_set_rid: tw.query_set_rid,
+            query_index: tw.end_of_pass_write_index,
+          });
+        }
+      }
     }
   }
 
@@ -928,9 +1020,9 @@ if (!gfx) {
       const hasTimestampOps =
         this._resolveQueries.length > 0 || this._copyBuffers.length > 0;
 
-      // Check if there's a canvas context with pending draw calls (render frame)
+      // Check if there's a canvas context with pending draw calls or clear-only frame
       const ctx = globalThis.__gpuCanvasContext;
-      const hasRenderFrame = ctx && ctx._pendingDrawCalls?.length > 0;
+      const hasRenderFrame = ctx && (ctx._pendingDrawCalls?.length > 0 || ctx._frameClearColor != null);
       const isXrMode = globalThis.__xrMode;
 
       if (isXrMode) {
@@ -953,10 +1045,8 @@ if (!gfx) {
         // These get passed to the native render pass for accurate GPU execution timing.
         let renderTimestampWrites = null;
         if (this._timestampWrites.length >= 2) {
-          const startTs = this._timestampWrites.find(
-            (t) => t.query_index === 0
-          );
-          const endTs = this._timestampWrites.find((t) => t.query_index === 1);
+          const startTs = this._timestampWrites[0];
+          const endTs = this._timestampWrites[this._timestampWrites.length - 1];
           if (
             startTs &&
             endTs &&
@@ -964,19 +1054,21 @@ if (!gfx) {
           ) {
             renderTimestampWrites = {
               query_set_rid: startTs.query_set_rid,
-              beginning_of_pass_write_index: 0,
-              end_of_pass_write_index: 1,
+              beginning_of_pass_write_index: startTs.query_index,
+              end_of_pass_write_index: endTs.query_index,
             };
           }
         }
 
         // Pass compute commands to be executed in the same submission as render
         // This ensures all GPU work is measured by the frame timestamps
+        // Also pass all extra timestamp writes that need encoder-level writing
         ctx.__submitFrame(
           renderTimestampWrites,
           this._resolveQueries,
           this._copyBuffers,
-          this._commands
+          this._commands,
+          this._timestampWrites
         );
       } else if (this._commands.length > 0) {
         // Compute-only encoder (no render frame) - submit compute separately
@@ -1042,6 +1134,7 @@ if (!gfx) {
   class MappableBuffer {
     constructor(rid, size, usage) {
       this.__rid = rid;
+      this.size = size;
       this.byteLength = size;
       this.usage = usage;
       this._mapState = "unmapped";
@@ -1145,7 +1238,7 @@ if (!gfx) {
       try {
         const hasTimestamp = gfx.op_gfx_has_timestamp_query();
         console.log("[shims] Native timestamp-query support:", hasTimestamp);
-        if (hasTimestamp) {
+        if (hasTimestamp && !globalThis.__nativeXR__) {
           availableFeatures.push("timestamp-query");
           timestampPeriod = gfx.op_gfx_get_timestamp_period();
           console.log("[shims] Timestamp period (ns/tick):", timestampPeriod);
@@ -1215,7 +1308,7 @@ if (!gfx) {
 
               const rid = gfx.op_gfx_device_create_pipeline({
                 vertex_module_rid: desc.vertex.module.__rid,
-                vertex_entry: desc.vertex.entryPoint ?? "vs_main",
+                vertex_entry: desc.vertex.entryPoint ?? null,
                 fragment_module_rid: desc.fragment?.module?.__rid ?? null,
                 fragment_entry: desc.fragment?.entryPoint ?? null,
                 vertex_buffers: vertexBuffers,
@@ -1322,6 +1415,7 @@ if (!gfx) {
               }
               return {
                 __rid: rid,
+                size,
                 byteLength: size,
                 usage,
                 destroy() {
@@ -1523,7 +1617,8 @@ if (!gfx) {
               let currentPipeline = null;
               const vertexBuffers = new Map();
               let indexBuffer = null,
-                indexFormat = null;
+                indexFormat = null,
+                indexBufferOffset = 0;
               const bindGroups = new Map();
 
               return {
@@ -1537,6 +1632,7 @@ if (!gfx) {
                 setIndexBuffer(buf, fmt, offset = 0, size) {
                   indexBuffer = buf;
                   indexFormat = fmt;
+                  indexBufferOffset = offset;
                 },
                 setBindGroup(idx, bg, offs) {
                   bindGroups.set(idx, bg);
@@ -1566,6 +1662,7 @@ if (!gfx) {
                     bindGroups: new Map(bindGroups),
                     indexBuffer,
                     indexFormat,
+                    indexBufferOffset,
                   });
                 },
                 finish() {

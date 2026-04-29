@@ -474,23 +474,33 @@ if (!isNativeXR) {
 
   // XRView
   class XRView {
-    constructor(data) {
+    constructor(data, offsetInvMatrix) {
       this.eye = data.view_index === 0 ? "left" : "right";
       this.projectionMatrix = new Float32Array(data.projection_matrix);
-      this.transform = new XRRigidTransform(
-        {
-          x: data.transform.position[0],
-          y: data.transform.position[1],
-          z: data.transform.position[2],
-        },
-        {
-          x: data.transform.orientation[0],
-          y: data.transform.orientation[1],
-          z: data.transform.orientation[2],
-          w: data.transform.orientation[3],
-        }
-      );
-      this.transform._matrix = new Float32Array(data.transform.matrix);
+
+      if (offsetInvMatrix) {
+        const viewMatrix = new Float32Array(data.transform.matrix);
+        const adjusted = mat4Multiply(offsetInvMatrix, viewMatrix);
+        const decomp = decomposeMatrix(adjusted);
+        this.transform = new XRRigidTransform(decomp.position, decomp.orientation);
+        this.transform._matrix = adjusted;
+      } else {
+        this.transform = new XRRigidTransform(
+          {
+            x: data.transform.position[0],
+            y: data.transform.position[1],
+            z: data.transform.position[2],
+          },
+          {
+            x: data.transform.orientation[0],
+            y: data.transform.orientation[1],
+            z: data.transform.orientation[2],
+            w: data.transform.orientation[3],
+          }
+        );
+        this.transform._matrix = new Float32Array(data.transform.matrix);
+      }
+
       this._viewIndex = data.view_index;
       this._viewport = {
         x: data.viewport_x || 0,
@@ -505,27 +515,96 @@ if (!isNativeXR) {
     }
   }
 
+  // Multiply two 4x4 column-major matrices: out = a * b
+  function mat4Multiply(a, b) {
+    const out = new Float32Array(16);
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 4; j++) {
+        out[j * 4 + i] =
+          a[i] * b[j * 4] +
+          a[4 + i] * b[j * 4 + 1] +
+          a[8 + i] * b[j * 4 + 2] +
+          a[12 + i] * b[j * 4 + 3];
+      }
+    }
+    return out;
+  }
+
+  // Extract position and quaternion from a 4x4 column-major matrix
+  function decomposeMatrix(m) {
+    const position = { x: m[12], y: m[13], z: m[14] };
+    // Extract rotation quaternion from upper-left 3x3
+    const trace = m[0] + m[5] + m[10];
+    let qx, qy, qz, qw;
+    if (trace > 0) {
+      const s = 0.5 / Math.sqrt(trace + 1.0);
+      qw = 0.25 / s;
+      qx = (m[6] - m[9]) * s;
+      qy = (m[8] - m[2]) * s;
+      qz = (m[1] - m[4]) * s;
+    } else if (m[0] > m[5] && m[0] > m[10]) {
+      const s = 2.0 * Math.sqrt(1.0 + m[0] - m[5] - m[10]);
+      qw = (m[6] - m[9]) / s;
+      qx = 0.25 * s;
+      qy = (m[4] + m[1]) / s;
+      qz = (m[8] + m[2]) / s;
+    } else if (m[5] > m[10]) {
+      const s = 2.0 * Math.sqrt(1.0 + m[5] - m[0] - m[10]);
+      qw = (m[8] - m[2]) / s;
+      qx = (m[4] + m[1]) / s;
+      qy = 0.25 * s;
+      qz = (m[9] + m[6]) / s;
+    } else {
+      const s = 2.0 * Math.sqrt(1.0 + m[10] - m[0] - m[5]);
+      qw = (m[1] - m[4]) / s;
+      qx = (m[8] + m[2]) / s;
+      qy = (m[9] + m[6]) / s;
+      qz = 0.25 * s;
+    }
+    return { position, orientation: { x: qx, y: qy, z: qz, w: qw } };
+  }
+
   class XRViewerPose {
-    constructor(data) {
+    constructor(data, refSpace) {
+      // Get the offset inverse matrix if the reference space has a transform
+      const hasOffset = refSpace?._transform &&
+        (refSpace._transform.position.x !== 0 ||
+         refSpace._transform.position.y !== 0 ||
+         refSpace._transform.position.z !== 0 ||
+         refSpace._transform.orientation.x !== 0 ||
+         refSpace._transform.orientation.y !== 0 ||
+         refSpace._transform.orientation.z !== 0 ||
+         refSpace._transform.orientation.w !== 1);
+      const offsetInvMatrix = hasOffset ? refSpace._transform.inverse.matrix : null;
+
       if (data.views?.length) {
         const v = data.views[0];
-        this.transform = new XRRigidTransform(
-          {
-            x: v.transform.position[0],
-            y: v.transform.position[1],
-            z: v.transform.position[2],
-          },
-          {
-            x: v.transform.orientation[0],
-            y: v.transform.orientation[1],
-            z: v.transform.orientation[2],
-            w: v.transform.orientation[3],
-          }
-        );
+        if (offsetInvMatrix) {
+          const viewMatrix = new Float32Array(
+            v.transform.matrix.buffer ? v.transform.matrix : v.transform.matrix
+          );
+          const adjusted = mat4Multiply(offsetInvMatrix, viewMatrix);
+          const decomp = decomposeMatrix(adjusted);
+          this.transform = new XRRigidTransform(decomp.position, decomp.orientation);
+        } else {
+          this.transform = new XRRigidTransform(
+            {
+              x: v.transform.position[0],
+              y: v.transform.position[1],
+              z: v.transform.position[2],
+            },
+            {
+              x: v.transform.orientation[0],
+              y: v.transform.orientation[1],
+              z: v.transform.orientation[2],
+              w: v.transform.orientation[3],
+            }
+          );
+        }
       } else {
         this.transform = new XRRigidTransform();
       }
-      this.views = data.views.map((v) => new XRView(v));
+      this.views = data.views.map((v) => new XRView(v, offsetInvMatrix));
       this.emulatedPosition = false;
     }
   }
@@ -542,11 +621,11 @@ if (!isNativeXR) {
     get predictedDisplayTime() {
       return this._state.predicted_display_time;
     }
-    getViewerPose() {
+    getViewerPose(refSpace) {
       if (!this._pose) {
         const data =
           this._cachedPose || globalThis.__xr.op_xr_get_viewer_pose();
-        this._pose = new XRViewerPose(data);
+        this._pose = new XRViewerPose(data, refSpace);
       }
       return this._pose;
     }
@@ -598,6 +677,7 @@ if (!isNativeXR) {
         _isXRSwapchain: true,
         width: this._layer._width,
         height: this._layer._height,
+        format: this._layer._colorFormat,
         depthOrArrayLayers: 1,
         createView: () => cachedView,
       };
@@ -605,6 +685,10 @@ if (!isNativeXR) {
     }
     get depthStencilTexture() {
       return this._layer._depthTextures?.[this._view._viewIndex] ?? null;
+    }
+    getViewDescriptor() {
+      // Each eye gets its own swapchain texture, no array slicing needed
+      return {};
     }
     get viewport() {
       return {

@@ -28,7 +28,29 @@ globalThis.document = {
   body: bodyEventTarget,
   createElement(name) {
     if (name === "canvas") return globalThis.__makeCanvas();
-    throw new Error(`Only canvas supported, got: ${name}`);
+    // Stub element for libraries that create DOM elements for URL parsing etc.
+    const el = { tagName: name.toUpperCase(), style: {}, dataset: {} };
+    if (name === "a") {
+      // URL resolution: setting .href on an <a> parses the URL
+      let _url = null;
+      Object.defineProperty(el, "href", {
+        get() { return _url ? _url.href : ""; },
+        set(v) { try { _url = new URL(v, globalThis.location?.href || "file:///"); } catch { _url = null; } },
+      });
+      Object.defineProperty(el, "pathname", {
+        get() { return _url ? _url.pathname : ""; },
+      });
+      Object.defineProperty(el, "hostname", {
+        get() { return _url ? _url.hostname : ""; },
+      });
+      Object.defineProperty(el, "protocol", {
+        get() { return _url ? _url.protocol : ""; },
+      });
+      Object.defineProperty(el, "origin", {
+        get() { return _url ? _url.origin : ""; },
+      });
+    }
+    return el;
   },
   addEventListener:
     documentEventTarget.addEventListener.bind(documentEventTarget),

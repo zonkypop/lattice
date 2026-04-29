@@ -11,9 +11,9 @@ path = "src/lib.rs"
 
 
 # android
-# crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib"]
 # desktop
-crate-type = ["rlib"]
+# crate-type = ["rlib"]
 
 
 
@@ -24,6 +24,7 @@ path = "src/main.rs"
 [features]
 default = ["desktop"]
 desktop = []
+tint = []
 
 [dependencies]
 deno_core = { version = "=0.398.0", default-features = false, features = ["include_icu_data"] }
@@ -65,8 +66,8 @@ timezone_provider = "=0.0.11"
 pathdiff = "0.2"
 
 # Graphics
-wgpu = { version = "28.0", features = ["vulkan"] }
-wgpu-hal = { version = "28.0", features = ["vulkan"] }
+wgpu = { version = "29.0", features = ["vulkan", "spirv"] }
+wgpu-hal = { version = "29.0", features = ["vulkan"] }
 
 # XR - use "linked" which works on both desktop and Android
 openxr = { version = "0.19", features = ["loaded"] }

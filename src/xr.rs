@@ -521,7 +521,7 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         .expose_adapter(vk_physical_device)
         .ok_or_else(|| JsErrorBox::generic("Failed to expose adapter"))?;
     
-    let wgpu_features = wgpu_exposed_adapter.features;
+    let wgpu_features = wgpu_exposed_adapter.features | wgpu::Features::PASSTHROUGH_SHADERS;
 
     let enabled_device_extensions = wgpu_exposed_adapter
         .adapter
@@ -584,6 +584,7 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
             None,
             &enabled_device_extensions,
             wgpu_features,
+            &wgpu::Limits::default(),
             &wgpu::MemoryHints::Performance,
             queue_family_index,
             0,

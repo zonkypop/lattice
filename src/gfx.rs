@@ -16,6 +16,179 @@ use std::sync::RwLock;
 
 use crate::xr::is_xr_active;
 
+// ======================= Tint Shader Compiler =======================
+
+static USE_TINT: AtomicBool = AtomicBool::new(cfg!(feature = "tint"));
+static USE_TINT_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Check USE_TINT env var on first shader compile
+fn maybe_init_use_tint() {
+    if !USE_TINT_INITIALIZED.swap(true, Ordering::SeqCst) {
+        if let Ok(val) = std::env::var("USE_TINT") {
+            if val == "1" || val.eq_ignore_ascii_case("true") {
+                USE_TINT.store(true, Ordering::SeqCst);
+                log::info!("USE_TINT env var detected — using Tint for shader compilation");
+            }
+        }
+    }
+}
+
+// ---- FFI bindings (linked static library, works on Quest) ----
+#[cfg(feature = "tint")]
+mod tint_ffi {
+    #[repr(C)]
+    pub struct TintResult {
+        pub data: *mut u32,
+        pub len: usize,
+        pub error: *mut std::ffi::c_char,
+    }
+
+    unsafe extern "C" {
+        pub fn tint_wgsl_to_spirv(
+            source: *const u8,
+            source_len: usize,
+            entry_point: *const std::ffi::c_char,
+        ) -> TintResult;
+        pub fn tint_free_result(result: TintResult);
+    }
+}
+
+/// Compile WGSL → SPIR-V for a single entry point using the statically-linked Tint library.
+#[cfg(feature = "tint")]
+fn compile_wgsl_with_tint(wgsl_source: &str, entry_point: &str) -> Result<Vec<u32>, JsErrorBox> {
+    use std::ffi::CString;
+    let ep = CString::new(entry_point)
+        .map_err(|_| JsErrorBox::generic("Entry point name contains null byte"))?;
+
+    unsafe {
+        let result = tint_ffi::tint_wgsl_to_spirv(
+            wgsl_source.as_ptr(),
+            wgsl_source.len(),
+            ep.as_ptr(),
+        );
+
+        if !result.error.is_null() {
+            let msg = std::ffi::CStr::from_ptr(result.error)
+                .to_string_lossy()
+                .into_owned();
+            tint_ffi::tint_free_result(result);
+            return Err(JsErrorBox::generic(format!("Tint: {}", msg)));
+        }
+
+        if result.data.is_null() || result.len == 0 {
+            tint_ffi::tint_free_result(result);
+            return Err(JsErrorBox::generic("Tint produced empty SPIR-V"));
+        }
+
+        let spirv = std::slice::from_raw_parts(result.data, result.len).to_vec();
+        tint_ffi::tint_free_result(result);
+        Ok(spirv)
+    }
+}
+
+// ---- CLI fallback (desktop only, no static lib needed) ----
+#[cfg(not(feature = "tint"))]
+fn compile_wgsl_with_tint(wgsl_source: &str, entry_point: &str) -> Result<Vec<u32>, JsErrorBox> {
+    use std::io::Write;
+    use std::process::Command;
+
+    let tint = std::env::var("TINT_PATH").unwrap_or_else(|_| "tint".to_string());
+    let dir = std::env::temp_dir();
+    let input_path = dir.join(format!("{}.wgsl", entry_point));
+    let output_path = dir.join(format!("{}.spv", entry_point));
+
+    {
+        let mut f = std::fs::File::create(&input_path)
+            .map_err(|e| JsErrorBox::generic(format!("Failed to write temp WGSL: {}", e)))?;
+        f.write_all(wgsl_source.as_bytes())
+            .map_err(|e| JsErrorBox::generic(format!("Failed to write temp WGSL: {}", e)))?;
+    }
+
+    let output = Command::new(&tint)
+        .arg(&input_path)
+        .arg("--format").arg("spirv")
+        .arg("--ep").arg(entry_point)
+        .arg("-o").arg(&output_path)
+        .output()
+        .map_err(|e| JsErrorBox::generic(format!(
+            "Failed to run tint ({}): {}. Install Dawn/Tint or set TINT_PATH.", tint, e
+        )))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_file(&output_path);
+        return Err(JsErrorBox::generic(format!("Tint failed for '{}':\n{}", entry_point, stderr)));
+    }
+
+    let spv_bytes = std::fs::read(&output_path)
+        .map_err(|e| JsErrorBox::generic(format!("Failed to read SPIR-V: {}", e)))?;
+
+    let _ = std::fs::remove_file(&input_path);
+    let _ = std::fs::remove_file(&output_path);
+
+    if spv_bytes.len() % 4 != 0 {
+        return Err(JsErrorBox::generic("Tint produced invalid SPIR-V (not 4-byte aligned)"));
+    }
+
+    Ok(spv_bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// Extract entry point function names from WGSL source.
+/// Looks for `@vertex fn name`, `@fragment fn name`, `@compute fn name`.
+fn extract_wgsl_entry_points(wgsl: &str) -> Vec<String> {
+    let re = regex::Regex::new(r"@(?:vertex|fragment|compute)\b[^f]*fn\s+(\w+)").unwrap();
+    re.captures_iter(wgsl)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .collect()
+}
+
+/// Strip SPIR-V decorations that Naga doesn't support (e.g. Coherent).
+/// This allows Tint-generated SPIR-V to pass through Naga's validator
+/// while still being used for reflection (auto-layout pipelines).
+/// Coherent (decoration 23) is a memory ordering hint — safe to remove.
+fn strip_unsupported_spirv_decorations(spirv: &mut Vec<u32>) {
+    const OP_DECORATE: u32 = 71;
+    const OP_MEMBER_DECORATE: u32 = 72;
+    const DECORATION_COHERENT: u32 = 23;
+
+    let mut i = 5; // skip SPIR-V header (5 words)
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+
+    while i < spirv.len() {
+        let word = spirv[i];
+        let word_count = (word >> 16) as usize;
+        let opcode = word & 0xFFFF;
+
+        if word_count == 0 { break; }
+
+        match opcode {
+            OP_DECORATE if word_count >= 3 => {
+                let decoration = spirv[i + 2];
+                if decoration == DECORATION_COHERENT {
+                    removals.push((i, word_count));
+                }
+            }
+            OP_MEMBER_DECORATE if word_count >= 4 => {
+                let decoration = spirv[i + 3];
+                if decoration == DECORATION_COHERENT {
+                    removals.push((i, word_count));
+                }
+            }
+            _ => {}
+        }
+
+        i += word_count;
+    }
+
+    // Remove in reverse order to keep indices valid
+    for (offset, count) in removals.into_iter().rev() {
+        spirv.drain(offset..offset + count);
+    }
+}
+
 // ======================= Graphics Context =======================
 
 struct MsaaState {
@@ -65,7 +238,28 @@ pub struct GfxDecodedImage {
 }
 
 pub struct GfxShader {
+    /// WGSL-based module (Naga). Always present. Used for auto-layout pipelines
+    /// that need Naga reflection, and as the sole module when Tint is disabled.
     pub module: wgpu::ShaderModule,
+    /// Per-entry-point passthrough SPIR-V modules (Tint path only).
+    /// Used for pipelines with explicit layouts to bypass Naga entirely.
+    pub tint_modules: Option<HashMap<String, wgpu::ShaderModule>>,
+}
+
+impl GfxShader {
+    /// Get the module for a specific entry point.
+    /// When `has_explicit_layout` is true and Tint modules exist, uses the
+    /// passthrough SPIR-V module. Otherwise falls back to the WGSL/Naga module.
+    pub fn module_for_entry(&self, entry_point: Option<&str>, has_explicit_layout: bool) -> &wgpu::ShaderModule {
+        if has_explicit_layout {
+            if let (Some(ep), Some(map)) = (entry_point, &self.tint_modules) {
+                if let Some(m) = map.get(ep) {
+                    return m;
+                }
+            }
+        }
+        &self.module
+    }
 }
 impl Resource for GfxShader {}
 
@@ -907,7 +1101,7 @@ pub struct VertexBufferLayoutDesc {
 #[derive(Deserialize)]
 pub struct PipelineCreate {
     pub vertex_module_rid: u32,
-    pub vertex_entry: String,
+    pub vertex_entry: Option<String>,
     pub fragment_module_rid: Option<u32>,
     pub fragment_entry: Option<String>,
     pub vertex_buffers: Vec<VertexBufferLayoutDesc>,
@@ -979,6 +1173,12 @@ pub struct TimestampWritesDesc {
 }
 
 #[derive(Deserialize)]
+pub struct EncoderTimestampWrite {
+    pub query_set_rid: u32,
+    pub query_index: u32,
+}
+
+#[derive(Deserialize)]
 pub struct BatchedComputeCommand {
     pub cmd: String, // "clear_buffer", "dispatch", "dispatch_indirect", "copy_buffer_to_texture", "copy_texture_to_texture"
     // clear_buffer fields
@@ -1035,6 +1235,7 @@ pub struct ClearColor {
 pub struct DrawCall {
     pub pipeline_rid: u32,
     pub vertex_buffer_rids: Vec<u32>,
+    pub vertex_buffer_offsets: Option<Vec<u64>>,
     pub bind_group_rids: Vec<Option<u32>>,
     pub clear_color: Option<ClearColor>,
     pub vertex_count: u32,
@@ -1042,6 +1243,7 @@ pub struct DrawCall {
     pub first_vertex: u32,
     pub first_instance: u32,
     pub index_buffer_rid: Option<u32>,
+    pub index_buffer_offset: Option<u64>,
     pub index_format: Option<String>,
     pub index_count: u32,
     pub first_index: u32,
@@ -1077,6 +1279,13 @@ pub struct SurfaceDrawArgs {
     // Operations to perform after render pass (resolve queries, copy buffers)
     pub resolve_query_sets: Option<Vec<ResolveQuerySetDesc>>,
     pub copy_buffers: Option<Vec<CopyBufferDesc>>,
+    // Clear color for clear-only frames (no draw calls)
+    pub clear_color: Option<ClearColor>,
+    // Depth view for clear-only frames
+    pub depth_view_rid: Option<u32>,
+    pub depth_clear_value: Option<f32>,
+    // Extra encoder-level timestamp writes (for render pass timestamps forwarded to encoder)
+    pub extra_timestamp_writes: Option<Vec<EncoderTimestampWrite>>,
 }
 
 #[derive(Deserialize)]
@@ -1512,7 +1721,7 @@ fn get_mipmap_resources(device: &wgpu::Device) -> &'static MipmapResources {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Mipmap Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             ..Default::default()
         });
         MipmapResources {
@@ -1844,6 +2053,17 @@ pub fn op_gfx_surface_configure(
     Ok(())
 }
 
+#[op2(fast)]
+pub fn op_gfx_set_use_tint(enabled: bool) {
+    USE_TINT.store(enabled, Ordering::SeqCst);
+    log::info!("Shader compiler: {}", if enabled { "Tint (SPIR-V)" } else { "Naga (WGSL)" });
+}
+
+#[op2(fast)]
+pub fn op_gfx_get_use_tint() -> bool {
+    USE_TINT.load(Ordering::SeqCst)
+}
+
 #[op2]
 #[serde]
 pub fn op_gfx_device_create_shader(
@@ -1851,6 +2071,7 @@ pub fn op_gfx_device_create_shader(
     #[serde] desc: ShaderCreate,
 ) -> Result<JsGfxShader, JsErrorBox> {
     let ctx = gfx_ctx()?;
+    maybe_init_use_tint();
 
     let sanitized = sanitize_wgsl(&desc.code);
 
@@ -1861,12 +2082,46 @@ pub fn op_gfx_device_create_shader(
         sanitized
     };
 
+    // Always create the WGSL/Naga module (needed for auto-layout reflection)
     let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: desc.label.as_deref(),
-        source: wgpu::ShaderSource::Wgsl(final_code.into()),
+        source: wgpu::ShaderSource::Wgsl(final_code.clone().into()),
     });
 
-    let rid = gpu_add(state, GfxShader { module });
+    // When Tint is enabled, also create passthrough SPIR-V modules per entry point.
+    // These bypass Naga entirely and are used for pipelines with explicit layouts.
+    let tint_modules = if USE_TINT.load(Ordering::SeqCst) {
+        let entry_points = extract_wgsl_entry_points(&final_code);
+        if entry_points.is_empty() {
+            None
+        } else {
+            let mut map = HashMap::new();
+            for ep in &entry_points {
+                match compile_wgsl_with_tint(&final_code, ep) {
+                    Ok(spirv) => {
+                        let m = unsafe {
+                            ctx.device.create_shader_module_passthrough(
+                                wgpu::ShaderModuleDescriptorPassthrough {
+                                    label: desc.label.as_deref(),
+                                    spirv: Some(std::borrow::Cow::Owned(spirv)),
+                                    ..Default::default()
+                                },
+                            )
+                        };
+                        map.insert(ep.clone(), m);
+                    }
+                    Err(e) => {
+                        log::warn!("Tint failed for entry point '{}': {}, falling back to Naga", ep, e);
+                    }
+                }
+            }
+            if map.is_empty() { None } else { Some(map) }
+        }
+    } else {
+        None
+    };
+
+    let rid = gpu_add(state, GfxShader { module, tint_modules });
     Ok(JsGfxShader { rid })
 }
 
@@ -2152,8 +2407,8 @@ pub fn op_gfx_device_create_pipeline_layout(
         layout_arcs.push(l.layout.clone());
     }
 
-    let layout_refs: Vec<&wgpu::BindGroupLayout> =
-        layout_arcs.iter().map(|a| a.as_ref()).collect();
+    let layout_refs: Vec<Option<&wgpu::BindGroupLayout>> =
+        layout_arcs.iter().map(|a| Some(a.as_ref())).collect();
 
     let pipeline_layout =
         ctx.device
@@ -2360,8 +2615,8 @@ pub fn op_gfx_device_create_pipeline(
         };
         Some(wgpu::DepthStencilState {
             format: tfmt,
-            depth_write_enabled: desc.depth_write_enabled.unwrap_or(true),
-            depth_compare: map_compare_function(desc.depth_compare.as_deref()),
+            depth_write_enabled: Some(desc.depth_write_enabled.unwrap_or(true)),
+            depth_compare: Some(map_compare_function(desc.depth_compare.as_deref())),
             stencil,
             bias: wgpu::DepthBiasState {
                 constant: desc.depth_bias.unwrap_or(0),
@@ -2381,13 +2636,14 @@ pub fn op_gfx_device_create_pipeline(
             .map(map_texture_format)
             .unwrap_or(ctx.format);
 
-        let entry_point = desc.fragment_entry.as_deref().unwrap_or("fs_main");
+        let entry_point = desc.fragment_entry.as_deref();
+        let has_layout = desc.pipeline_layout_rid.is_some();
 
         let color_write_mask = wgpu::ColorWrites::from_bits(desc.color_write_mask.unwrap_or(0xF))
             .unwrap_or(wgpu::ColorWrites::ALL);
         Some(wgpu::FragmentState {
-            module: &f.module,
-            entry_point: Some(entry_point),
+            module: f.module_for_entry(entry_point, has_layout),
+            entry_point,
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: color_format,
@@ -2413,8 +2669,8 @@ pub fn op_gfx_device_create_pipeline(
                 label: Some("GFX Pipeline"),
                 layout: Some(&pl.layout),
                 vertex: wgpu::VertexState {
-                    module: &v_mod.module,
-                    entry_point: Some(&desc.vertex_entry),
+                    module: v_mod.module_for_entry(desc.vertex_entry.as_deref(), true),
+                    entry_point: desc.vertex_entry.as_deref(),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     buffers: &vertex_buffer_layouts,
                 },
@@ -2423,7 +2679,7 @@ pub fn op_gfx_device_create_pipeline(
                 depth_stencil,
                 multisample,
                 multiview_mask: None,
-                cache: None, 
+                cache: None,
             })
     } else {
         ctx.device
@@ -2431,8 +2687,8 @@ pub fn op_gfx_device_create_pipeline(
                 label: Some("GFX Pipeline (auto layout)"),
                 layout: None,
                 vertex: wgpu::VertexState {
-                    module: &v_mod.module,
-                    entry_point: Some(&desc.vertex_entry),
+                    module: v_mod.module_for_entry(desc.vertex_entry.as_deref(), false),
+                    entry_point: desc.vertex_entry.as_deref(),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     buffers: &vertex_buffer_layouts,
                 },
@@ -2456,6 +2712,195 @@ pub fn op_gfx_surface_draw(
     let ctx = gfx_ctx()?;
 
     if args.draw_calls.is_empty() {
+        // Clear-only frame: acquire surface, clear with specified color, present
+        let surface = ctx.surface.as_ref()
+            .ok_or_else(|| JsErrorBox::generic("No surface in XR mode"))?;
+        let output = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                log::warn!("Surface timeout/occluded on clear-only frame");
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                log::warn!("Surface validation error on clear-only frame");
+                return Ok(());
+            }
+        };
+        if output.texture.width() == 0 || output.texture.height() == 0 {
+            return Ok(());
+        }
+
+        let surface_width = output.texture.width();
+        let surface_height = output.texture.height();
+        ensure_msaa_texture(&ctx.device, ctx.format, surface_width, surface_height);
+        let msaa_state_lock = get_msaa_state();
+        let msaa_state = msaa_state_lock.read().unwrap();
+        let msaa_view = &msaa_state.as_ref().unwrap().view;
+        let resolve_view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let clear_color = args.clear_color.as_ref().map(|c| wgpu::Color { r: c.r, g: c.g, b: c.b, a: c.a })
+            .unwrap_or(wgpu::Color::BLACK);
+
+        // Build depth attachment for clear-only frame if provided
+        let depth_view_arc: Option<Arc<wgpu::TextureView>> = args.depth_view_rid.and_then(|rid| {
+            gpu_get::<GfxTextureView>(state, rid).ok().map(|v| v.view.clone())
+        });
+        let depth_attachment = depth_view_arc.as_ref().map(|dv| {
+            wgpu::RenderPassDepthStencilAttachment {
+                view: dv.as_ref(),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(args.depth_clear_value.unwrap_or(1.0)),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }
+        });
+
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("GFX Clear-Only Encoder"),
+        });
+
+        // Execute compute commands even on clear-only frames
+        if let Some(ref compute_cmds) = args.compute_commands {
+            for cmd in compute_cmds.iter() {
+                match cmd.cmd.as_str() {
+                    "clear_buffer" => {
+                        if let Some(buf_rid) = cmd.buffer_rid {
+                            if let Ok(buf) = gpu_get::<GfxBuffer>(state, buf_rid) {
+                                encoder.clear_buffer(&buf.buffer, cmd.offset.unwrap_or(0), Some(cmd.size.unwrap_or(0)));
+                            }
+                        }
+                    }
+                    "dispatch" => {
+                        if let Some(p_rid) = cmd.pipeline_rid {
+                            if let Ok(pipeline) = gpu_get::<GfxComputePipeline>(state, p_rid) {
+                                let compute_qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
+                                    gpu_get::<GfxQuerySet>(state, tw.query_set_rid).ok()
+                                });
+                                let compute_ts_writes = match (&cmd.timestamp_writes, &compute_qs_ref) {
+                                    (Some(tw), Some(qs)) => Some(wgpu::ComputePassTimestampWrites {
+                                        query_set: &qs.query_set,
+                                        beginning_of_pass_write_index: tw.beginning_of_pass_write_index,
+                                        end_of_pass_write_index: tw.end_of_pass_write_index,
+                                    }),
+                                    _ => None,
+                                };
+                                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("Clear-Frame Compute Pass"),
+                                    timestamp_writes: compute_ts_writes,
+                                });
+                                pass.set_pipeline(&pipeline.pipeline);
+                                if let Some(ref rids) = cmd.bind_group_rids {
+                                    for (idx, rid_opt) in rids.iter().enumerate() {
+                                        if let Some(rid) = rid_opt {
+                                            if let Ok(bg) = gpu_get::<GfxBindGroup>(state, *rid) {
+                                                pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
+                                            }
+                                        }
+                                    }
+                                }
+                                pass.dispatch_workgroups(
+                                    cmd.workgroup_count_x.unwrap_or(1),
+                                    cmd.workgroup_count_y.unwrap_or(1),
+                                    cmd.workgroup_count_z.unwrap_or(1),
+                                );
+                            }
+                        }
+                    }
+                    "dispatch_indirect" => {
+                        if let (Some(p_rid), Some(ib_rid)) = (cmd.pipeline_rid, cmd.indirect_buffer_rid) {
+                            if let (Ok(pipeline), Ok(indirect_buf)) = (
+                                gpu_get::<GfxComputePipeline>(state, p_rid),
+                                gpu_get::<GfxBuffer>(state, ib_rid)
+                            ) {
+                                let compute_qs_ref = cmd.timestamp_writes.as_ref().and_then(|tw| {
+                                    gpu_get::<GfxQuerySet>(state, tw.query_set_rid).ok()
+                                });
+                                let compute_ts_writes = match (&cmd.timestamp_writes, &compute_qs_ref) {
+                                    (Some(tw), Some(qs)) => Some(wgpu::ComputePassTimestampWrites {
+                                        query_set: &qs.query_set,
+                                        beginning_of_pass_write_index: tw.beginning_of_pass_write_index,
+                                        end_of_pass_write_index: tw.end_of_pass_write_index,
+                                    }),
+                                    _ => None,
+                                };
+                                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("Clear-Frame Compute Pass Indirect"),
+                                    timestamp_writes: compute_ts_writes,
+                                });
+                                pass.set_pipeline(&pipeline.pipeline);
+                                if let Some(ref rids) = cmd.bind_group_rids {
+                                    for (idx, rid_opt) in rids.iter().enumerate() {
+                                        if let Some(rid) = rid_opt {
+                                            if let Ok(bg) = gpu_get::<GfxBindGroup>(state, *rid) {
+                                                pass.set_bind_group(idx as u32, bg.group.as_ref(), &[]);
+                                            }
+                                        }
+                                    }
+                                }
+                                pass.dispatch_workgroups_indirect(&indirect_buf.buffer, cmd.indirect_offset.unwrap_or(0));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("GFX Clear-Only Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: msaa_view,
+                    resolve_target: Some(&resolve_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: depth_attachment,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            // Pass drops here - just clear, no draws
+        }
+
+        // Handle timestamp resolve/copy even on clear-only frames
+        if let Some(ref resolve_ops) = args.resolve_query_sets {
+            for op in resolve_ops {
+                if let Ok(qs) = gpu_get::<GfxQuerySet>(state, op.query_set_rid) {
+                    if let Ok(dst) = gpu_get::<GfxBuffer>(state, op.destination_rid) {
+                        encoder.resolve_query_set(
+                            &qs.query_set,
+                            op.first_query..op.first_query + op.query_count,
+                            &dst.buffer,
+                            op.destination_offset,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(ref copy_ops) = args.copy_buffers {
+            for op in copy_ops {
+                if let Ok(src) = gpu_get::<GfxBuffer>(state, op.src_rid) {
+                    if let Ok(dst) = gpu_get::<GfxBuffer>(state, op.dst_rid) {
+                        encoder.copy_buffer_to_buffer(
+                            &src.buffer, op.src_offset,
+                            &dst.buffer, op.dst_offset, op.size,
+                        );
+                    }
+                }
+            }
+        }
+
+        flush_pending_commands(&ctx.queue);
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
         return Ok(());
     }
 
@@ -2547,21 +2992,17 @@ pub fn op_gfx_surface_draw(
     let surface = ctx.surface.as_ref()
         .ok_or_else(|| JsErrorBox::generic("No surface in XR mode"))?;
     let output = match surface.get_current_texture() {
-        Ok(t) => t,
-        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+        wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
             log::warn!("Surface lost or outdated, skipping frame");
             return Ok(());
         }
-        Err(wgpu::SurfaceError::OutOfMemory) => {
-            return Err(JsErrorBox::generic("GPU out of memory"));
-        }
-        Err(wgpu::SurfaceError::Timeout) => {
-            log::warn!("Surface timeout, skipping frame");
+        wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+            log::warn!("Surface timeout/occluded, skipping frame");
             return Ok(());
         }
-        Err(e) => {
-            log::error!("Surface error: {:?}", e);
-            return Ok(());
+        wgpu::CurrentSurfaceTexture::Validation => {
+            return Err(JsErrorBox::generic("Surface validation error"));
         }
     };
 
@@ -2663,8 +3104,10 @@ pub fn op_gfx_surface_draw(
     struct SurfaceDrawData {
         pipeline_rid: u32,
         vbufs: Vec<Arc<wgpu::Buffer>>,
+        vbuf_offsets: Vec<u64>,
         bgs: Vec<Option<Arc<wgpu::BindGroup>>>,
         index_buf: Option<Arc<wgpu::Buffer>>,
+        index_buf_offset: u64,
         indirect_buf: Option<Arc<wgpu::Buffer>>,
         index_format: wgpu::IndexFormat,
         is_multi_draw: bool,
@@ -2759,11 +3202,17 @@ pub fn op_gfx_surface_draw(
             _ => wgpu::IndexFormat::Uint32,
         };
 
+        let vbuf_offsets: Vec<u64> = dc.vertex_buffer_offsets.as_ref()
+            .map(|o| o.clone())
+            .unwrap_or_else(|| vec![0u64; vbufs.len()]);
+
         draw_data_list.push(SurfaceDrawData {
             pipeline_rid: dc.pipeline_rid,
             vbufs,
+            vbuf_offsets,
             bgs,
             index_buf,
+            index_buf_offset: dc.index_buffer_offset.unwrap_or(0),
             indirect_buf,
             index_format,
             is_multi_draw,
@@ -2958,6 +3407,20 @@ pub fn op_gfx_surface_draw(
         }
     }
 
+    // Write extra encoder-level timestamps (forwarded from render pass timestampWrites)
+    // Write the "beginning" timestamps before the render pass
+    if let Some(ref extra_ts) = args.extra_timestamp_writes {
+        for etw in extra_ts.iter() {
+            // Only write "beginning" timestamps here (even indices by convention)
+            // "end" timestamps are written after the render pass
+            if etw.query_index % 2 == 0 {
+                if let Ok(qs) = gpu_get::<GfxQuerySet>(state, etw.query_set_rid) {
+                    encoder.write_timestamp(&qs.query_set, etw.query_index);
+                }
+            }
+        }
+    }
+
     // Render pass for all draw calls
     {
         let depth_attachment = match (&depth_view, &depth_ops) {
@@ -2997,7 +3460,8 @@ pub fn op_gfx_surface_draw(
             pass.set_stencil_reference(data.stencil_reference);
 
             for (slot, buf) in data.vbufs.iter().enumerate() {
-                pass.set_vertex_buffer(slot as u32, buf.slice(..));
+                let offset = data.vbuf_offsets.get(slot).copied().unwrap_or(0);
+                pass.set_vertex_buffer(slot as u32, buf.slice(offset..));
             }
 
             for (idx, bg_opt) in data.bgs.iter().enumerate() {
@@ -3008,17 +3472,17 @@ pub fn op_gfx_surface_draw(
 
             if data.is_multi_draw {
                 if let (Some(ref idx_buf), Some(ref indirect)) = (&data.index_buf, &data.indirect_buf) {
-                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.set_index_buffer(idx_buf.slice(data.index_buf_offset..), data.index_format);
                     pass.multi_draw_indexed_indirect(indirect, data.indirect_offset, data.draw_count);
                 }
             } else if data.is_indirect {
                 if let (Some(ref idx_buf), Some(ref indirect)) = (&data.index_buf, &data.indirect_buf) {
-                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.set_index_buffer(idx_buf.slice(data.index_buf_offset..), data.index_format);
                     pass.draw_indexed_indirect(indirect, data.indirect_offset);
                 }
             } else if let Some(ref idx_buf) = data.index_buf {
                 if data.index_count > 0 {
-                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.set_index_buffer(idx_buf.slice(data.index_buf_offset..), data.index_format);
                     pass.draw_indexed(
                         data.first_index..(data.first_index + data.index_count),
                         data.base_vertex,
@@ -3030,6 +3494,17 @@ pub fn op_gfx_surface_draw(
                     data.first_vertex..(data.first_vertex + data.vertex_count),
                     data.first_instance..(data.first_instance + data.instance_count),
                 );
+            }
+        }
+    }
+
+    // Write extra encoder-level "end" timestamps (odd indices by convention)
+    if let Some(ref extra_ts) = args.extra_timestamp_writes {
+        for etw in extra_ts.iter() {
+            if etw.query_index % 2 == 1 {
+                if let Ok(qs) = gpu_get::<GfxQuerySet>(state, etw.query_set_rid) {
+                    encoder.write_timestamp(&qs.query_set, etw.query_index);
+                }
             }
         }
     }
@@ -3211,8 +3686,10 @@ pub struct RenderXrFrameArgs {
 struct XrDrawData {
     pipeline_rid: u32,
     vbufs: Vec<Arc<wgpu::Buffer>>,
+    vbuf_offsets: Vec<u64>,
     bgs: Vec<Option<Arc<wgpu::BindGroup>>>,
     index_buf: Option<Arc<wgpu::Buffer>>,
+    index_buf_offset: u64,
     indirect_buf: Option<Arc<wgpu::Buffer>>,
     index_format: wgpu::IndexFormat,
     is_multi_draw: bool,
@@ -3304,11 +3781,17 @@ pub fn op_gfx_render_xr_frame(
             _ => wgpu::IndexFormat::Uint32,
         };
 
+        let vbuf_offsets: Vec<u64> = dc.vertex_buffer_offsets.as_ref()
+            .map(|o| o.clone())
+            .unwrap_or_else(|| vec![0u64; vbufs.len()]);
+
         draw_data_list.push(XrDrawData {
             pipeline_rid: dc.pipeline_rid,
             vbufs,
+            vbuf_offsets,
             bgs,
             index_buf,
+            index_buf_offset: dc.index_buffer_offset.unwrap_or(0),
             indirect_buf,
             index_format,
             is_multi_draw,
@@ -3410,7 +3893,8 @@ pub fn op_gfx_render_xr_frame(
             pass.set_stencil_reference(data.stencil_reference);
 
             for (slot, buf) in data.vbufs.iter().enumerate() {
-                pass.set_vertex_buffer(slot as u32, buf.slice(..));
+                let offset = data.vbuf_offsets.get(slot).copied().unwrap_or(0);
+                pass.set_vertex_buffer(slot as u32, buf.slice(offset..));
             }
 
             for (idx, bg_opt) in data.bgs.iter().enumerate() {
@@ -3421,7 +3905,7 @@ pub fn op_gfx_render_xr_frame(
 
             if data.is_multi_draw {
                 if let Some(ref idx_buf) = data.index_buf {
-                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.set_index_buffer(idx_buf.slice(data.index_buf_offset..), data.index_format);
 
                     if let Some(ref indirect) = data.indirect_buf {
                         pass.multi_draw_indexed_indirect(
@@ -3433,12 +3917,12 @@ pub fn op_gfx_render_xr_frame(
                 }
             } else if data.is_indirect {
                 if let (Some(ref idx_buf), Some(ref indirect)) = (&data.index_buf, &data.indirect_buf) {
-                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.set_index_buffer(idx_buf.slice(data.index_buf_offset..), data.index_format);
                     pass.draw_indexed_indirect(indirect, data.indirect_offset);
                 }
             } else if let Some(ref idx_buf) = data.index_buf {
                 if data.index_count > 0 {
-                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.set_index_buffer(idx_buf.slice(data.index_buf_offset..), data.index_format);
                     pass.draw_indexed(
                         data.first_index..(data.first_index + data.index_count),
                         data.base_vertex,
@@ -3530,8 +4014,10 @@ pub fn op_gfx_render_to_texture(
     struct TextureDrawData {
         pipeline_rid: u32,
         vbufs: Vec<Arc<wgpu::Buffer>>,
+        vbuf_offsets: Vec<u64>,
         bgs: Vec<Option<Arc<wgpu::BindGroup>>>,
         index_buf: Option<Arc<wgpu::Buffer>>,
+        index_buf_offset: u64,
         index_format: wgpu::IndexFormat,
         index_count: u32,
         first_index: u32,
@@ -3578,11 +4064,17 @@ pub fn op_gfx_render_to_texture(
             _ => wgpu::IndexFormat::Uint32,
         };
 
+        let vbuf_offsets: Vec<u64> = dc.vertex_buffer_offsets.as_ref()
+            .map(|o| o.clone())
+            .unwrap_or_else(|| vec![0u64; vbufs.len()]);
+
         draw_data_list.push(TextureDrawData {
             pipeline_rid: dc.pipeline_rid,
             vbufs,
+            vbuf_offsets,
             bgs,
             index_buf,
+            index_buf_offset: dc.index_buffer_offset.unwrap_or(0),
             index_format,
             index_count: dc.index_count,
             first_index: dc.first_index,
@@ -3640,7 +4132,8 @@ pub fn op_gfx_render_to_texture(
             }
 
             for (slot, buf) in data.vbufs.iter().enumerate() {
-                pass.set_vertex_buffer(slot as u32, buf.slice(..));
+                let offset = data.vbuf_offsets.get(slot).copied().unwrap_or(0);
+                pass.set_vertex_buffer(slot as u32, buf.slice(offset..));
             }
 
             for (idx, bg_opt) in data.bgs.iter().enumerate() {
@@ -3651,7 +4144,7 @@ pub fn op_gfx_render_to_texture(
 
             if let Some(ref idx_buf) = data.index_buf {
                 if data.index_count > 0 {
-                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.set_index_buffer(idx_buf.slice(data.index_buf_offset..), data.index_format);
                     pass.draw_indexed(
                         data.first_index..(data.first_index + data.index_count),
                         data.base_vertex,
@@ -3802,8 +4295,10 @@ pub fn op_gfx_render_depth_only(
     struct DepthDrawData {
         pipeline_rid: u32,
         vbufs: Vec<Arc<wgpu::Buffer>>,
+        vbuf_offsets: Vec<u64>,
         bgs: Vec<Option<Arc<wgpu::BindGroup>>>,
         index_buf: Option<Arc<wgpu::Buffer>>,
+        index_buf_offset: u64,
         index_format: wgpu::IndexFormat,
         index_count: u32,
         first_index: u32,
@@ -3849,11 +4344,17 @@ pub fn op_gfx_render_depth_only(
             _ => wgpu::IndexFormat::Uint32,
         };
 
+        let vbuf_offsets: Vec<u64> = dc.vertex_buffer_offsets.as_ref()
+            .map(|o| o.clone())
+            .unwrap_or_else(|| vec![0u64; vbufs.len()]);
+
         draw_data_list.push(DepthDrawData {
             pipeline_rid: dc.pipeline_rid,
             vbufs,
+            vbuf_offsets,
             bgs,
             index_buf,
+            index_buf_offset: dc.index_buffer_offset.unwrap_or(0),
             index_format,
             index_count: dc.index_count,
             first_index: dc.first_index,
@@ -3896,7 +4397,8 @@ pub fn op_gfx_render_depth_only(
             pass.set_stencil_reference(data.stencil_reference);
 
             for (slot, buf) in data.vbufs.iter().enumerate() {
-                pass.set_vertex_buffer(slot as u32, buf.slice(..));
+                let offset = data.vbuf_offsets.get(slot).copied().unwrap_or(0);
+                pass.set_vertex_buffer(slot as u32, buf.slice(offset..));
             }
 
             for (idx, bg_opt) in data.bgs.iter().enumerate() {
@@ -3907,7 +4409,7 @@ pub fn op_gfx_render_depth_only(
 
             if let Some(ref idx_buf) = data.index_buf {
                 if data.index_count > 0 {
-                    pass.set_index_buffer(idx_buf.slice(..), data.index_format);
+                    pass.set_index_buffer(idx_buf.slice(data.index_buf_offset..), data.index_format);
                     pass.draw_indexed(
                         data.first_index..(data.first_index + data.index_count),
                         data.base_vertex,
@@ -4046,7 +4548,7 @@ pub fn op_gfx_device_create_compute_pipeline(
         ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("GFX Compute Pipeline"),
             layout: Some(&pl.layout),
-            module: &shader.module,
+            module: shader.module_for_entry(Some(&desc.entry_point), true),
             entry_point: Some(&desc.entry_point),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
@@ -4055,7 +4557,7 @@ pub fn op_gfx_device_create_compute_pipeline(
         ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("GFX Compute Pipeline (auto layout)"),
             layout: None,
-            module: &shader.module,
+            module: shader.module_for_entry(Some(&desc.entry_point), false),
             entry_point: Some(&desc.entry_point),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
@@ -4572,6 +5074,9 @@ pub fn op_gfx_buffer_map_async(
         wgpu::MapMode::Write
     };
 
+    if size == 0 {
+        return Err(JsErrorBox::generic("buffer_map_async: size must be > 0"));
+    }
     let slice = buffer.slice(offset..offset + size);
 
     // Set up async tracking

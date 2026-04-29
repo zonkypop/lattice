@@ -115,6 +115,8 @@ fn should_exit_xr() -> bool {
 extension!(
     gfx_host,
     ops = [
+        gfx::op_gfx_set_use_tint,
+        gfx::op_gfx_get_use_tint,
         gfx::op_gfx_get_preferred_surface_format,
         gfx::op_gfx_surface_configure,
         gfx::op_gfx_device_create_shader,
@@ -287,9 +289,9 @@ impl GpuState {
     async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let surface = instance
@@ -329,6 +331,8 @@ impl GpuState {
             features |= wgpu::Features::TEXTURE_COMPRESSION_ASTC;
             info!("Enabling TEXTURE_COMPRESSION_ASTC feature");
         }
+        // Enable passthrough shaders so Tint-compiled SPIR-V can bypass Naga validation
+        features |= wgpu::Features::PASSTHROUGH_SHADERS;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {

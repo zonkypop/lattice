@@ -83,6 +83,21 @@ if (typeof ImageData === "undefined") {
 }
 globalThis.performance ??= { now: () => Date.now() };
 
+// WebGL enum constants (used by glTF loaders for component types, topology, samplers)
+if (typeof WebGLRenderingContext === 'undefined') {
+  globalThis.WebGLRenderingContext = {
+    BYTE: 0x1400, UNSIGNED_BYTE: 0x1401,
+    SHORT: 0x1402, UNSIGNED_SHORT: 0x1403,
+    UNSIGNED_INT: 0x1405, FLOAT: 0x1406,
+    TRIANGLES: 0x0004, TRIANGLE_STRIP: 0x0005,
+    LINES: 0x0001, LINE_STRIP: 0x0003, POINTS: 0x0000,
+    NEAREST: 0x2600, LINEAR: 0x2601,
+    NEAREST_MIPMAP_NEAREST: 0x2700, LINEAR_MIPMAP_NEAREST: 0x2701,
+    NEAREST_MIPMAP_LINEAR: 0x2702, LINEAR_MIPMAP_LINEAR: 0x2703,
+    REPEAT: 0x2901, CLAMP_TO_EDGE: 0x812F, MIRRORED_REPEAT: 0x8370,
+  };
+}
+
 // RAF system
 let __rafCallbacks = [];
 let __rafId = 0;

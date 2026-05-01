@@ -47,25 +47,7 @@ fn normalize_file_path(path: &str) -> String {
 }
 
 impl ImportMapModuleLoader {
-    pub fn new(script_dir: PathBuf, import_map_path: Option<PathBuf>) -> Result<Self, anyhow::Error> {
-        let import_map = if let Some(map_path) = import_map_path {
-            let map_text = std::fs::read_to_string(&map_path)?;
-            let base_url = ModuleSpecifier::from_file_path(&map_path)
-                .map_err(|_| anyhow::anyhow!("Invalid import map path"))?;
-            
-            let result = import_map::parse_from_json(base_url, &map_text)?;
-            
-            for warning in result.diagnostics.iter() {
-                log::warn!("Import map warning: {}", warning);
-            }
-            
-            Some(Arc::new(result.import_map))
-        } else {
-            None
-        };
-
-   
-
+    pub fn new(script_dir: PathBuf) -> Result<Self, anyhow::Error> {
         #[cfg(target_os = "android")]
         let setup_path = std::path::PathBuf::from("/data/local/tmp/combined_app/src/shims/setup.js");
         #[cfg(not(target_os = "android"))]
@@ -76,7 +58,26 @@ impl ImportMapModuleLoader {
         let setup_module_path = setup_path.exists().then_some(setup_path);
 
         Ok(Self {
-            import_map,
+            import_map: None,
+            script_dir,
+            setup_module_path,
+        })
+    }
+
+    /// Create a loader with a pre-parsed import map (used for URL mode where
+    /// the import map was fetched from the remote endpoint).
+    pub fn new_with_import_map(script_dir: PathBuf, map: ImportMap) -> Result<Self, anyhow::Error> {
+        #[cfg(target_os = "android")]
+        let setup_path = std::path::PathBuf::from("/data/local/tmp/combined_app/src/shims/setup.js");
+        #[cfg(not(target_os = "android"))]
+        let setup_path = std::env::current_dir()
+            .map(|d| d.join("src/shims/setup.js"))
+            .unwrap_or_else(|_| PathBuf::from("src/shims/setup.js"));
+
+        let setup_module_path = setup_path.exists().then_some(setup_path);
+
+        Ok(Self {
+            import_map: Some(Arc::new(map)),
             script_dir,
             setup_module_path,
         })
@@ -151,6 +152,15 @@ impl ImportMapModuleLoader {
             .ok()
             .map(|url| format!("import \"{}\";\n", url))
     }
+
+    /// Return an absolute file:// import for setup.js (used for HTTP-loaded modules
+    /// where relative paths don't make sense).
+    fn get_setup_import_absolute(&self) -> Option<String> {
+        let setup_path = self.setup_module_path.as_ref()?;
+        ModuleSpecifier::from_file_path(setup_path)
+            .ok()
+            .map(|url| format!("import \"{}\";\n", url))
+    }
 }
 
 impl ModuleLoader for ImportMapModuleLoader {
@@ -160,6 +170,12 @@ impl ModuleLoader for ImportMapModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, JsErrorBox> {
+        // Absolute HTTP URL — resolve directly
+        if specifier.starts_with("http://") || specifier.starts_with("https://") {
+            return ModuleSpecifier::parse(specifier)
+                .map_err(|e| JsErrorBox::generic(e.to_string()));
+        }
+
         let referrer_url = if referrer.is_empty() || referrer == "." {
             ModuleSpecifier::from_file_path(&self.script_dir.join("dummy.js"))
                 .map_err(|_| JsErrorBox::generic("Invalid script dir"))?
@@ -172,16 +188,22 @@ impl ModuleLoader for ImportMapModuleLoader {
                 .map_err(|e| JsErrorBox::generic(e.to_string()))?
         };
 
+        // If referrer is HTTP, resolve relative to it (and check import map)
+        let referrer_is_http = referrer_url.scheme() == "http" || referrer_url.scheme() == "https";
+
         if let Some(ref import_map) = self.import_map {
             match import_map.resolve(specifier, &referrer_url) {
                 Ok(resolved) => return Ok(resolved),
                 Err(e) => {
                     let err_str = e.to_string();
-                    if err_str.contains("Relative import path") || 
-                       specifier.starts_with("./") || 
+                    if err_str.contains("Relative import path") ||
+                       specifier.starts_with("./") ||
                        specifier.starts_with("../") ||
                        specifier.starts_with("/") {
-                        return Err(JsErrorBox::generic(e.to_string()));
+                        // For HTTP referrers, fall through to URL join instead of erroring
+                        if !referrer_is_http {
+                            return Err(JsErrorBox::generic(e.to_string()));
+                        }
                     }
                 }
             }
@@ -198,7 +220,54 @@ impl ModuleLoader for ImportMapModuleLoader {
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let specifier = module_specifier.clone();
-        
+
+        // HTTP/HTTPS — fetch over network
+        if specifier.scheme() == "http" || specifier.scheme() == "https" {
+            let setup_import = if self.should_inject_setup(&specifier, "") {
+                self.get_setup_import_absolute()
+            } else {
+                None
+            };
+            let is_raw = specifier.query() == Some("raw");
+
+            // Synchronous HTTP fetch (matches the sync file-loading path and
+            // avoids deadlocks on deno's single-threaded tokio runtime)
+            let code = match ureq::get(specifier.as_str()).call() {
+                Ok(resp) => {
+                    resp.into_body().read_to_string()
+                        .map_err(|e| JsErrorBox::generic(format!("Failed to read response from {}: {}", specifier, e)))
+                }
+                Err(e) => Err(JsErrorBox::generic(format!("Failed to fetch {}: {}", specifier, e))),
+            };
+            let code = match code {
+                Ok(c) => c,
+                Err(e) => return ModuleLoadResponse::Sync(Err(e)),
+            };
+
+            let final_code = if is_raw {
+                let escaped = code.replace('\\', "\\\\").replace('`', "\\`").replace("${", "\\${");
+                format!("export default `{}`;", escaped)
+            } else {
+                let needs_setup = setup_import.is_some() && !code.contains("import \"./setup.js\"") && !code.contains("import './setup.js'");
+                if needs_setup {
+                    if let Some(ref import) = setup_import {
+                        format!("{}{}", import, code)
+                    } else {
+                        code
+                    }
+                } else {
+                    code
+                }
+            };
+
+            return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(final_code.into()),
+                &specifier,
+                None,
+            )));
+        }
+
         let file_path = match specifier.to_file_path() {
             Ok(mut p) => {
                 #[cfg(target_os = "windows")]
@@ -216,7 +285,7 @@ impl ModuleLoader for ImportMapModuleLoader {
                 ));
             }
         };
-    
+
         // Handle ?raw imports (Vite-style): export file content as a string
         let is_raw = specifier.query() == Some("raw");
 
@@ -248,7 +317,7 @@ impl ModuleLoader for ImportMapModuleLoader {
         } else {
             code
         };
-    
+
         ModuleLoadResponse::Sync(Ok(ModuleSource::new(
             ModuleType::JavaScript,
             ModuleSourceCode::String(final_code.into()),

@@ -484,37 +484,49 @@ function _getAudioCtx() {
   return _sharedAudioCtx;
 }
 
+async function _readFrom(url) {
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return new Uint8Array(await resp.arrayBuffer());
+  }
+  return Deno.readFile(url);
+}
+
 async function _resolveAndRead(rawPath) {
   let path = rawPath.startsWith('./') ? rawPath.slice(2) : rawPath;
 
   // If we already know the working prefix, use it directly
   if (_resolvedPrefix !== undefined) {
-    return Deno.readFile((_resolvedPrefix || '') + path);
+    return _readFrom((_resolvedPrefix || '') + path);
   }
 
   // Try candidate prefixes in order until one works, then cache the winner
   const explicit = globalThis.__audioBasePath__;
   const scriptDir = globalThis.__scriptDir__ || '';
+  const isUrlMode = scriptDir.startsWith('http://') || scriptDir.startsWith('https://');
   const candidates = [];
   if (explicit) candidates.push(explicit);
-  candidates.push('');             // cwd-relative
-  if (scriptDir) {
-    candidates.push(scriptDir);    // entry script dir  (e.g. "js/")
-    // Also try one level deeper for common "web root inside script dir" layouts
-    // e.g. js/u/ when entry is js/entry.js
-    try {
-      const entries = Deno.readDirSync(scriptDir);
-      for (const e of entries) {
-        if (e.isDirectory && !e.name.startsWith('.')) {
-          candidates.push(scriptDir + e.name + '/');
+  if (isUrlMode) {
+    candidates.push(scriptDir);   // e.g. http://localhost:8000/
+  } else {
+    candidates.push('');           // cwd-relative
+    if (scriptDir) {
+      candidates.push(scriptDir);
+      try {
+        const entries = Deno.readDirSync(scriptDir);
+        for (const e of entries) {
+          if (e.isDirectory && !e.name.startsWith('.')) {
+            candidates.push(scriptDir + e.name + '/');
+          }
         }
-      }
-    } catch (_) {}
+      } catch (_) {}
+    }
   }
 
   for (const prefix of candidates) {
     try {
-      const data = await Deno.readFile(prefix + path);
+      const data = await _readFrom(prefix + path);
       _resolvedPrefix = prefix;
       if (prefix) console.log(`[Audio] resolved base path: ${prefix}`);
       return data;

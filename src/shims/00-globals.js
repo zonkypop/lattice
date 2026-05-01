@@ -83,6 +83,33 @@ if (typeof ImageData === "undefined") {
 }
 globalThis.performance ??= { now: () => Date.now() };
 
+// Override fetch to use synchronous native HTTP when available.
+// Deno's built-in async fetch deadlocks on the single-threaded tokio runtime.
+if (globalThis.__httpFetch) {
+  const _nativeFetch = globalThis.__httpFetch;
+  const _denoFetch = globalThis.fetch; // keep for non-HTTP (e.g. data: URIs)
+  globalThis.fetch = function fetch(input, init) {
+    let url = typeof input === 'string' ? input : input?.url;
+    // Only intercept GET/HEAD on http(s) URLs
+    const method = init?.method?.toUpperCase() || 'GET';
+    if (url && (url.startsWith('http://') || url.startsWith('https://')) && (method === 'GET' || method === 'HEAD')) {
+      try {
+        const bytes = _nativeFetch(url);
+        const headers = new Headers();
+        if (url.endsWith('.json')) headers.set('content-type', 'application/json');
+        else if (url.endsWith('.wasm')) headers.set('content-type', 'application/wasm');
+        else if (url.endsWith('.js') || url.endsWith('.mjs')) headers.set('content-type', 'application/javascript');
+        return Promise.resolve(new Response(bytes.buffer, { status: 200, headers }));
+      } catch (e) {
+        return Promise.reject(new TypeError(`fetch failed: ${e.message}`));
+      }
+    }
+    // Fall through to deno's fetch for non-HTTP or non-GET
+    if (_denoFetch) return _denoFetch(input, init);
+    return Promise.reject(new TypeError('fetch not available'));
+  };
+}
+
 // WebGL enum constants (used by glTF loaders for component types, topology, samplers)
 if (typeof WebGLRenderingContext === 'undefined') {
   globalThis.WebGLRenderingContext = {

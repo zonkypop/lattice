@@ -305,7 +305,7 @@ echo "    Done."
 # Fix 9: Download pre-built binding file
 # -------------------------------------------------------
 echo ">>> Fix 9: Downloading pre-built binding file for aarch64"
-BINDING_FILE="$HOME/Desktop/research/src_binding_release_aarch64-linux-android.rs"
+BINDING_FILE="$HOME/Desktop/DEV/research/src_binding_release_aarch64-linux-android.rs"
 if [ ! -f "$BINDING_FILE" ]; then
   echo "      Downloading from rusty_v8 releases..."
   V8_VERSION=$(grep '^version' "$V8_RUST/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')

@@ -136,9 +136,11 @@ import {
 
   // event loop
   op_yield_to_runtime,
+  op_http_fetch,
 } from "ext:core/ops";
 
 globalThis.__yieldToRuntime = op_yield_to_runtime;
+globalThis.__httpFetch = op_http_fetch;
 
 globalThis.__xr = {
   op_xr_is_supported,

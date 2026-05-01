@@ -978,116 +978,104 @@ pub fn op_xr_get_viewer_pose() -> Result<XrViewerPose, JsErrorBox> {
     Ok(XrViewerPose { views: xr_views })
 }
 
+fn get_pose(space: &xr::Space, stage: &xr::Space, time: xr::Time) -> Option<XrPose> {
+    space.locate(stage, time).ok()
+        .filter(|loc| loc.location_flags.contains(
+            xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID
+        ))
+        .map(|loc| XrPose {
+            position: [loc.pose.position.x, loc.pose.position.y, loc.pose.position.z],
+            orientation: [loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w],
+            matrix: pose_to_matrix(&loc.pose),
+        })
+}
+
+fn build_controller_source(
+    session: &xr::Session<xr::Vulkan>,
+    grip_space: &xr::Space,
+    aim_space: &xr::Space,
+    stage_space: &xr::Space,
+    time: xr::Time,
+    trigger_action: &xr::Action<f32>,
+    squeeze_action: &xr::Action<f32>,
+    thumbstick_action: &xr::Action<xr::Vector2f>,
+    stick_click_action: &xr::Action<bool>,
+    face_button_1: &xr::Action<bool>,
+    face_button_2: &xr::Action<bool>,
+    handedness: &str,
+) -> Option<XrInputSourceData> {
+    let grip = get_pose(grip_space, stage_space, time);
+    let aim = get_pose(aim_space, stage_space, time);
+
+    if grip.is_none() && aim.is_none() {
+        return None;
+    }
+
+    let trigger = trigger_action.state(session, xr::Path::NULL)
+        .map(|s| s.current_state).unwrap_or(0.0);
+    let squeeze = squeeze_action.state(session, xr::Path::NULL)
+        .map(|s| s.current_state).unwrap_or(0.0);
+    let thumbstick = thumbstick_action.state(session, xr::Path::NULL)
+        .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
+    let stick_click = stick_click_action.state(session, xr::Path::NULL)
+        .map(|s| s.current_state).unwrap_or(false);
+    let btn1 = face_button_1.state(session, xr::Path::NULL)
+        .map(|s| s.current_state).unwrap_or(false);
+    let btn2 = face_button_2.state(session, xr::Path::NULL)
+        .map(|s| s.current_state).unwrap_or(false);
+
+    Some(XrInputSourceData {
+        handedness: handedness.to_string(),
+        target_ray_mode: "tracked-pointer".to_string(),
+        profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
+        grip_space_pose: grip,
+        target_ray_pose: aim,
+        gamepad: Some(XrGamepadData {
+            buttons: vec![
+                XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
+                XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
+                XrButtonData { pressed: false, touched: false, value: 0.0 },
+                XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
+                XrButtonData { pressed: btn1, touched: btn1, value: if btn1 { 1.0 } else { 0.0 } },
+                XrButtonData { pressed: btn2, touched: btn2, value: if btn2 { 1.0 } else { 0.0 } },
+            ],
+            axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
+        }),
+        hand: None,
+    })
+}
+
+fn collect_input_sources(state: &XrState, time: xr::Time) -> Vec<XrInputSourceData> {
+    let active_action_set = xr::ActiveActionSet::new(&state.action_set);
+    if state.session.sync_actions(&[active_action_set]).is_err() {
+        return vec![];
+    }
+
+    let mut sources = Vec::with_capacity(2);
+    if let Some(src) = build_controller_source(
+        &state.session, &state.left_grip_space, &state.left_aim_space, &state.stage_space, time,
+        &state.left_trigger_action, &state.left_squeeze_action, &state.left_thumbstick_action,
+        &state.left_thumbstick_click_action, &state.left_x_button_action, &state.left_y_button_action, "left",
+    ) { sources.push(src); }
+    if let Some(src) = build_controller_source(
+        &state.session, &state.right_grip_space, &state.right_aim_space, &state.stage_space, time,
+        &state.right_trigger_action, &state.right_squeeze_action, &state.right_thumbstick_action,
+        &state.right_thumbstick_click_action, &state.right_a_button_action, &state.right_b_button_action, "right",
+    ) { sources.push(src); }
+    sources
+}
+
 #[op2]
 #[serde]
 pub fn op_xr_get_input_sources() -> Result<XrInputSourcesState, JsErrorBox> {
     let mut guard = get_xr_state().lock().unwrap();
     let state = guard.as_mut().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
-    
+
     let frame_state = state.frame_state.as_ref()
         .ok_or_else(|| JsErrorBox::generic("No frame state"))?;
-    
-    // Sync actions
-    let active_action_set = xr::ActiveActionSet::new(&state.action_set);
-    if let Err(e) = state.session.sync_actions(&[active_action_set]) {
-        log::warn!("Sync actions failed: {}", e);
-        return Ok(XrInputSourcesState { sources: vec![] });
-    }
-    
-    let mut sources = Vec::new();
-    let time = frame_state.predicted_display_time;
-    
-    // Helper to get pose
-    let get_pose = |space: &xr::Space, stage: &xr::Space, time: xr::Time| -> Option<XrPose> {
-        space.locate(stage, time).ok()
-            .filter(|loc| loc.location_flags.contains(
-                xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID
-            ))
-            .map(|loc| XrPose {
-                position: [loc.pose.position.x, loc.pose.position.y, loc.pose.position.z],
-                orientation: [loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w],
-                matrix: pose_to_matrix(&loc.pose),
-            })
-    };
-    
-    // Left controller
-    let left_grip = get_pose(&state.left_grip_space, &state.stage_space, time);
-    let left_aim = get_pose(&state.left_aim_space, &state.stage_space, time);
-    
-    if left_grip.is_some() || left_aim.is_some() {
-        let trigger = state.left_trigger_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(0.0);
-        let squeeze = state.left_squeeze_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(0.0);
-        let thumbstick = state.left_thumbstick_action.state(&state.session, xr::Path::NULL)
-            .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
-        let stick_click = state.left_thumbstick_click_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(false);
-        let x_btn = state.left_x_button_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(false);
-        let y_btn = state.left_y_button_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(false);
-        
-        sources.push(XrInputSourceData {
-            handedness: "left".to_string(),
-            target_ray_mode: "tracked-pointer".to_string(),
-            profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
-            grip_space_pose: left_grip,
-            target_ray_pose: left_aim,
-            gamepad: Some(XrGamepadData {
-                buttons: vec![
-                    XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
-                    XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
-                    XrButtonData { pressed: false, touched: false, value: 0.0 },
-                    XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
-                    XrButtonData { pressed: x_btn, touched: x_btn, value: if x_btn { 1.0 } else { 0.0 } },
-                    XrButtonData { pressed: y_btn, touched: y_btn, value: if y_btn { 1.0 } else { 0.0 } },
-                ],
-                axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
-            }),
-            hand: None,
-        });
-    }
-    
-    // Right controller
-    let right_grip = get_pose(&state.right_grip_space, &state.stage_space, time);
-    let right_aim = get_pose(&state.right_aim_space, &state.stage_space, time);
-    
-    if right_grip.is_some() || right_aim.is_some() {
-        let trigger = state.right_trigger_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(0.0);
-        let squeeze = state.right_squeeze_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(0.0);
-        let thumbstick = state.right_thumbstick_action.state(&state.session, xr::Path::NULL)
-            .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
-        let stick_click = state.right_thumbstick_click_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(false);
-        let a_btn = state.right_a_button_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(false);
-        let b_btn = state.right_b_button_action.state(&state.session, xr::Path::NULL)
-            .map(|s| s.current_state).unwrap_or(false);
-        
-        sources.push(XrInputSourceData {
-            handedness: "right".to_string(),
-            target_ray_mode: "tracked-pointer".to_string(),
-            profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
-            grip_space_pose: right_grip,
-            target_ray_pose: right_aim,
-            gamepad: Some(XrGamepadData {
-                buttons: vec![
-                    XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
-                    XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
-                    XrButtonData { pressed: false, touched: false, value: 0.0 },
-                    XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
-                    XrButtonData { pressed: a_btn, touched: a_btn, value: if a_btn { 1.0 } else { 0.0 } },
-                    XrButtonData { pressed: b_btn, touched: b_btn, value: if b_btn { 1.0 } else { 0.0 } },
-                ],
-                axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
-            }),
-            hand: None,
-        });
-    }
-    
+
+    let sources = collect_input_sources(state, frame_state.predicted_display_time);
+
     Ok(XrInputSourcesState { sources })
 }
 
@@ -1163,105 +1151,8 @@ pub fn op_xr_frame_begin() -> Result<XrFrameBeginResult, JsErrorBox> {
     let viewer_pose = Some(XrViewerPose { views: xr_views });
 
     // === get_input_sources ===
-    let active_action_set = xr::ActiveActionSet::new(&state.action_set);
-    let input_sources = if state.session.sync_actions(&[active_action_set]).is_ok() {
-        let time = frame_state.predicted_display_time;
-        let mut sources = Vec::with_capacity(2);
-
-        // Helper to get pose
-        let get_pose = |space: &xr::Space, stage: &xr::Space, time: xr::Time| -> Option<XrPose> {
-            space.locate(stage, time).ok()
-                .filter(|loc| loc.location_flags.contains(
-                    xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID
-                ))
-                .map(|loc| XrPose {
-                    position: [loc.pose.position.x, loc.pose.position.y, loc.pose.position.z],
-                    orientation: [loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w],
-                    matrix: pose_to_matrix(&loc.pose),
-                })
-        };
-
-        // Left controller
-        let left_grip = get_pose(&state.left_grip_space, &state.stage_space, time);
-        let left_aim = get_pose(&state.left_aim_space, &state.stage_space, time);
-
-        if left_grip.is_some() || left_aim.is_some() {
-            let trigger = state.left_trigger_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(0.0);
-            let squeeze = state.left_squeeze_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(0.0);
-            let thumbstick = state.left_thumbstick_action.state(&state.session, xr::Path::NULL)
-                .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
-            let stick_click = state.left_thumbstick_click_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-            let x_btn = state.left_x_button_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-            let y_btn = state.left_y_button_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-
-            sources.push(XrInputSourceData {
-                handedness: "left".to_string(),
-                target_ray_mode: "tracked-pointer".to_string(),
-                profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
-                grip_space_pose: left_grip,
-                target_ray_pose: left_aim,
-                gamepad: Some(XrGamepadData {
-                    buttons: vec![
-                        XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
-                        XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
-                        XrButtonData { pressed: false, touched: false, value: 0.0 },
-                        XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
-                        XrButtonData { pressed: x_btn, touched: x_btn, value: if x_btn { 1.0 } else { 0.0 } },
-                        XrButtonData { pressed: y_btn, touched: y_btn, value: if y_btn { 1.0 } else { 0.0 } },
-                    ],
-                    axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
-                }),
-                hand: None,
-            });
-        }
-
-        // Right controller
-        let right_grip = get_pose(&state.right_grip_space, &state.stage_space, time);
-        let right_aim = get_pose(&state.right_aim_space, &state.stage_space, time);
-
-        if right_grip.is_some() || right_aim.is_some() {
-            let trigger = state.right_trigger_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(0.0);
-            let squeeze = state.right_squeeze_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(0.0);
-            let thumbstick = state.right_thumbstick_action.state(&state.session, xr::Path::NULL)
-                .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
-            let stick_click = state.right_thumbstick_click_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-            let a_btn = state.right_a_button_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-            let b_btn = state.right_b_button_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-
-            sources.push(XrInputSourceData {
-                handedness: "right".to_string(),
-                target_ray_mode: "tracked-pointer".to_string(),
-                profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
-                grip_space_pose: right_grip,
-                target_ray_pose: right_aim,
-                gamepad: Some(XrGamepadData {
-                    buttons: vec![
-                        XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
-                        XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
-                        XrButtonData { pressed: false, touched: false, value: 0.0 },
-                        XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
-                        XrButtonData { pressed: a_btn, touched: a_btn, value: if a_btn { 1.0 } else { 0.0 } },
-                        XrButtonData { pressed: b_btn, touched: b_btn, value: if b_btn { 1.0 } else { 0.0 } },
-                    ],
-                    axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
-                }),
-                hand: None,
-            });
-        }
-
-        XrInputSourcesState { sources }
-    } else {
-        XrInputSourcesState { sources: Vec::new() }
+    let input_sources = XrInputSourcesState {
+        sources: collect_input_sources(state, frame_state.predicted_display_time),
     };
 
     // === acquire_swapchain_image ===
@@ -1553,105 +1444,8 @@ pub fn op_xr_frame_wait_finish() -> Result<XrFrameBeginResult, JsErrorBox> {
     let viewer_pose = Some(XrViewerPose { views: xr_views });
 
     // === get_input_sources ===
-    let active_action_set = xr::ActiveActionSet::new(&state.action_set);
-    let input_sources = if state.session.sync_actions(&[active_action_set]).is_ok() {
-        let time = frame_state.predicted_display_time;
-        let mut sources = Vec::with_capacity(2);
-
-        // Helper to get pose
-        let get_pose = |space: &xr::Space, stage: &xr::Space, time: xr::Time| -> Option<XrPose> {
-            space.locate(stage, time).ok()
-                .filter(|loc| loc.location_flags.contains(
-                    xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID
-                ))
-                .map(|loc| XrPose {
-                    position: [loc.pose.position.x, loc.pose.position.y, loc.pose.position.z],
-                    orientation: [loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w],
-                    matrix: pose_to_matrix(&loc.pose),
-                })
-        };
-
-        // Left controller
-        let left_grip = get_pose(&state.left_grip_space, &state.stage_space, time);
-        let left_aim = get_pose(&state.left_aim_space, &state.stage_space, time);
-
-        if left_grip.is_some() || left_aim.is_some() {
-            let trigger = state.left_trigger_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(0.0);
-            let squeeze = state.left_squeeze_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(0.0);
-            let thumbstick = state.left_thumbstick_action.state(&state.session, xr::Path::NULL)
-                .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
-            let stick_click = state.left_thumbstick_click_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-            let x_btn = state.left_x_button_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-            let y_btn = state.left_y_button_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-
-            sources.push(XrInputSourceData {
-                handedness: "left".to_string(),
-                target_ray_mode: "tracked-pointer".to_string(),
-                profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
-                grip_space_pose: left_grip,
-                target_ray_pose: left_aim,
-                gamepad: Some(XrGamepadData {
-                    buttons: vec![
-                        XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
-                        XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
-                        XrButtonData { pressed: false, touched: false, value: 0.0 },
-                        XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
-                        XrButtonData { pressed: x_btn, touched: x_btn, value: if x_btn { 1.0 } else { 0.0 } },
-                        XrButtonData { pressed: y_btn, touched: y_btn, value: if y_btn { 1.0 } else { 0.0 } },
-                    ],
-                    axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
-                }),
-                hand: None,
-            });
-        }
-
-        // Right controller
-        let right_grip = get_pose(&state.right_grip_space, &state.stage_space, time);
-        let right_aim = get_pose(&state.right_aim_space, &state.stage_space, time);
-
-        if right_grip.is_some() || right_aim.is_some() {
-            let trigger = state.right_trigger_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(0.0);
-            let squeeze = state.right_squeeze_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(0.0);
-            let thumbstick = state.right_thumbstick_action.state(&state.session, xr::Path::NULL)
-                .map(|s| (s.current_state.x, s.current_state.y)).unwrap_or((0.0, 0.0));
-            let stick_click = state.right_thumbstick_click_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-            let a_btn = state.right_a_button_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-            let b_btn = state.right_b_button_action.state(&state.session, xr::Path::NULL)
-                .map(|s| s.current_state).unwrap_or(false);
-
-            sources.push(XrInputSourceData {
-                handedness: "right".to_string(),
-                target_ray_mode: "tracked-pointer".to_string(),
-                profiles: vec!["oculus-touch-v3".to_string(), "oculus-touch".to_string(), "generic-trigger-squeeze-thumbstick".to_string()],
-                grip_space_pose: right_grip,
-                target_ray_pose: right_aim,
-                gamepad: Some(XrGamepadData {
-                    buttons: vec![
-                        XrButtonData { pressed: trigger > 0.9, touched: trigger > 0.0, value: trigger },
-                        XrButtonData { pressed: squeeze > 0.9, touched: squeeze > 0.0, value: squeeze },
-                        XrButtonData { pressed: false, touched: false, value: 0.0 },
-                        XrButtonData { pressed: stick_click, touched: thumbstick.0.abs() > 0.01 || thumbstick.1.abs() > 0.01, value: if stick_click { 1.0 } else { 0.0 } },
-                        XrButtonData { pressed: a_btn, touched: a_btn, value: if a_btn { 1.0 } else { 0.0 } },
-                        XrButtonData { pressed: b_btn, touched: b_btn, value: if b_btn { 1.0 } else { 0.0 } },
-                    ],
-                    axes: vec![0.0, 0.0, thumbstick.0, -thumbstick.1],
-                }),
-                hand: None,
-            });
-        }
-
-        XrInputSourcesState { sources }
-    } else {
-        XrInputSourcesState { sources: Vec::new() }
+    let input_sources = XrInputSourcesState {
+        sources: collect_input_sources(state, frame_state.predicted_display_time),
     };
 
     // === acquire_swapchain_image ===

@@ -11,9 +11,9 @@ path = "src/lib.rs"
 
 
 # android
-crate-type = ["rlib", "cdylib"]
+# crate-type = ["rlib", "cdylib"]
 # desktop
-# crate-type = ["rlib"]
+crate-type = ["rlib"]
 
 
 
@@ -64,6 +64,7 @@ temporal_rs = "0.0.11"
 timezone_provider = "=0.0.11"
 
 pathdiff = "0.2"
+ureq = "3"
 
 # Graphics
 wgpu = { version = "29.0", features = ["vulkan", "spirv"] }

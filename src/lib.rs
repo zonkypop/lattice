@@ -31,6 +31,7 @@ mod module_loader;
 
 use gfx::{GfxContext, set_gfx_context};
 use module_loader::{ImportMapModuleLoader, create_web_worker_callback};
+use import_map;
 
 use deno_runtime::BootstrapOptions;
 
@@ -255,7 +256,8 @@ extension!(
         audio::op_audio_node_drop,
 
         // event loop
-        op_yield_to_runtime
+        op_yield_to_runtime,
+        op_http_fetch
 
     ],
     esm_entry_point = "ext:gfx_host/bootstrap.js",
@@ -411,23 +413,81 @@ impl GpuState {
 
 // ======================= JS Runtime Bootstrap =======================
 
-async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpecifier, SharedArrayBufferStore), AnyError> {
+/// Normalize an endpoint URL into a base URL ending with `/` and an entry module URL.
+fn parse_endpoint(endpoint: &str) -> (String, String) {
+    assert!(
+        endpoint.starts_with("http://") || endpoint.starts_with("https://"),
+        "Endpoint must be a URL (http:// or https://)"
+    );
+    let base = if endpoint.ends_with('/') {
+        endpoint.to_string()
+    } else if endpoint.ends_with(".js") || endpoint.ends_with(".mjs") || endpoint.ends_with(".ts") {
+        // Explicit script URL — base is the parent directory
+        let last_slash = endpoint.rfind('/').unwrap_or(0);
+        format!("{}/", &endpoint[..last_slash])
+    } else {
+        format!("{}/", endpoint)
+    };
+    let entry = if endpoint.ends_with('/') || (!endpoint.ends_with(".js") && !endpoint.ends_with(".mjs") && !endpoint.ends_with(".ts")) {
+        format!("{}entry.js", base)
+    } else {
+        endpoint.to_string()
+    };
+    (base, entry)
+}
+
+async fn create_main_worker(endpoint: &str) -> Result<(MainWorker, ModuleSpecifier, SharedArrayBufferStore), AnyError> {
     use std::fs;
 
-    let js_path = std::env::current_dir()?.join(script_path);
-    let script_dir = js_path.parent().unwrap().to_path_buf();
-    let import_map_path = script_dir.join("import_map.json");
+    let (base_url, entry_url) = parse_endpoint(endpoint);
 
-    let main_module = ModuleSpecifier::from_file_path(&js_path)
-        .map_err(|_| AnyError::msg("Failed to create ModuleSpecifier from script path"))?;
+    let main_module = ModuleSpecifier::parse(&entry_url)
+        .map_err(|e| AnyError::msg(format!("Invalid entry URL '{}': {}", entry_url, e)))?;
+
+    // script_dir is used for shims (setup.js)
+    let script_dir = std::env::current_dir()?.join("js");
+
+    // Fetch import map from endpoint
+    let import_map = {
+        let import_map_url = format!("{}import_map.json", base_url);
+        info!("Fetching import map from {}", import_map_url);
+        match ureq::get(&import_map_url).call() {
+            Ok(resp) => {
+                match resp.into_body().read_to_string() {
+                    Ok(text) => {
+                        let map_base = ModuleSpecifier::parse(&import_map_url).ok();
+                        if let Some(map_base) = map_base {
+                            match import_map::parse_from_json(map_base, &text) {
+                                Ok(result) => {
+                                    for w in result.diagnostics.iter() {
+                                        log::warn!("Import map warning: {}", w);
+                                    }
+                                    info!("Loaded remote import map");
+                                    Some(result.import_map)
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to parse remote import map: {}", e);
+                                    None
+                                }
+                            }
+                        } else { None }
+                    }
+                    Err(e) => { log::warn!("Failed to read import map response: {}", e); None }
+                }
+            }
+            Err(_) => { info!("No import map found at endpoint"); None }
+        }
+    };
 
     let fs_arc = Arc::new(RealFs);
     let permission_desc_parser = Arc::new(RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys));
 
-    let module_loader = ImportMapModuleLoader::new(
-        script_dir.clone(),
-        if import_map_path.exists() { Some(import_map_path) } else { None },
-    )?;
+    // Build module loader — in URL mode, pass the pre-fetched import map
+    let module_loader = if let Some(map) = import_map {
+        ImportMapModuleLoader::new_with_import_map(script_dir.clone(), map)?
+    } else {
+        ImportMapModuleLoader::new(script_dir.clone())?
+    };
 
     let shared_array_buffer_store = SharedArrayBufferStore::default();
     let compiled_wasm_module_store = CompiledWasmModuleStore::default();
@@ -439,7 +499,6 @@ async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpec
         compiled_wasm_module_store.clone(),
         Handle::current(),
     );
-
 
     #[cfg(target_os = "android")]
     let data_dir = std::path::PathBuf::from("/data/data/com.yourcompany.combinedapp/files");
@@ -510,19 +569,14 @@ async fn create_main_worker(script_path: &str) -> Result<(MainWorker, ModuleSpec
     #[cfg(not(target_os = "android"))]
     let xr_enabled = std::env::args().any(|a| a == "--xr");
 
-    let script_dir_str = script_dir.to_string_lossy().replace('\\', "/");
-    let script_dir_slash = if script_dir_str.ends_with('/') {
-        script_dir_str.to_string()
-    } else {
-        format!("{}/", script_dir_str)
-    };
+    let script_dir_str = base_url.clone();
 
     worker.js_runtime.execute_script(
         "<native_flags>",
         deno_core::ModuleCodeString::from(format!(
             "globalThis.__isNative__ = true; globalThis.__nativeXR__ = {}; globalThis.__scriptDir__ = '{}';",
             xr_enabled,
-            script_dir_slash
+            script_dir_str
         )),
     )?;
 
@@ -734,6 +788,22 @@ pub async fn op_yield_to_runtime() -> Result<(), deno_error::JsErrorBox> {
     Ok(())
 }
 
+/// Synchronous HTTP fetch via ureq — avoids deadlocks on the single-threaded
+/// tokio runtime that deno's built-in async fetch suffers from.
+#[deno_core::op2]
+#[buffer]
+pub fn op_http_fetch(#[string] url: &str) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let resp = ureq::get(url).call()
+        .map_err(|e| deno_error::JsErrorBox::generic(format!("fetch failed for {}: {}", url, e)))?;
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        return Err(deno_error::JsErrorBox::generic(format!("HTTP {} for {}", status, url)));
+    }
+    let bytes = resp.into_body().read_to_vec()
+        .map_err(|e| deno_error::JsErrorBox::generic(format!("failed to read response from {}: {}", url, e)))?;
+    Ok(bytes)
+}
+
 /// Drain pending Android input events to prevent ANR.
 /// Android's InputDispatcher triggers ANR if events aren't acknowledged within 5s.
 /// We just consume and acknowledge them — VR input comes from OpenXR, not here.
@@ -807,13 +877,14 @@ pub fn main() -> Result<(), AnyError> {
     deno_core::v8::V8::set_flags_from_string("--max-old-space-size=4096");
 
     // Parse command line args
+    // Usage: combined_app [--xr] [--clear-db] <endpoint-url>
     let args: Vec<String> = std::env::args().collect();
     let xr_mode = args.iter().any(|a| a == "--xr");
     let clear_db = args.iter().any(|a| a == "--clear-db");
-    let script_path = args.iter()
+    let endpoint = args.iter()
         .find(|a| !a.starts_with('-') && *a != &args[0])
         .map(|s| s.as_str())
-        .unwrap_or("js/entry.js");
+        .expect("Usage: combined_app [--xr] [--clear-db] <endpoint-url>");
 
     if clear_db {
         let db_dir = std::env::current_dir().unwrap_or_default().join("data").join("indexeddb");
@@ -829,18 +900,18 @@ pub fn main() -> Result<(), AnyError> {
     
     if xr_mode {
         set_runtime_mode(RuntimeMode::XR);
-        info!("Starting in XR mode with script: {}", script_path);
-        run_xr_mode(script_path)?;
+        info!("Starting in XR mode with endpoint: {}", endpoint);
+        run_xr_mode(endpoint)?;
     } else {
         set_runtime_mode(RuntimeMode::Desktop);
-        info!("Starting in desktop mode with script: {}", script_path);
-        
+        info!("Starting in desktop mode with endpoint: {}", endpoint);
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime");
-        
-        let (worker, main_module, _) = rt.block_on(create_main_worker(script_path))?;
+
+        let (worker, main_module, _) = rt.block_on(create_main_worker(endpoint))?;
         
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         event_loop.set_control_flow(ControlFlow::Poll);
@@ -869,13 +940,20 @@ fn android_main() {
     );
 
     let _ = rustls::crypto::ring::default_provider().install_default();
-    
+
     log::info!("Android XR starting...");
-    
-    // Set working directory, jank for now
+
+    // Set working directory (still needed for shims)
     std::env::set_current_dir("/data/local/tmp/combined_app").ok();
-    
-    if let Err(e) = run_xr_mode("/data/local/tmp/combined_app/js/entry.js") {
+
+    // Read endpoint URL from config file
+    let endpoint = std::fs::read_to_string("/data/local/tmp/combined_app/endpoint.txt")
+        .map(|s| s.trim().to_string())
+        .expect("endpoint.txt not found at /data/local/tmp/combined_app/endpoint.txt");
+
+    log::info!("Using endpoint: {}", endpoint);
+
+    if let Err(e) = run_xr_mode(&endpoint) {
         log::error!("XR error: {:?}", e);
     }
 }

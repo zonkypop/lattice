@@ -5,7 +5,7 @@ google-chrome --enable-features=Vulkan,DefaultANGLEVulkan,UnsafeWebGPU --use-vul
 
 # Run in Desktop mode
 
-cargo run --release
+cargo run --release -- http://localhost:8000/
 
 # Run in OpenXR mode
 
@@ -24,3 +24,7 @@ GN_ARGS="use_custom_libcxx=false" \
 BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/c++/v1" \
 V8_FROM_SOURCE=1 \
 cargo apk build --release --lib
+
+
+
+./run_quest.sh http://localhost:8000/

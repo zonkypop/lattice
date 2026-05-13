@@ -158,7 +158,7 @@ if (!isNativeXR) {
         ? new XRInputSourceSpace("target-ray", data)
         : null;
       this._hand = data.hand ? new XRHand(data.hand) : null;
-      this._gamepad = data.gamepad ? new XRGamepad(data.gamepad) : null;
+      this._gamepad = data.gamepad ? new XRGamepad(data.gamepad, data.handedness) : null;
 
       // Internal tracking
       this._connected = false;
@@ -240,7 +240,7 @@ if (!isNativeXR) {
 
   // XRGamepad - mirrors standard Gamepad API
   class XRGamepad {
-    constructor(data) {
+    constructor(data, handedness) {
       this.id = "";
       this.index = -1;
       this.connected = true;
@@ -248,7 +248,8 @@ if (!isNativeXR) {
       this.mapping = "xr-standard";
       this.axes = [0, 0, 0, 0]; // Use regular array, not Float32Array
       this.buttons = (data.buttons || []).map((b) => new XRGamepadButton(b));
-      this.hapticActuators = [];
+      this.hapticActuators = [new GamepadHapticActuator(handedness || "none")];
+      this.vibrationActuator = this.hapticActuators[0];
       this._update(data);
     }
 
@@ -269,6 +270,44 @@ if (!isNativeXR) {
           this.buttons[i]._update(data.buttons[i]);
         }
       }
+    }
+  }
+
+  // GamepadHapticActuator - WebXR haptic feedback
+  class GamepadHapticActuator {
+    constructor(handedness) {
+      this.type = "vibration";
+      this._handedness = handedness === "left" ? 0 : 1;
+    }
+
+    pulse(intensity, duration) {
+      try {
+        globalThis.__xr.op_xr_haptic_pulse(
+          this._handedness,
+          duration,
+          0.0, // frequency: 0 = runtime default
+          Math.max(0, Math.min(1, intensity))
+        );
+      } catch (e) {
+        console.warn("Haptic pulse failed:", e);
+      }
+      return Promise.resolve(true);
+    }
+
+    reset() {
+      try {
+        globalThis.__xr.op_xr_haptic_stop(this._handedness);
+      } catch (_) {}
+      return Promise.resolve(true);
+    }
+
+    playEffect(type, params = {}) {
+      if (type === "dual-rumble" || type === "vibration") {
+        const intensity = params.strongMagnitude ?? params.weakMagnitude ?? 1.0;
+        const duration = params.duration ?? 100;
+        return this.pulse(intensity, duration);
+      }
+      return Promise.resolve("complete");
     }
   }
 

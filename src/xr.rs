@@ -204,6 +204,10 @@ pub struct XrState {
     pub left_hand_path: xr::Path,
     pub right_hand_path: xr::Path,
 
+    // Haptic output
+    pub left_haptic_action: xr::Action<xr::Haptic>,
+    pub right_haptic_action: xr::Action<xr::Haptic>,
+
     // Clip planes (set from JS via updateRenderState)
     pub depth_near: f32,
     pub depth_far: f32,
@@ -656,7 +660,9 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
     let left_y_button_action = action_set.create_action::<bool>("left_y", "Left Y Button", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
     let right_a_button_action = action_set.create_action::<bool>("right_a", "Right A Button", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
     let right_b_button_action = action_set.create_action::<bool>("right_b", "Right B Button", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
-    
+    let left_haptic_action = action_set.create_action::<xr::Haptic>("left_haptic", "Left Haptic", &[left_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+    let right_haptic_action = action_set.create_action::<xr::Haptic>("right_haptic", "Right Haptic", &[right_hand_path]).map_err(|e| JsErrorBox::generic(format!("Action error: {}", e)))?;
+
     let oculus_profile = instance.string_to_path("/interaction_profiles/oculus/touch_controller").unwrap();
     
     instance.suggest_interaction_profile_bindings(oculus_profile, &[
@@ -676,6 +682,8 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         xr::Binding::new(&left_y_button_action, instance.string_to_path("/user/hand/left/input/y/click").unwrap()),
         xr::Binding::new(&right_a_button_action, instance.string_to_path("/user/hand/right/input/a/click").unwrap()),
         xr::Binding::new(&right_b_button_action, instance.string_to_path("/user/hand/right/input/b/click").unwrap()),
+        xr::Binding::new(&left_haptic_action, instance.string_to_path("/user/hand/left/output/haptic").unwrap()),
+        xr::Binding::new(&right_haptic_action, instance.string_to_path("/user/hand/right/output/haptic").unwrap()),
     ]).map_err(|e| JsErrorBox::generic(format!("Failed to suggest bindings: {}", e)))?;
     
     let left_grip_space = left_grip_action.create_space(session.clone(), left_hand_path, xr::Posef::IDENTITY).map_err(|e| JsErrorBox::generic(format!("Space error: {}", e)))?;
@@ -809,6 +817,8 @@ pub async fn init_xr_session_internal() -> Result<XrSessionInfo, JsErrorBox> {
         right_b_button_action,
         left_hand_path,
         right_hand_path,
+        left_haptic_action,
+        right_haptic_action,
         depth_near: 0.2,
         depth_far: 550.0,
     };
@@ -1177,6 +1187,60 @@ pub fn op_xr_frame_begin() -> Result<XrFrameBeginResult, JsErrorBox> {
         input_sources,
         swapchain_info,
     })
+}
+
+// ======================= Haptic Feedback =======================
+
+/// Apply haptic vibration to a controller.
+/// handedness: 0 = left, 1 = right
+/// duration_ms: vibration duration in milliseconds (0 = minimum pulse)
+/// frequency: vibration frequency in Hz (0 = default)
+/// amplitude: vibration strength 0.0–1.0
+#[op2(fast)]
+pub fn op_xr_haptic_pulse(handedness: u32, duration_ms: f64, frequency: f32, amplitude: f32) -> Result<(), JsErrorBox> {
+    let guard = get_xr_state().lock().unwrap();
+    let state = guard.as_ref().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
+
+    let (action, subaction_path) = match handedness {
+        0 => (&state.left_haptic_action, state.left_hand_path),
+        1 => (&state.right_haptic_action, state.right_hand_path),
+        _ => return Err(JsErrorBox::generic("Invalid handedness (0=left, 1=right)")),
+    };
+
+    let duration_nanos = if duration_ms <= 0.0 {
+        xr::Duration::MIN_HAPTIC
+    } else {
+        xr::Duration::from_nanos((duration_ms * 1_000_000.0) as i64)
+    };
+
+    let vibration = xr::HapticVibration::new()
+        .duration(duration_nanos)
+        .frequency(frequency)
+        .amplitude(amplitude.clamp(0.0, 1.0));
+
+    action.apply_feedback(&state.session, subaction_path, &vibration)
+        .map_err(|e| JsErrorBox::generic(format!("Haptic feedback failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// Stop haptic feedback on a controller.
+/// handedness: 0 = left, 1 = right
+#[op2(fast)]
+pub fn op_xr_haptic_stop(handedness: u32) -> Result<(), JsErrorBox> {
+    let guard = get_xr_state().lock().unwrap();
+    let state = guard.as_ref().ok_or_else(|| JsErrorBox::generic("No XR session"))?;
+
+    let (action, subaction_path) = match handedness {
+        0 => (&state.left_haptic_action, state.left_hand_path),
+        1 => (&state.right_haptic_action, state.right_hand_path),
+        _ => return Err(JsErrorBox::generic("Invalid handedness (0=left, 1=right)")),
+    };
+
+    action.stop_feedback(&state.session, subaction_path)
+        .map_err(|e| JsErrorBox::generic(format!("Stop haptic failed: {}", e)))?;
+
+    Ok(())
 }
 
 #[op2]

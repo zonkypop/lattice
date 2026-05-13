@@ -22,5 +22,17 @@ Object.defineProperty(globalThis.navigator, "platform", {
   writable: true,
   configurable: true,
 });
+const __lang = globalThis.__locale__ || "en-US";
+Object.defineProperty(globalThis.navigator, "language", {
+  value: __lang,
+  writable: true,
+  configurable: true,
+});
+Object.defineProperty(globalThis.navigator, "languages", {
+  value: Object.freeze([__lang]),
+  writable: true,
+  configurable: true,
+});
+globalThis.navigator.sendBeacon ??= () => false;
 
 console.log("[shims] setup complete");

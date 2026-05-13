@@ -81,6 +81,21 @@ globalThis.document = {
   },
 };
 
+// createElementNS (used by SVG libs and Auth.js lockdown)
+globalThis.document.createElementNS = function(ns, tag) {
+  return globalThis.document.createElement(tag);
+};
+
+// write/writeln stubs (Auth.js locks these down)
+globalThis.document.write = () => {};
+globalThis.document.writeln = () => {};
+
+// documentElement (needed by MutationObserver in Auth.js lockdown)
+globalThis.document.documentElement = {
+  addEventListener() {},
+  removeEventListener() {},
+};
+
 bodyEventTarget.ownerDocument = globalThis.document;
 
 // Canvas factory

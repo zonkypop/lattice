@@ -96,6 +96,9 @@ import {
   op_xr_frame_wait_start,
   op_xr_frame_wait_poll,
   op_xr_frame_wait_finish,
+  op_xr_set_clip_planes,
+  op_xr_haptic_pulse,
+  op_xr_haptic_stop,
 
   // Audio ops
   op_audio_create_context,
@@ -158,6 +161,9 @@ globalThis.__xr = {
   op_xr_frame_wait_start,
   op_xr_frame_wait_poll,
   op_xr_frame_wait_finish,
+  op_xr_set_clip_planes,
+  op_xr_haptic_pulse,
+  op_xr_haptic_stop,
 };
 
 globalThis.__indexeddb = {

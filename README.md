@@ -2,11 +2,11 @@ Lattice lets you run WebGPU/JS code natively - using Deno, WGPU, OpenXR and Vulk
 
 ### Run on Desktop
 
-cargo run --release
+cargo run --release -- http://localhost:8000 (or some other URL)
 
 ### Run with WebXR/OpenXR
 
-cargo run --release -- --xr
+cargo run --release -- --xr http://localhost:8000 (or some other URL)
 
 
 Lattice is a WIP, to do :

@@ -83,6 +83,20 @@ if (typeof ImageData === "undefined") {
 }
 globalThis.performance ??= { now: () => Date.now() };
 
+// Stubs for browser APIs that Auth.js lock() captures via .bind()
+globalThis.open ??= () => null;
+windowTarget.open ??= () => null;
+
+// MutationObserver stub (Auth.js uses it to remove injected iframes)
+if (typeof globalThis.MutationObserver === 'undefined') {
+  globalThis.MutationObserver = class MutationObserver {
+    constructor(cb) {}
+    observe() {}
+    disconnect() {}
+    takeRecords() { return []; }
+  };
+}
+
 // Override fetch to use synchronous native HTTP when available.
 // Deno's built-in async fetch deadlocks on the single-threaded tokio runtime.
 if (globalThis.__httpFetch) {

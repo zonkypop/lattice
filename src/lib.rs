@@ -217,6 +217,8 @@ extension!(
         xr::op_xr_frame_wait_start,
         xr::op_xr_frame_wait_poll,
         xr::op_xr_frame_wait_finish,
+        xr::op_xr_haptic_pulse,
+        xr::op_xr_haptic_stop,
 
         // Audio ops
         audio::op_audio_create_context,
@@ -571,12 +573,15 @@ async fn create_main_worker(endpoint: &str) -> Result<(MainWorker, ModuleSpecifi
 
     let script_dir_str = base_url.clone();
 
+    let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+
     worker.js_runtime.execute_script(
         "<native_flags>",
         deno_core::ModuleCodeString::from(format!(
-            "globalThis.__isNative__ = true; globalThis.__nativeXR__ = {}; globalThis.__scriptDir__ = '{}';",
+            "globalThis.__isNative__ = true; globalThis.__nativeXR__ = {}; globalThis.__scriptDir__ = '{}'; globalThis.__locale__ = '{}';",
             xr_enabled,
-            script_dir_str
+            script_dir_str,
+            locale
         )),
     )?;
 

@@ -1,0 +1,94 @@
+[package]
+name = "web-audio-api"
+version = "1.2.0"
+authors = ["Otto <otto@ot-to.nl>"]
+edition = "2021"
+description = "A pure Rust implementation of the Web Audio API, for use in non-browser contexts"
+readme = "README.md"
+repository = "https://github.com/orottier/web-audio-api-rs"
+keywords = ["web-audio-api", "audio", "sound", "dsp"]
+license = "MIT"
+categories = ["multimedia::audio"]
+include = [
+    "/resources",
+    "/src",
+    "LICENSE",
+    "README.md",
+]
+rust-version = "1.76"
+
+[dependencies]
+almost = "0.2.0"
+arc-swap = "1.6"
+arrayvec = "0.7"
+fft-convolver = "0.2.0"
+cpal = { version = "0.15", optional = true }
+creek = "1.2"
+crossbeam-channel = "0.5"
+cubeb = { version = "0.13", optional = true }
+dasp_sample = "0.11"
+float_eq = "1.0"
+futures-channel = { version = "0.3.30", features = ["sink"] }
+futures-core = { version = "0.3.30", default-features = false }
+futures-util = { version = "0.3.30", default-features = false, features = [
+    "sink",
+] }
+hound = "3.5"
+hrtf = "0.8.1"
+llq = "0.1.1"
+log = "0.4"
+num-complex = "0.4"
+realfft = "3.3"
+rubato = "0.16"
+smallvec = "1.11"
+symphonia = { version = "0.5", default-features = false }
+vecmath = "1.0"
+
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+no_denormals = "0.2.0"
+
+[dev-dependencies]
+futures = { version = "0.3.30", features = ["executor"] }
+alloc_counter = "0.0.4"
+criterion = "0.5.1"
+env_logger = "0.11"
+iai = "0.1.1"
+rand = "0.8"
+paste = "1.0.14"
+
+# Uncomment the following lines to enable debug symbols
+# during CPU profiling
+# [profile.release]
+# debug = true
+
+[[bench]]
+name = "my_benchmark"
+# The path is required for excluding /benches from the package.
+# See also: https://users.rust-lang.org/t/cargo-publish-with-excluded-benchmark-fails-validation/53444/2
+path = "benches/my_benchmark.rs"
+harness = false
+
+[features]
+default = ["mp3", "ogg", "flac", "wav", "m4a", "alac", "cpal"]
+mp3 = ["symphonia/mp3", "creek/decode-mp3"]
+ogg = [
+    "symphonia/ogg",
+    "symphonia/vorbis",
+    "creek/decode-ogg",
+    "creek/decode-vorbis",
+]
+flac = ["symphonia/flac", "creek/decode-flac"]
+wav = ["symphonia/wav", "symphonia/pcm", "creek/decode-wav", "creek/decode-pcm"]
+aac = ["symphonia/aac", "creek/decode-aac"]
+m4a = ["aac", "symphonia/isomp4", "creek/decode-isomp4"]
+alac = [
+    "symphonia/alac",
+    "symphonia/isomp4",
+    "creek/decode-alac",
+    "creek/decode-isomp4",
+]
+cpal = ["dep:cpal"]
+cubeb = ["dep:cubeb"]
+cpal-jack = ["cpal", "cpal/jack"]
+cpal-asio = ["cpal", "cpal/asio"]
+iai = []

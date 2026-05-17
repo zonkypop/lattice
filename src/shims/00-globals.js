@@ -1,6 +1,5 @@
 // 00-globals.js - Bootstrap globals FIRST, no imports
 
-
 // Minimal event target (inline to avoid import order issues)
 class SimpleEventTarget {
   constructor() {
@@ -83,59 +82,161 @@ if (typeof ImageData === "undefined") {
 }
 globalThis.performance ??= { now: () => Date.now() };
 
-// Stubs for browser APIs that Auth.js lock() captures via .bind()
 globalThis.open ??= () => null;
 windowTarget.open ??= () => null;
 
-// MutationObserver stub (Auth.js uses it to remove injected iframes)
-if (typeof globalThis.MutationObserver === 'undefined') {
+if (typeof globalThis.MutationObserver === "undefined") {
   globalThis.MutationObserver = class MutationObserver {
     constructor(cb) {}
     observe() {}
     disconnect() {}
-    takeRecords() { return []; }
+    takeRecords() {
+      return [];
+    }
+  };
+}
+
+// Deno Workers can't load blob URL scripts (module loader doesn't resolve
+// blob: URLs). Emulate blob URL Workers on the main thread by capturing
+// the script source at Blob creation time, then executing it in a
+// simulated Worker scope when `new Worker(blobUrl)` is called.
+const _OrigBlob = globalThis.Blob;
+const _blobSources = new WeakMap();
+globalThis.Blob = class Blob extends _OrigBlob {
+  constructor(parts, options) {
+    super(parts, options);
+    if (options?.type?.includes("javascript") && Array.isArray(parts)) {
+      _blobSources.set(this, parts.join(""));
+    }
+  }
+};
+
+const _OrigWorker = globalThis.Worker;
+if (_OrigWorker) {
+  globalThis.Worker = function Worker(url, opts) {
+    if (typeof url === "string" && url.startsWith("blob:")) {
+      const blob = _blobStore.get(url);
+      const source = blob && _blobSources.get(blob);
+      if (source) {
+        // Run the worker script in a simulated scope on the main thread
+        const worker = this;
+        worker.onmessage = null;
+        const timers = [];
+        const self = {
+          onmessage: null,
+          postMessage(data) {
+            if (worker.onmessage) worker.onmessage({ data });
+          },
+        };
+        // Override timer functions to track for cleanup
+        const _setTimeout = (fn, ms) => { const id = setTimeout(fn, ms); timers.push({type: "t", id}); return id; };
+        const _setInterval = (fn, ms) => { const id = setInterval(fn, ms); timers.push({type: "i", id}); return id; };
+        worker.postMessage = (data) => { if (self.onmessage) self.onmessage({ data }); };
+        worker.terminate = () => {
+          for (const t of timers) t.type === "i" ? clearInterval(t.id) : clearTimeout(t.id);
+          timers.length = 0;
+        };
+        worker.addEventListener = () => {};
+        // Execute the worker code
+        try {
+          const fn = new Function("self", "postMessage", "setTimeout", "setInterval",
+            source);
+          fn(self, self.postMessage.bind(self), _setTimeout, _setInterval);
+        } catch (e) {
+          console.error("[Worker shim] failed to execute blob script:", e);
+        }
+        return;
+      }
+    }
+    return new _OrigWorker(url, opts);
   };
 }
 
 // Override fetch to use synchronous native HTTP when available.
 // Deno's built-in async fetch deadlocks on the single-threaded tokio runtime.
+// Also handle blob: URLs which are created by URL.createObjectURL().
+const _blobStore = new Map();
+const _origCreateObjectURL = URL.createObjectURL;
+const _origRevokeObjectURL = URL.revokeObjectURL;
+URL.createObjectURL = function (blob) {
+  const url = _origCreateObjectURL.call(URL, blob);
+  _blobStore.set(url, blob);
+  return url;
+};
+URL.revokeObjectURL = function (url) {
+  _blobStore.delete(url);
+  _origRevokeObjectURL.call(URL, url);
+};
+
 if (globalThis.__httpFetch) {
   const _nativeFetch = globalThis.__httpFetch;
-  const _denoFetch = globalThis.fetch; // keep for non-HTTP (e.g. data: URIs)
-  globalThis.fetch = function fetch(input, init) {
-    let url = typeof input === 'string' ? input : input?.url;
-    // Only intercept GET/HEAD on http(s) URLs
-    const method = init?.method?.toUpperCase() || 'GET';
-    if (url && (url.startsWith('http://') || url.startsWith('https://')) && (method === 'GET' || method === 'HEAD')) {
-      try {
-        const bytes = _nativeFetch(url);
-        const headers = new Headers();
-        if (url.endsWith('.json')) headers.set('content-type', 'application/json');
-        else if (url.endsWith('.wasm')) headers.set('content-type', 'application/wasm');
-        else if (url.endsWith('.js') || url.endsWith('.mjs')) headers.set('content-type', 'application/javascript');
-        return Promise.resolve(new Response(bytes.buffer, { status: 200, headers }));
-      } catch (e) {
-        return Promise.reject(new TypeError(`fetch failed: ${e.message}`));
+  const _denoFetch = globalThis.fetch;
+  globalThis.fetch = async function fetch(input, init) {
+    let url = typeof input === "string" ? input : input?.url;
+    const method = init?.method?.toUpperCase() || "GET";
+
+    // Handle blob: URLs from URL.createObjectURL()
+    if (url && url.startsWith("blob:")) {
+      const blob = _blobStore.get(url);
+      if (blob) {
+        return new Response(blob, { status: 200 });
       }
+      throw new TypeError(`Blob not found for URL: ${url}`);
     }
-    // Fall through to deno's fetch for non-HTTP or non-GET
-    if (_denoFetch) return _denoFetch(input, init);
-    return Promise.reject(new TypeError('fetch not available'));
+
+    // Intercept GET/HEAD on http(s) URLs — async ureq on a blocking thread
+    // Skip when custom headers are present (e.g. Authorization) since
+    // op_http_fetch doesn't support headers — fall through to Deno fetch.
+    const hasCustomHeaders =
+      init &&
+      init.headers &&
+      typeof init.headers === "object" &&
+      Object.keys(init.headers).length > 0;
+    if (
+      url &&
+      (url.startsWith("http://") || url.startsWith("https://")) &&
+      (method === "GET" || method === "HEAD") &&
+      !hasCustomHeaders
+    ) {
+      const bytes = await _nativeFetch(url);
+      const headers = new Headers();
+      if (url.endsWith(".json"))
+        headers.set("content-type", "application/json");
+      else if (url.endsWith(".wasm"))
+        headers.set("content-type", "application/wasm");
+      else if (url.endsWith(".js") || url.endsWith(".mjs"))
+        headers.set("content-type", "application/javascript");
+      return new Response(bytes.buffer, { status: 200, headers });
+    }
+
+    // Fall through to Deno's fetch for other cases (data: URIs, Request objects, etc.)
+    return _denoFetch(input, init);
   };
 }
 
 // WebGL enum constants (used by glTF loaders for component types, topology, samplers)
-if (typeof WebGLRenderingContext === 'undefined') {
+if (typeof WebGLRenderingContext === "undefined") {
   globalThis.WebGLRenderingContext = {
-    BYTE: 0x1400, UNSIGNED_BYTE: 0x1401,
-    SHORT: 0x1402, UNSIGNED_SHORT: 0x1403,
-    UNSIGNED_INT: 0x1405, FLOAT: 0x1406,
-    TRIANGLES: 0x0004, TRIANGLE_STRIP: 0x0005,
-    LINES: 0x0001, LINE_STRIP: 0x0003, POINTS: 0x0000,
-    NEAREST: 0x2600, LINEAR: 0x2601,
-    NEAREST_MIPMAP_NEAREST: 0x2700, LINEAR_MIPMAP_NEAREST: 0x2701,
-    NEAREST_MIPMAP_LINEAR: 0x2702, LINEAR_MIPMAP_LINEAR: 0x2703,
-    REPEAT: 0x2901, CLAMP_TO_EDGE: 0x812F, MIRRORED_REPEAT: 0x8370,
+    BYTE: 0x1400,
+    UNSIGNED_BYTE: 0x1401,
+    SHORT: 0x1402,
+    UNSIGNED_SHORT: 0x1403,
+    UNSIGNED_INT: 0x1405,
+    FLOAT: 0x1406,
+    TRIANGLES: 0x0004,
+    TRIANGLE_STRIP: 0x0005,
+    LINES: 0x0001,
+    LINE_STRIP: 0x0003,
+    POINTS: 0x0000,
+    NEAREST: 0x2600,
+    LINEAR: 0x2601,
+    NEAREST_MIPMAP_NEAREST: 0x2700,
+    LINEAR_MIPMAP_NEAREST: 0x2701,
+    NEAREST_MIPMAP_LINEAR: 0x2702,
+    LINEAR_MIPMAP_LINEAR: 0x2703,
+    REPEAT: 0x2901,
+    CLAMP_TO_EDGE: 0x812f,
+    MIRRORED_REPEAT: 0x8370,
   };
 }
 

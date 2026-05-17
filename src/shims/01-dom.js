@@ -29,25 +29,57 @@ globalThis.document = {
   createElement(name) {
     if (name === "canvas") return globalThis.__makeCanvas();
     // Stub element for libraries that create DOM elements for URL parsing etc.
-    const el = { tagName: name.toUpperCase(), style: {}, dataset: {} };
+    const elEvt = new SimpleEventTarget();
+    const el = {
+      tagName: name.toUpperCase(),
+      style: {},
+      dataset: {},
+      setAttribute() {},
+      getAttribute() { return null; },
+      removeAttribute() {},
+      appendChild(c) { return c; },
+      removeChild(c) { return c; },
+      click() {},
+      focus() {},
+      blur() {},
+      addEventListener: elEvt.addEventListener.bind(elEvt),
+      removeEventListener: elEvt.removeEventListener.bind(elEvt),
+      dispatchEvent: elEvt.dispatchEvent.bind(elEvt),
+    };
     if (name === "a") {
       // URL resolution: setting .href on an <a> parses the URL
       let _url = null;
       Object.defineProperty(el, "href", {
-        get() { return _url ? _url.href : ""; },
-        set(v) { try { _url = new URL(v, globalThis.location?.href || "file:///"); } catch { _url = null; } },
+        get() {
+          return _url ? _url.href : "";
+        },
+        set(v) {
+          try {
+            _url = new URL(v, globalThis.location?.href || "file:///");
+          } catch {
+            _url = null;
+          }
+        },
       });
       Object.defineProperty(el, "pathname", {
-        get() { return _url ? _url.pathname : ""; },
+        get() {
+          return _url ? _url.pathname : "";
+        },
       });
       Object.defineProperty(el, "hostname", {
-        get() { return _url ? _url.hostname : ""; },
+        get() {
+          return _url ? _url.hostname : "";
+        },
       });
       Object.defineProperty(el, "protocol", {
-        get() { return _url ? _url.protocol : ""; },
+        get() {
+          return _url ? _url.protocol : "";
+        },
       });
       Object.defineProperty(el, "origin", {
-        get() { return _url ? _url.origin : ""; },
+        get() {
+          return _url ? _url.origin : "";
+        },
       });
     }
     return el;
@@ -81,16 +113,13 @@ globalThis.document = {
   },
 };
 
-// createElementNS (used by SVG libs and Auth.js lockdown)
-globalThis.document.createElementNS = function(ns, tag) {
+globalThis.document.createElementNS = function (ns, tag) {
   return globalThis.document.createElement(tag);
 };
 
-// write/writeln stubs (Auth.js locks these down)
 globalThis.document.write = () => {};
 globalThis.document.writeln = () => {};
 
-// documentElement (needed by MutationObserver in Auth.js lockdown)
 globalThis.document.documentElement = {
   addEventListener() {},
   removeEventListener() {},

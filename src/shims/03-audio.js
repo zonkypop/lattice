@@ -126,7 +126,15 @@ if (!audio) {
       try { audio.op_audio_param_exponential_ramp(this._nid, this._p, value, endTime); } catch (_) {}
       return this;
     }
-    cancelScheduledValues() { return this; }
+    cancelScheduledValues(cancelTime = 0) {
+      try { audio.op_audio_param_cancel_scheduled_values(this._nid, this._p, cancelTime); } catch (_) {}
+      return this;
+    }
+    cancelAndHoldAtTime(cancelTime = 0) {
+      try { audio.op_audio_param_cancel_and_hold(this._nid, this._p, cancelTime); } catch (_) {}
+      return this;
+    }
+    setValueCurveAtTime(values, startTime, duration) { return this; }
   }
 
   // --- Base AudioNode ---
@@ -134,10 +142,44 @@ if (!audio) {
     constructor(ctx, nodeId) {
       this.context = ctx;
       this.__id = nodeId;
+      this.numberOfInputs = 1;
+      this.numberOfOutputs = 1;
+      this._channelCount = 2;
+      this._channelCountMode = "max";
+      this._channelInterpretation = "speakers";
     }
-    connect(dest) {
-      if (dest?.__id != null && this.__id != null) {
-        try { audio.op_audio_connect(this.__id, dest.__id); } catch (_) {}
+    get channelCount() { return this._channelCount; }
+    set channelCount(v) {
+      this._channelCount = v;
+      if (this.__id != null) {
+        try { audio.op_audio_set_channel_count(this.__id, v); } catch (_) {}
+      }
+    }
+    get channelCountMode() { return this._channelCountMode; }
+    set channelCountMode(v) {
+      this._channelCountMode = v;
+      if (this.__id != null) {
+        try { audio.op_audio_set_channel_count_mode(this.__id, v); } catch (_) {}
+      }
+    }
+    get channelInterpretation() { return this._channelInterpretation; }
+    set channelInterpretation(v) {
+      this._channelInterpretation = v;
+      if (this.__id != null) {
+        try { audio.op_audio_set_channel_interpretation(this.__id, v); } catch (_) {}
+      }
+    }
+    connect(dest, outputIndex = 0, inputIndex = 0) {
+      if (this.__id == null) return dest;
+      if (dest instanceof NativeAudioParam) {
+        // node.connect(audioParam, output) — parameter modulation
+        if (dest._nid >= 0) {
+          try { audio.op_audio_connect_param(this.__id, dest._nid, dest._p, outputIndex); } catch (_) {}
+        }
+        return undefined; // Web Audio API spec: returns void for param connections
+      }
+      if (dest?.__id != null) {
+        try { audio.op_audio_connect(this.__id, dest.__id, outputIndex, inputIndex); } catch (_) {}
       }
       return dest;
     }
@@ -172,6 +214,7 @@ if (!audio) {
     set buffer(buf) {
       this._buffer = buf;
       if (buf?.__id != null && this.__id != null) {
+        if (buf._syncToNative) buf._syncToNative();
         try { audio.op_audio_buffer_source_set_buffer(this.__id, buf.__id); } catch (_) {}
       }
     }
@@ -190,8 +233,8 @@ if (!audio) {
       this._loopEnd = v;
       try { audio.op_audio_buffer_source_set_loop_end(this.__id, v); } catch (_) {}
     }
-    start(when = 0) {
-      try { audio.op_audio_buffer_source_start(this.__id, when); } catch (_) {}
+    start(when = 0, offset = 0, duration = 0) {
+      try { audio.op_audio_buffer_source_start(this.__id, when, offset, duration); } catch (_) {}
     }
     stop(when = 0) {
       try { audio.op_audio_buffer_source_stop(this.__id, when); } catch (_) {}
@@ -210,6 +253,11 @@ if (!audio) {
     set type(v) {
       this._type = v;
       try { audio.op_audio_oscillator_set_type(this.__id, v); } catch (_) {}
+    }
+    setPeriodicWave(wave) {
+      // Store for reference; native PeriodicWave support is TODO
+      this._periodicWave = wave;
+      this._type = "custom";
     }
     start(when = 0) {
       try { audio.op_audio_oscillator_start(this.__id, when); } catch (_) {}
@@ -331,32 +379,37 @@ if (!audio) {
     getFloatTimeDomainData(arr) { if (arr) arr.fill(0); }
   }
 
+  // --- ListenerParam (extends NativeAudioParam for instanceof compatibility) ---
+  // Audio libraries check `listener.positionX instanceof AudioParam`.
+  // We batch-flush all listener params via microtask so setting 9 params per frame
+  // only triggers one native call.
+  class ListenerParam extends NativeAudioParam {
+    constructor(listener, defaultVal) {
+      // Pass dummy node/param — we override value set/get to use the batch flush
+      super(-1, "", defaultVal);
+      this._listener = listener;
+    }
+    get value() { return this._value; }
+    set value(v) {
+      this._value = v;
+      this._listener._markDirty();
+    }
+  }
+
   // --- AudioListener ---
-  // Params must be reactive: Three.js sets listener.positionX.value = x each frame.
-  // We batch updates via microtask so all 9 params flush once per frame.
   class NativeAudioListener {
     constructor(ctxId) {
       this._ctxId = ctxId;
       this._dirty = false;
-      const self = this;
-      const makeParam = (defaultVal) => {
-        const p = { _v: defaultVal };
-        Object.defineProperty(p, 'value', {
-          get() { return p._v; },
-          set(v) { p._v = v; self._markDirty(); },
-        });
-        p.setValueAtTime = (v) => { p.value = v; return p; };
-        return p;
-      };
-      this.positionX = makeParam(0);
-      this.positionY = makeParam(0);
-      this.positionZ = makeParam(0);
-      this.forwardX = makeParam(0);
-      this.forwardY = makeParam(0);
-      this.forwardZ = makeParam(-1);
-      this.upX = makeParam(0);
-      this.upY = makeParam(1);
-      this.upZ = makeParam(0);
+      this.positionX = new ListenerParam(this, 0);
+      this.positionY = new ListenerParam(this, 0);
+      this.positionZ = new ListenerParam(this, 0);
+      this.forwardX = new ListenerParam(this, 0);
+      this.forwardY = new ListenerParam(this, 0);
+      this.forwardZ = new ListenerParam(this, -1);
+      this.upX = new ListenerParam(this, 0);
+      this.upY = new ListenerParam(this, 1);
+      this.upZ = new ListenerParam(this, 0);
     }
     _markDirty() {
       if (this._dirty) return;
@@ -365,36 +418,108 @@ if (!audio) {
         this._dirty = false;
         try {
           audio.op_audio_listener_set_position(this._ctxId,
-            this.positionX._v, this.positionY._v, this.positionZ._v);
+            this.positionX._value, this.positionY._value, this.positionZ._value);
           audio.op_audio_listener_set_orientation(this._ctxId,
-            this.forwardX._v, this.forwardY._v, this.forwardZ._v,
-            this.upX._v, this.upY._v, this.upZ._v);
+            this.forwardX._value, this.forwardY._value, this.forwardZ._value,
+            this.upX._value, this.upY._value, this.upZ._value);
         } catch (_) {}
       });
     }
     setPosition(x, y, z) {
-      this.positionX._v = x; this.positionY._v = y; this.positionZ._v = z;
+      this.positionX._value = x; this.positionY._value = y; this.positionZ._value = z;
       this._markDirty();
     }
     setOrientation(fx, fy, fz, ux, uy, uz) {
-      this.forwardX._v = fx; this.forwardY._v = fy; this.forwardZ._v = fz;
-      this.upX._v = ux; this.upY._v = uy; this.upZ._v = uz;
+      this.forwardX._value = fx; this.forwardY._value = fy; this.forwardZ._value = fz;
+      this.upX._value = ux; this.upY._value = uy; this.upZ._value = uz;
       this._markDirty();
+    }
+  }
+
+  // --- WaveShaperNode (native) ---
+  class NativeWaveShaperNode extends NativeAudioNode {
+    constructor(ctx, nodeId) {
+      super(ctx, nodeId);
+      this._curve = null;
+      this.oversample = "none";
+    }
+    get curve() { return this._curve; }
+    set curve(v) {
+      this._curve = v;
+      if (v && this.__id != null) {
+        try {
+          const f32 = v instanceof Float32Array ? v : new Float32Array(v);
+          audio.op_audio_wave_shaper_set_curve(this.__id, f32);
+        } catch (_) {}
+      }
+    }
+  }
+
+  // --- ConstantSourceNode (native) ---
+  class NativeConstantSourceNode extends NativeAudioNode {
+    constructor(ctx, nodeId) {
+      super(ctx, nodeId);
+      this.offset = new NativeAudioParam(nodeId, "offset", 1);
+    }
+    start(when = 0) {
+      try { audio.op_audio_constant_source_start(this.__id, when); } catch (_) {}
+    }
+    stop(when = 0) {
+      try { audio.op_audio_constant_source_stop(this.__id, when); } catch (_) {}
+    }
+  }
+
+  // --- ChannelMergerNode / ChannelSplitterNode (native) ---
+  class NativeChannelMergerNode extends NativeAudioNode {
+    constructor(ctx, nodeId, numberOfInputs = 6) {
+      super(ctx, nodeId);
+      this.numberOfInputs = numberOfInputs;
+      this.numberOfOutputs = 1;
+    }
+  }
+
+  class NativeChannelSplitterNode extends NativeAudioNode {
+    constructor(ctx, nodeId, numberOfOutputs = 6) {
+      super(ctx, nodeId);
+      this.numberOfInputs = 1;
+      this.numberOfOutputs = numberOfOutputs;
+    }
+  }
+
+  // --- ConvolverNode (native) ---
+  class NativeConvolverNode extends NativeAudioNode {
+    constructor(ctx, nodeId) {
+      super(ctx, nodeId);
+      this._buffer = null;
+      this.normalize = true;
+    }
+    get buffer() { return this._buffer; }
+    set buffer(v) {
+      this._buffer = v;
+      if (v?.__id != null && this.__id != null) {
+        if (v._syncToNative) v._syncToNative();
+        try { audio.op_audio_convolver_set_buffer(this.__id, v.__id); } catch (_) {}
+      }
     }
   }
 
   // --- AudioContext ---
   class NativeAudioContext {
-    constructor() {
+    constructor(skipInit) {
+      if (skipInit === true) return; // subclass handles init
       const info = audio.op_audio_create_context();
       this._id = info.id;
       this.sampleRate = info.sample_rate;
+      this.state = "running";
       this.destination = new NativeAudioNode(this, info.destination_id);
       this.listener = new NativeAudioListener(this._id);
+      this.audioWorklet = { addModule: () => Promise.resolve() };
     }
     get currentTime() {
       return audio.op_audio_context_current_time(this._id);
     }
+    resume() { this.state = "running"; return Promise.resolve(); }
+    suspend() { this.state = "suspended"; return Promise.resolve(); }
     createGain() {
       const { id } = audio.op_audio_create_gain(this._id);
       return new NativeGainNode(this, id);
@@ -431,8 +556,49 @@ if (!audio) {
       const { id } = audio.op_audio_create_analyser(this._id);
       return new NativeAnalyserNode(this, id);
     }
+    createWaveShaper() {
+      const { id } = audio.op_audio_create_wave_shaper(this._id);
+      return new NativeWaveShaperNode(this, id);
+    }
+    createConstantSource() {
+      const { id } = audio.op_audio_create_constant_source(this._id);
+      return new NativeConstantSourceNode(this, id);
+    }
+    createChannelMerger(numberOfInputs = 6) {
+      const { id } = audio.op_audio_create_channel_merger(this._id, numberOfInputs);
+      return new NativeChannelMergerNode(this, id, numberOfInputs);
+    }
+    createChannelSplitter(numberOfOutputs = 6) {
+      const { id } = audio.op_audio_create_channel_splitter(this._id, numberOfOutputs);
+      return new NativeChannelSplitterNode(this, id, numberOfOutputs);
+    }
+    createConvolver() {
+      const { id } = audio.op_audio_create_convolver(this._id);
+      return new NativeConvolverNode(this, id);
+    }
+    createPeriodicWave(real, imag) { return { real, imag }; }
+    createBuffer(numberOfChannels, length, sampleRate) {
+      const info = audio.op_audio_create_buffer(this._id, numberOfChannels, length, sampleRate);
+      const channels = [];
+      for (let i = 0; i < numberOfChannels; i++) {
+        channels.push(new Float32Array(length));
+      }
+      return new NativeAudioBuffer({
+        __id: info.id,
+        numberOfChannels: info.number_of_channels,
+        length: info.length,
+        sampleRate: info.sample_rate,
+        duration: info.duration,
+        _channels: channels,
+      });
+    }
     createMediaElementSource() { return new NativeAudioNode(this, null); }
     createMediaStreamSource() { return new NativeAudioNode(this, null); }
+    createMediaStreamDestination() {
+      const node = new NativeAudioNode(this, null);
+      node.stream = { getTracks: () => [] };
+      return node;
+    }
     decodeAudioData(arrayBuffer, successCallback, errorCallback) {
       const promise = new Promise((resolve, reject) => {
         try {
@@ -440,13 +606,13 @@ if (!audio) {
             ? arrayBuffer
             : new Uint8Array(arrayBuffer);
           const info = audio.op_audio_decode_audio_data(this._id, bytes);
-          resolve({
+          resolve(new NativeAudioBuffer({
             __id: info.id,
             duration: info.duration,
             length: info.length,
             sampleRate: info.sample_rate,
             numberOfChannels: info.number_of_channels,
-          });
+          }));
         } catch (e) {
           reject(e);
         }
@@ -464,6 +630,200 @@ if (!audio) {
 
   globalThis.AudioContext = globalThis.window.AudioContext = NativeAudioContext;
   globalThis.window.webkitAudioContext = NativeAudioContext;
+  globalThis.AudioNode = NativeAudioNode;
+  globalThis.AudioParam = NativeAudioParam;
+  class NativeAudioBuffer {
+    constructor(options = {}) {
+      this.__id = options.__id ?? null;
+      this.numberOfChannels = options.numberOfChannels ?? 1;
+      this.length = options.length ?? 0;
+      this.sampleRate = options.sampleRate ?? 44100;
+      this.duration = options.duration ?? 0;
+      this._channels = options._channels ?? [];
+      // Track whether JS-side channel data needs syncing to native.
+      // Buffers from decodeAudioData/startRendering already have native data.
+      // Buffers from createBuffer have local Float32Arrays that may be written to.
+      this._localOnly = !!options._channels && options._channels.length > 0;
+    }
+    getChannelData(ch) {
+      if (!this._channels[ch]) {
+        // Try to fetch from native buffer (e.g. decoded audio data)
+        if (this.__id != null && this.length > 0) {
+          try {
+            const data = audio.op_audio_buffer_get_channel_data(this.__id, ch);
+            this._channels[ch] = new Float32Array(data.buffer, data.byteOffset, data.byteLength / 4);
+          } catch (_) {
+            this._channels[ch] = new Float32Array(this.length);
+          }
+        } else {
+          this._channels[ch] = new Float32Array(this.length);
+        }
+      }
+      this._localOnly = true;
+      return this._channels[ch];
+    }
+    copyToChannel(source, ch, startInChannel = 0) {
+      if (!this._channels[ch]) this._channels[ch] = new Float32Array(this.length);
+      this._channels[ch].set(source, startInChannel);
+      if (this.__id != null) {
+        try { audio.op_audio_buffer_copy_to_channel(this.__id, source, ch); } catch (_) {}
+      }
+    }
+    copyFromChannel(dest, ch, startInChannel = 0) {
+      const src = this._channels[ch];
+      if (src) dest.set(src.subarray(startInChannel, startInChannel + dest.length));
+    }
+    // Flush all JS-side channel data to the native buffer
+    _syncToNative() {
+      if (!this._localOnly || this.__id == null) return;
+      for (let ch = 0; ch < this._channels.length; ch++) {
+        const data = this._channels[ch];
+        if (data && data.length > 0) {
+          try { audio.op_audio_buffer_copy_to_channel(this.__id, data, ch); } catch (_) {}
+        }
+      }
+      this._localOnly = false;
+    }
+  }
+  globalThis.AudioBuffer = NativeAudioBuffer;
+  globalThis.BaseAudioContext = NativeAudioContext;
+  // --- OfflineAudioContext (native) ---
+  // Must extend NativeAudioContext so instanceof AudioContext is true.
+  // Libraries that deep-merge options treat AudioContext instances as leaf
+  // values; without this, the offline context gets deep-merged incorrectly.
+  class NativeOfflineAudioContext extends NativeAudioContext {
+    constructor(numberOfChannels, length, sampleRate) {
+      super(true); // skip NativeAudioContext init
+      const info = audio.op_offline_context_create(numberOfChannels, length, sampleRate);
+      this._id = info.id;
+      this.sampleRate = info.sample_rate;
+      this.state = "running";
+      this.destination = new NativeAudioNode(this, info.destination_id);
+      this.listener = new NativeAudioListener(this._id);
+      this.length = length;
+      this.audioWorklet = { addModule: () => Promise.resolve() };
+    }
+    get currentTime() {
+      return audio.op_audio_context_current_time(this._id);
+    }
+    resume() { this.state = "running"; return Promise.resolve(); }
+    suspend() { this.state = "suspended"; return Promise.resolve(); }
+    createGain() {
+      const { id } = audio.op_audio_create_gain(this._id);
+      return new NativeGainNode(this, id);
+    }
+    createBufferSource() {
+      const { id } = audio.op_audio_create_buffer_source(this._id);
+      return new NativeAudioBufferSourceNode(this, id);
+    }
+    createOscillator() {
+      const { id } = audio.op_audio_create_oscillator(this._id);
+      return new NativeOscillatorNode(this, id);
+    }
+    createConstantSource() {
+      const { id } = audio.op_audio_create_constant_source(this._id);
+      return new NativeConstantSourceNode(this, id);
+    }
+    createConvolver() {
+      const { id } = audio.op_audio_create_convolver(this._id);
+      return new NativeConvolverNode(this, id);
+    }
+    createBiquadFilter() {
+      const { id } = audio.op_audio_create_biquad_filter(this._id);
+      return new NativeBiquadFilterNode(this, id);
+    }
+    createDelay(maxDelayTime = 1.0) {
+      const { id } = audio.op_audio_create_delay(this._id, maxDelayTime);
+      return new NativeDelayNode(this, id);
+    }
+    createDynamicsCompressor() {
+      const { id } = audio.op_audio_create_dynamics_compressor(this._id);
+      return new NativeDynamicsCompressorNode(this, id);
+    }
+    createStereoPanner() {
+      const { id } = audio.op_audio_create_stereo_panner(this._id);
+      return new NativeStereoPannerNode(this, id);
+    }
+    createAnalyser() {
+      const { id } = audio.op_audio_create_analyser(this._id);
+      return new NativeAnalyserNode(this, id);
+    }
+    createPanner() {
+      const { id } = audio.op_audio_create_panner(this._id);
+      return new NativePannerNode(this, id);
+    }
+    createWaveShaper() {
+      const { id } = audio.op_audio_create_wave_shaper(this._id);
+      return new NativeWaveShaperNode(this, id);
+    }
+    createChannelMerger(numberOfInputs = 6) {
+      const { id } = audio.op_audio_create_channel_merger(this._id, numberOfInputs);
+      return new NativeChannelMergerNode(this, id, numberOfInputs);
+    }
+    createChannelSplitter(numberOfOutputs = 6) {
+      const { id } = audio.op_audio_create_channel_splitter(this._id, numberOfOutputs);
+      return new NativeChannelSplitterNode(this, id, numberOfOutputs);
+    }
+    createPeriodicWave(real, imag) { return { real, imag }; }
+    createBuffer(numberOfChannels, length, sampleRate) {
+      const info = audio.op_audio_create_buffer(this._id, numberOfChannels, length, sampleRate);
+      const channels = [];
+      for (let i = 0; i < numberOfChannels; i++) {
+        channels.push(new Float32Array(length));
+      }
+      return new NativeAudioBuffer({
+        __id: info.id,
+        numberOfChannels: info.number_of_channels,
+        length: info.length,
+        sampleRate: info.sample_rate,
+        duration: info.duration,
+        _channels: channels,
+      });
+    }
+    decodeAudioData(arrayBuffer, successCallback, errorCallback) {
+      const promise = new Promise((resolve, reject) => {
+        try {
+          const bytes = arrayBuffer instanceof Uint8Array
+            ? arrayBuffer
+            : new Uint8Array(arrayBuffer);
+          const info = audio.op_audio_decode_audio_data(this._id, bytes);
+          resolve(new NativeAudioBuffer({
+            __id: info.id,
+            duration: info.duration,
+            length: info.length,
+            sampleRate: info.sample_rate,
+            numberOfChannels: info.number_of_channels,
+          }));
+        } catch (e) {
+          reject(e);
+        }
+      });
+      if (typeof successCallback === 'function') {
+        promise.then(successCallback, errorCallback || (() => {}));
+      }
+      return promise;
+    }
+    startRendering() {
+      return new Promise((resolve, reject) => {
+        try {
+          const info = audio.op_offline_context_start_rendering(this._id);
+          this.state = "closed";
+          resolve(new NativeAudioBuffer({
+            __id: info.id,
+            duration: info.duration,
+            length: info.length,
+            sampleRate: info.sample_rate,
+            numberOfChannels: info.number_of_channels,
+          }));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }
+    close() { this.state = "closed"; }
+  }
+  globalThis.OfflineAudioContext = NativeOfflineAudioContext;
+  globalThis.AudioWorkletNode = globalThis.AudioWorkletNode ?? class AudioWorkletNode {};
 
   console.log("[shims] audio initialized (native)");
 }

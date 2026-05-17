@@ -176,6 +176,12 @@ impl ModuleLoader for ImportMapModuleLoader {
                 .map_err(|e| JsErrorBox::generic(e.to_string()));
         }
 
+        // data: URLs — pass through as-is (used by dynamic import() with inline source)
+        if specifier.starts_with("data:") {
+            return ModuleSpecifier::parse(specifier)
+                .map_err(|e| JsErrorBox::generic(e.to_string()));
+        }
+
         let referrer_url = if referrer.is_empty() || referrer == "." {
             ModuleSpecifier::from_file_path(&self.script_dir.join("dummy.js"))
                 .map_err(|_| JsErrorBox::generic("Invalid script dir"))?
@@ -220,6 +226,33 @@ impl ModuleLoader for ImportMapModuleLoader {
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let specifier = module_specifier.clone();
+
+        // data: URLs — decode inline source (used by dynamic import() with inline JS)
+        if specifier.scheme() == "data" {
+            let url_str = specifier.as_str();
+            // Expected format: data:text/javascript;charset=utf-8,<percent-encoded code>
+            if let Some(comma_pos) = url_str.find(',') {
+                let encoded = &url_str[comma_pos + 1..];
+                match percent_encoding::percent_decode_str(encoded).decode_utf8() {
+                    Ok(code) => {
+                        return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                            ModuleType::JavaScript,
+                            ModuleSourceCode::String(code.into_owned().into()),
+                            &specifier,
+                            None,
+                        )));
+                    }
+                    Err(e) => {
+                        return ModuleLoadResponse::Sync(Err(
+                            JsErrorBox::generic(format!("Failed to decode data URL: {}", e))
+                        ));
+                    }
+                }
+            }
+            return ModuleLoadResponse::Sync(Err(
+                JsErrorBox::generic(format!("Invalid data URL: {}", specifier))
+            ));
+        }
 
         // HTTP/HTTPS — fetch over network
         if specifier.scheme() == "http" || specifier.scheme() == "https" {

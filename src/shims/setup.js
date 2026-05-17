@@ -7,6 +7,7 @@ import "./01-dom.js"; // document, body, canvas factory
 import "./02-input.js"; // input event dispatching
 import "./03-audio.js"; // AudioContext stubs
 import "./04-indexeddb.js"; // IndexedDB (if native ops present)
+import "./04a-localstorage.js"; // localStorage (native SQLite, separate DB)
 import "./05-webgpu.js"; // WebGPU (if native ops present)
 import "./06-webxr.js"; // WebXR (if native ops present)
 

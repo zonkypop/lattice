@@ -225,6 +225,103 @@ pub fn op_indexeddb_store_exists(
     Ok(exists > 0)
 }
 
+// ======================= localStorage Ops =======================
+
+static LS_CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
+
+fn get_ls_conn() -> &'static Mutex<Connection> {
+    LS_CONN.get_or_init(|| {
+        #[cfg(target_os = "android")]
+        let data_dir = {
+            let d = std::path::PathBuf::from("/data/data/com.yourcompany.combinedapp/files/localstorage");
+            std::fs::create_dir_all(&d).ok();
+            d
+        };
+        #[cfg(not(target_os = "android"))]
+        let data_dir = {
+            let d = std::env::current_dir()
+                .unwrap_or_default()
+                .join("data")
+                .join("localstorage");
+            std::fs::create_dir_all(&d).ok();
+            d
+        };
+
+        let path = data_dir.join("storage.sqlite");
+        let conn = Connection::open(&path).expect("Failed to open localStorage database");
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        ).expect("Failed to initialize localStorage table");
+        Mutex::new(conn)
+    })
+}
+
+#[op2]
+#[string]
+pub fn op_localstorage_get(#[string] key: String) -> Result<Option<String>, JsErrorBox> {
+    let conn = get_ls_conn().lock().map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let result: Option<String> = conn.query_row(
+        "SELECT value FROM kv WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    ).optional().map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(result)
+}
+
+#[op2(fast)]
+pub fn op_localstorage_set(
+    #[string] key: String,
+    #[string] value: String,
+) -> Result<(), JsErrorBox> {
+    let conn = get_ls_conn().lock().map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+        params![key, value],
+    ).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_localstorage_remove(#[string] key: String) -> Result<(), JsErrorBox> {
+    let conn = get_ls_conn().lock().map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    conn.execute("DELETE FROM kv WHERE key = ?1", params![key])
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(())
+}
+
+#[op2(fast)]
+pub fn op_localstorage_clear() -> Result<(), JsErrorBox> {
+    let conn = get_ls_conn().lock().map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    conn.execute("DELETE FROM kv", [])
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(())
+}
+
+#[op2]
+#[serde]
+pub fn op_localstorage_keys() -> Result<Vec<String>, JsErrorBox> {
+    let conn = get_ls_conn().lock().map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let mut stmt = conn.prepare("SELECT key FROM kv ORDER BY rowid")
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let keys: Result<Vec<String>, _> = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?
+        .collect();
+    keys.map_err(|e| JsErrorBox::generic(e.to_string()))
+}
+
+#[op2(fast)]
+pub fn op_localstorage_length() -> Result<u32, JsErrorBox> {
+    let conn = get_ls_conn().lock().map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let count: u32 = conn.query_row("SELECT COUNT(*) FROM kv", [], |row| row.get(0))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(count)
+}
+
+// ======================= Helpers =======================
+
 // Helper to sanitize table names (prevent SQL injection)
 fn sanitize_table_name(name: &str) -> String {
     // Only allow alphanumeric and underscore

@@ -126,6 +126,11 @@ globalThis.__dispatchInputEvents = function () {
 
       // Keyboard
       if (type === "keydown" || type === "keyup") {
+        // Skip repeat keydowns — in the browser, timing naturally spaces
+        // repeated events across frames. In our batched dispatch, repeats
+        // can retrigger actions before the previous action's release phase
+        // completes, causing state corruption in audio schedulers.
+        if (type === "keydown" && domEvent.repeat) continue;
         if (type === "keydown" && domEvent.key === "Escape") {
           if (globalThis.__input.op_input_is_pointer_locked?.()) {
             globalThis.__input.op_input_exit_pointer_lock?.();

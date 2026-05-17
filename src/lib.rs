@@ -95,7 +95,11 @@ async fn drain_event_loop(runtime: &mut deno_core::JsRuntime) {
             }
         }).await;
         if done { break; }
-        tokio::task::yield_now().await;
+        // Use a short sleep instead of yield_now. yield_now parks the thread
+        // until the next reactor event (which can be ~200ms with audio buffers).
+        // A 1ms sleep ensures spawn_blocking completions (HTTP fetches, decodes)
+        // are picked up promptly.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
 
@@ -234,13 +238,17 @@ extension!(
         audio::op_audio_create_dynamics_compressor,
         audio::op_audio_create_analyser,
         audio::op_audio_connect,
+        audio::op_audio_connect_param,
         audio::op_audio_disconnect,
         audio::op_audio_param_set_value,
         audio::op_audio_param_set_value_at_time,
         audio::op_audio_param_set_target_at_time,
         audio::op_audio_param_linear_ramp,
         audio::op_audio_param_exponential_ramp,
+        audio::op_audio_param_cancel_scheduled_values,
+        audio::op_audio_param_cancel_and_hold,
         audio::op_audio_decode_audio_data,
+        audio::op_audio_buffer_get_channel_data,
         audio::op_audio_buffer_drop,
         audio::op_audio_buffer_source_set_buffer,
         audio::op_audio_buffer_source_start,
@@ -256,6 +264,31 @@ extension!(
         audio::op_audio_listener_set_position,
         audio::op_audio_listener_set_orientation,
         audio::op_audio_node_drop,
+        audio::op_audio_set_channel_count,
+        audio::op_audio_set_channel_count_mode,
+        audio::op_audio_set_channel_interpretation,
+
+        audio::op_audio_create_constant_source,
+        audio::op_audio_constant_source_start,
+        audio::op_audio_constant_source_stop,
+        audio::op_audio_create_convolver,
+        audio::op_audio_convolver_set_buffer,
+        audio::op_audio_create_wave_shaper,
+        audio::op_audio_wave_shaper_set_curve,
+        audio::op_audio_create_channel_merger,
+        audio::op_audio_create_channel_splitter,
+        audio::op_audio_create_buffer,
+        audio::op_audio_buffer_copy_to_channel,
+        audio::op_offline_context_create,
+        audio::op_offline_context_start_rendering,
+
+        // localStorage
+        sqlite::op_localstorage_get,
+        sqlite::op_localstorage_set,
+        sqlite::op_localstorage_remove,
+        sqlite::op_localstorage_clear,
+        sqlite::op_localstorage_keys,
+        sqlite::op_localstorage_length,
 
         // event loop
         op_yield_to_runtime,
@@ -765,7 +798,7 @@ impl ApplicationHandler for App {
 
         if let Some(ref mut worker) = self.worker {
             self.tokio_rt.block_on(drain_event_loop(&mut worker.js_runtime));
-            
+
             let _guard = self.tokio_rt.enter();
             let result = worker.js_runtime.execute_script(
                 "<animation_frame>",
@@ -793,20 +826,24 @@ pub async fn op_yield_to_runtime() -> Result<(), deno_error::JsErrorBox> {
     Ok(())
 }
 
-/// Synchronous HTTP fetch via ureq — avoids deadlocks on the single-threaded
-/// tokio runtime that deno's built-in async fetch suffers from.
+/// Async HTTP fetch via ureq on a blocking thread — the JS thread stays free
+/// while the network request runs on tokio's blocking thread pool.
 #[deno_core::op2]
 #[buffer]
-pub fn op_http_fetch(#[string] url: &str) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    let resp = ureq::get(url).call()
-        .map_err(|e| deno_error::JsErrorBox::generic(format!("fetch failed for {}: {}", url, e)))?;
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        return Err(deno_error::JsErrorBox::generic(format!("HTTP {} for {}", status, url)));
-    }
-    let bytes = resp.into_body().read_to_vec()
-        .map_err(|e| deno_error::JsErrorBox::generic(format!("failed to read response from {}: {}", url, e)))?;
-    Ok(bytes)
+pub async fn op_http_fetch(#[string] url: String) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    tokio::task::spawn_blocking(move || {
+        let resp = ureq::get(&url).call()
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("fetch failed for {}: {}", url, e)))?;
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            return Err(deno_error::JsErrorBox::generic(format!("HTTP {} for {}", status, url)));
+        }
+        let bytes = resp.into_body().read_to_vec()
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("failed to read response from {}: {}", url, e)))?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|e| deno_error::JsErrorBox::generic(format!("fetch task failed: {}", e)))?
 }
 
 /// Drain pending Android input events to prevent ANR.
@@ -877,6 +914,22 @@ fn run_xr_mode(script_path: &str) -> Result<(), AnyError> {
 #[cfg(not(target_os = "android"))]
 pub fn main() -> Result<(), AnyError> {
     env_logger::init();
+
+    // Install a panic hook that logs instead of printing to stderr + aborting.
+    // web-audio-api-rs spawns internal render threads that can panic during
+    // node teardown or process exit — without this hook those panics crash
+    // the process with no actionable error message.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        log::error!("Panic on thread '{}': {}", name, info);
+        // Only run the default hook (which prints the backtrace) on the main thread.
+        // Render-thread panics during shutdown are expected and non-fatal.
+        if name == "main" {
+            default_hook(info);
+        }
+    }));
 
     // Set V8 heap limit before any isolate is created
     deno_core::v8::V8::set_flags_from_string("--max-old-space-size=4096");

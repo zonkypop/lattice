@@ -20,5 +20,6 @@ Supported / tested platforms:
 - MacOS Desktop
 
 Audio via [web-audio-api-rs](https://github.com/orottier/web-audio-api-rs) / [cpal](https://github.com/rustaudio/cpal)
+
 WebRTC via [webrtc-rs](https://github.com/webrtc-rs/webrtc)
 

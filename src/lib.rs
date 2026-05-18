@@ -37,6 +37,8 @@ use deno_runtime::BootstrapOptions;
 
 mod sqlite;
 mod audio;
+mod opus;
+mod webrtc;
 use tokio::runtime::Handle;
 
 use deno_core::{SharedArrayBufferStore, CompiledWasmModuleStore};
@@ -289,6 +291,26 @@ extension!(
         sqlite::op_localstorage_clear,
         sqlite::op_localstorage_keys,
         sqlite::op_localstorage_length,
+
+        // WebRTC ops
+        webrtc::op_rtc_new,
+        webrtc::op_rtc_create_offer,
+        webrtc::op_rtc_create_answer,
+        webrtc::op_rtc_accept_answer,
+        webrtc::op_rtc_add_remote_candidate,
+        webrtc::op_rtc_create_data_channel,
+        webrtc::op_rtc_send_text,
+        webrtc::op_rtc_send_binary,
+        webrtc::op_rtc_poll,
+        webrtc::op_rtc_close,
+        webrtc::op_rtc_get_state,
+
+        // Voice chat ops
+        webrtc::op_rtc_get_user_media,
+        webrtc::op_rtc_add_track,
+        webrtc::op_rtc_setup_on_track,
+        webrtc::op_rtc_create_remote_audio_source,
+        webrtc::op_rtc_stop_stream,
 
         // event loop
         op_yield_to_runtime,
@@ -991,6 +1013,105 @@ pub fn main() -> Result<(), AnyError> {
 
 
 #[cfg(target_os = "android")]
+fn request_android_permissions() {
+    use std::ffi::CString;
+
+    let native_activity = ndk_glue::native_activity();
+    let vm_ptr = native_activity.vm();
+    let activity = native_activity.activity();
+
+    unsafe {
+        // Attach current thread to JVM
+        let mut env: *mut jni_sys::JNIEnv = std::ptr::null_mut();
+        let attach_result = (**vm_ptr).AttachCurrentThread.unwrap()(
+            vm_ptr,
+            &mut env as *mut *mut jni_sys::JNIEnv as *mut *mut std::ffi::c_void,
+            std::ptr::null_mut(),
+        );
+        if attach_result != 0 || env.is_null() {
+            log::error!("Failed to attach to JVM");
+            return;
+        }
+
+        let env_fns = **env;
+
+        // Check if we already have RECORD_AUDIO permission
+        let permission_str = CString::new("android.permission.RECORD_AUDIO").unwrap();
+        let j_permission = env_fns.NewStringUTF.unwrap()(env, permission_str.as_ptr());
+
+        // int checkSelfPermission(String permission) — returns 0 if granted
+        let context_class = env_fns.GetObjectClass.unwrap()(env, activity);
+        let check_method_name = CString::new("checkSelfPermission").unwrap();
+        let check_method_sig = CString::new("(Ljava/lang/String;)I").unwrap();
+        let check_method = env_fns.GetMethodID.unwrap()(
+            env,
+            context_class,
+            check_method_name.as_ptr(),
+            check_method_sig.as_ptr(),
+        );
+
+        if !check_method.is_null() {
+            let result = env_fns.CallIntMethodA.unwrap()(
+                env,
+                activity,
+                check_method,
+                [jni_sys::jvalue { l: j_permission }].as_ptr(),
+            );
+
+            if result == 0 {
+                log::info!("RECORD_AUDIO permission already granted");
+                env_fns.DeleteLocalRef.unwrap()(env, j_permission);
+                env_fns.DeleteLocalRef.unwrap()(env, context_class);
+                return;
+            }
+        }
+
+        // Request permission: requestPermissions(String[], int)
+        let str_class = env_fns.FindClass.unwrap()(
+            env,
+            CString::new("java/lang/String").unwrap().as_ptr(),
+        );
+        let perm_array = env_fns.NewObjectArray.unwrap()(
+            env,
+            1,
+            str_class,
+            j_permission,
+        );
+
+        let request_method_name = CString::new("requestPermissions").unwrap();
+        let request_method_sig = CString::new("([Ljava/lang/String;I)V").unwrap();
+        let request_method = env_fns.GetMethodID.unwrap()(
+            env,
+            context_class,
+            request_method_name.as_ptr(),
+            request_method_sig.as_ptr(),
+        );
+
+        if !request_method.is_null() {
+            log::info!("Requesting RECORD_AUDIO permission...");
+            env_fns.CallVoidMethodA.unwrap()(
+                env,
+                activity,
+                request_method,
+                [
+                    jni_sys::jvalue { l: perm_array },
+                    jni_sys::jvalue { i: 1 },
+                ]
+                .as_ptr(),
+            );
+        } else {
+            log::warn!("requestPermissions method not found");
+        }
+
+        // Clean up local refs
+        env_fns.DeleteLocalRef.unwrap()(env, j_permission);
+        env_fns.DeleteLocalRef.unwrap()(env, context_class);
+        env_fns.DeleteLocalRef.unwrap()(env, str_class);
+        env_fns.DeleteLocalRef.unwrap()(env, perm_array);
+    }
+}
+
+#[cfg(target_os = "android")]
 #[ndk_glue::main(backtrace = "on")]
 fn android_main() {
     android_logger::init_once(
@@ -1000,6 +1121,12 @@ fn android_main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     log::info!("Android XR starting...");
+
+    // Request mic permission early (before any getUserMedia calls)
+    request_android_permissions();
+
+    // Give Android a moment to process the permission dialog
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Set working directory (still needed for shims)
     std::env::set_current_dir("/data/local/tmp/combined_app").ok();

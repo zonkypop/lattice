@@ -917,7 +917,7 @@ class Audio {
     this.paused = true;
     this.ended = false;
     this.loop = false;
-    this.volume = 1;
+    this._volume = 1;
     this.muted = false;
     this.playbackRate = 1;
     this.readyState = 0;
@@ -927,7 +927,32 @@ class Audio {
     this._listeners = {};
     this._buffer = null;
     this._source = null;
+    this._srcObject = null;
+    this._remoteSource = null;
+    this._remoteGain = null;
     this._loadPromise = this.src ? this._load() : Promise.resolve();
+  }
+
+  get volume() { return this._volume; }
+  set volume(v) {
+    this._volume = v;
+    if (this._remoteGain) {
+      this._remoteGain.gain.value = this.muted ? 0 : v;
+    }
+  }
+
+  get srcObject() { return this._srcObject; }
+  set srcObject(stream) {
+    // Tear down previous remote playback
+    if (this._remoteSource) {
+      try { this._remoteSource.disconnect(); } catch (_) {}
+      this._remoteSource = null;
+    }
+    if (this._remoteGain) {
+      try { this._remoteGain.disconnect(); } catch (_) {}
+      this._remoteGain = null;
+    }
+    this._srcObject = stream;
   }
 
   async _load() {
@@ -943,6 +968,11 @@ class Audio {
   }
 
   play() {
+    // Remote stream playback via srcObject
+    if (this._srcObject && this._srcObject._remoteTrackId != null) {
+      this._playRemote();
+      return Promise.resolve();
+    }
     if (!this._buffer) {
       // Not loaded yet — play after load completes
       this._loadPromise?.then(() => { if (this._buffer) this._playNow(); });
@@ -950,6 +980,33 @@ class Audio {
     }
     this._playNow();
     return Promise.resolve();
+  }
+
+  async _playRemote() {
+    const stream = this._srcObject;
+    if (!stream || stream._remoteTrackId == null) return;
+    const __rtc = globalThis.__webrtc;
+    if (!__rtc) return;
+
+    const ctx = _getAudioCtx();
+    if (!ctx) return;
+
+    try {
+      const result = await __rtc.op_rtc_create_remote_audio_source(
+        stream._pcId,
+        stream._remoteTrackId,
+        ctx._id
+      );
+      // NativeAudioNode wraps a native node by ID
+      this._remoteSource = new NativeAudioNode(ctx, result.node_id);
+      this._remoteGain = ctx.createGain();
+      this._remoteGain.gain.value = this.muted ? 0 : this._volume;
+      this._remoteSource.connect(this._remoteGain);
+      this._remoteGain.connect(ctx.destination);
+      this.paused = false;
+    } catch (e) {
+      console.warn("[Audio] Failed to set up remote stream playback:", e.message);
+    }
   }
 
   _playNow() {
@@ -961,7 +1018,7 @@ class Audio {
     source.buffer = this._buffer;
     source.loop = this.loop;
     const gain = ctx.createGain();
-    gain.gain.value = this.muted ? 0 : this.volume;
+    gain.gain.value = this.muted ? 0 : this._volume;
     source.connect(gain);
     gain.connect(ctx.destination);
     source.start();
@@ -972,10 +1029,20 @@ class Audio {
 
   pause() {
     if (this._source) { try { this._source.stop(); } catch (_) {} this._source = null; }
+    // Disconnect remote playback
+    if (this._remoteSource) {
+      try { this._remoteSource.disconnect(); } catch (_) {}
+      this._remoteSource = null;
+    }
+    if (this._remoteGain) {
+      try { this._remoteGain.disconnect(); } catch (_) {}
+      this._remoteGain = null;
+    }
     this.paused = true;
   }
 
   load() { if (this.src) this._loadPromise = this._load(); }
+  remove() { this.pause(); }
 
   addEventListener(e, cb) { (this._listeners[e] ??= []).push(cb); }
   removeEventListener(e, cb) {

@@ -12,17 +12,17 @@ use web_audio_api::node::{AudioNode, AudioScheduledSourceNode};
 
 // ======================= Global State =======================
 
-struct AudioState {
-    contexts: HashMap<u32, AudioContext>,
-    offline_contexts: HashMap<u32, OfflineAudioContext>,
+pub(crate) struct AudioState {
+    pub(crate) contexts: HashMap<u32, AudioContext>,
+    pub(crate) offline_contexts: HashMap<u32, OfflineAudioContext>,
     /// Offline contexts that have finished rendering but must stay alive until
     /// all nodes created on them are dropped. web-audio-api-rs nodes send a
     /// deregister message to their parent context on drop — if the context is
     /// already gone, the channel send panics/aborts.
     finished_offline_contexts: Vec<OfflineAudioContext>,
-    nodes: HashMap<u32, NodeWrapper>,
-    buffers: HashMap<u32, web_audio_api::AudioBuffer>,
-    next_id: u32,
+    pub(crate) nodes: HashMap<u32, NodeWrapper>,
+    pub(crate) buffers: HashMap<u32, web_audio_api::AudioBuffer>,
+    pub(crate) next_id: u32,
 }
 
 impl AudioState {
@@ -45,8 +45,12 @@ impl AudioState {
 
 static AUDIO: OnceLock<Mutex<AudioState>> = OnceLock::new();
 
-fn audio() -> &'static Mutex<AudioState> {
+pub(crate) fn audio_state() -> &'static Mutex<AudioState> {
     AUDIO.get_or_init(|| Mutex::new(AudioState::new()))
+}
+
+fn audio() -> &'static Mutex<AudioState> {
+    audio_state()
 }
 
 /// Catch panics from web-audio-api-rs ops that are known to panic
@@ -93,7 +97,7 @@ where
 // ======================= Node Wrapper =======================
 
 #[allow(dead_code)]
-enum NodeWrapper {
+pub(crate) enum NodeWrapper {
     Destination(web_audio_api::node::AudioDestinationNode),
     Gain(web_audio_api::node::GainNode),
     BufferSource(web_audio_api::node::AudioBufferSourceNode),
@@ -109,6 +113,7 @@ enum NodeWrapper {
     WaveShaper(web_audio_api::node::WaveShaperNode),
     ChannelMerger(web_audio_api::node::ChannelMergerNode),
     ChannelSplitter(web_audio_api::node::ChannelSplitterNode),
+    MediaStreamSource(web_audio_api::node::MediaStreamAudioSourceNode),
 }
 
 /// Dispatch to the inner AudioNode impl (used for connect / disconnect).
@@ -130,6 +135,7 @@ macro_rules! with_node {
             NodeWrapper::WaveShaper($n) => $body,
             NodeWrapper::ChannelMerger($n) => $body,
             NodeWrapper::ChannelSplitter($n) => $body,
+            NodeWrapper::MediaStreamSource($n) => $body,
         }
     };
 }

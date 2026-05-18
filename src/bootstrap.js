@@ -166,6 +166,26 @@ import {
   op_localstorage_keys,
   op_localstorage_length,
 
+  // WebRTC
+  op_rtc_new,
+  op_rtc_create_offer,
+  op_rtc_create_answer,
+  op_rtc_accept_answer,
+  op_rtc_add_remote_candidate,
+  op_rtc_create_data_channel,
+  op_rtc_send_text,
+  op_rtc_send_binary,
+  op_rtc_poll,
+  op_rtc_close,
+  op_rtc_get_state,
+
+  // Voice chat
+  op_rtc_get_user_media,
+  op_rtc_add_track,
+  op_rtc_setup_on_track,
+  op_rtc_create_remote_audio_source,
+  op_rtc_stop_stream,
+
   // event loop
   op_yield_to_runtime,
   op_http_fetch,
@@ -343,4 +363,26 @@ globalThis.__input = {
   op_input_exit_pointer_lock,
   op_input_is_pointer_locked,
   op_input_set_cursor_style,
+};
+
+// Expose WebRTC ops to globalThis
+globalThis.__webrtc = {
+  op_rtc_new,
+  op_rtc_create_offer,
+  op_rtc_create_answer,
+  op_rtc_accept_answer,
+  op_rtc_add_remote_candidate,
+  op_rtc_create_data_channel,
+  op_rtc_send_text,
+  op_rtc_send_binary,
+  op_rtc_poll,
+  op_rtc_close,
+  op_rtc_get_state,
+
+  // Voice chat
+  op_rtc_get_user_media,
+  op_rtc_add_track,
+  op_rtc_setup_on_track,
+  op_rtc_create_remote_audio_source,
+  op_rtc_stop_stream,
 };

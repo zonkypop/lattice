@@ -11,9 +11,9 @@ path = "src/lib.rs"
 
 
 # android
-# crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib"]
 # desktop
-crate-type = ["rlib"]
+# crate-type = ["rlib"]
 
 
 
@@ -25,6 +25,9 @@ path = "src/main.rs"
 default = ["desktop"]
 desktop = []
 tint = []
+
+[build-dependencies]
+cc = "1"
 
 [dependencies]
 deno_core = { version = "=0.398.0", default-features = false, features = ["include_icu_data"] }
@@ -59,6 +62,13 @@ rusqlite = "0.37"
 # Audio
 web-audio-api = { path = "vendor/web-audio-api" }
 
+# Opus codec for voice chat (vendored, built via cc crate in build.rs)
+crossbeam-channel = "0.5"
+
+# WebRTC
+webrtc = "0.17"
+bytes = "1"
+
 rustls = { version = "0.23", features = ["ring"] }
 
 temporal_rs = "0.0.11"
@@ -88,6 +98,7 @@ winit = "0.30"
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = "0.7"
 ndk-glue = "0.7"
+jni-sys = "0.3"
 android_logger = "0.14"
 
 # Android manifest
@@ -143,6 +154,10 @@ name = "android.permission.INTERNET"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.ACCESS_NETWORK_STATE"
 
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
 [[package.metadata.android.uses_feature]]
 name = "android.hardware.vr.high_performance"
 required = true
+
